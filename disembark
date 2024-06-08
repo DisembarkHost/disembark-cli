@@ -1,0 +1,302 @@
+#!/usr/bin/env php
+<?php
+namespace Disembark;
+
+class Run {
+
+    const VERSION = '1.0.0';
+
+    public static function main($argv, $argc) {
+        if ($argc < 2) {
+            self::showHelp();
+            exit(1);
+        }
+
+        $command = $argv[1];
+
+        switch ($command) {
+            case 'connect':
+                if ($argc != 4) {
+                    echo "Error: Invalid arguments for connect.\n";
+                    exit(1);
+                }
+                $siteUrl = $argv[2];
+                $token = $argv[3];
+                self::connect($siteUrl, $token);
+                break;
+
+            case 'backup':
+                if ($argc != 3) {
+                    echo "Error: Invalid arguments for backup.\n";
+                    exit(1);
+                }
+                $siteUrl = $argv[2];
+                self::backup($siteUrl);
+                break;
+            
+            case 'version':
+                if ($argc != 2) {
+                    echo "Error: Invalid arguments for version.\n";
+                    exit(1);
+                }
+                self::version();
+                break;
+
+            default:
+                echo "Error: Unknown command '$command'.\n\n";
+                self::showHelp();
+                exit(1);
+        }
+    }
+
+    private static function connect($siteUrl, $token) {
+        // Trim trailing slashes from the site URL
+        $siteUrl = rtrim($siteUrl, '/');
+        
+        // Verify the site URL starts with http:// or https://
+        if (!preg_match('/^https?:\/\//', $siteUrl)) {
+            echo "Error: The site URL must start with http:// or https://.\n";
+            exit(1);
+        }
+    
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+
+        if ( empty( $siteUrl ) ||  empty( $token ) ) {
+            echo "Error: Required arguments <site-url> and <token>.\n";
+            exit(1);
+        }
+        try {
+            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], [ 'verify' => false ]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            // Handle the exception
+            echo "Error: Request failed with error: {$e->getMessage()}\n";
+            exit(1);
+        }
+
+        if ($response->status_code != 200) {
+            echo "Error: Failed to connect to $siteUrl. Please check your credentials and try again.\n";
+            exit(1);
+        }
+
+        $tables = json_decode($response->body);
+        if ( empty( $tables ) ) {
+            echo "Error: Failed to connect to $siteUrl. Please check your credentials and try again.\n";
+            exit(1);
+        }
+        
+        $filePath = $homeDir . '/.disembark';
+        $data = [];
+    
+        // Check if the file already exists and read its contents
+        if (file_exists($filePath)) {
+            $jsonContents = file_get_contents($filePath);
+            $data = json_decode($jsonContents);
+            if (!is_array($data)) {
+                $data = [];
+            }
+        }
+    
+        // Check if the siteUrl already exists and update it, otherwise add new
+        $found = false;
+        foreach ($data as &$entry) {
+            if ( ! empty($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $entry->token = $token;
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            $data[] = [
+                'siteUrl' => $siteUrl,
+                'token' => $token
+            ];
+        }
+        
+        $jsonData = json_encode($data, JSON_PRETTY_PRINT);
+        
+        if (file_put_contents($filePath, $jsonData) === false) {
+            echo "Error: Unable to write to $filePath.\n";
+            exit(1);
+        }
+        
+        echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
+    }
+
+    private static function backup($siteUrl) {
+
+        // Trim trailing slashes from the site URL
+        $siteUrl = rtrim($siteUrl, '/');
+        
+        // Verify the site URL starts with http:// or https://
+        if (!preg_match('/^https?:\/\//', $siteUrl)) {
+            echo "Error: The site URL must start with http:// or https://.\n";
+            exit(1);
+        }
+
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+        
+        $filePath = $homeDir . '/.disembark';
+        $data = [];
+
+        // Check if the file already exists and read its contents
+        if (file_exists($filePath)) {
+            $jsonContents = file_get_contents($filePath);
+            $data = json_decode($jsonContents);
+            if (!is_array($data)) {
+                echo "Error: Invalid data in $filePath.\n";
+                exit(1);
+            }
+        } else {
+            echo "Error: No configuration file found at $filePath.\n";
+            exit(1);
+        }
+
+        // Find the token for the given siteUrl
+        $token = null;
+        foreach ($data as $entry) {
+            if (isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $token = $entry->token;
+                break;
+            }
+        }
+
+        if (empty($token)) {
+            echo "Error: No token found for $siteUrl.\n";
+            exit(1);
+        }
+        
+        // Implement the logic for backing up the site with the given URL
+        $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -24);
+        echo "Starting backup for $siteUrl using backup token $backup_token\n";
+        try {
+            $response     = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token&backup_token=$backup_token", [], [ 'verify' => false, 'timeout' => 600 ]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            // Handle the exception
+            echo "Error: Request failed with error: {$e->getMessage()}\n";
+            exit(1);
+        }
+        $database     = json_decode( $response->body );
+        try {
+            $response     = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/files?token=$token&backup_token=$backup_token", [], [ 'verify' => false, 'timeout' => 600 ]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            // Handle the exception
+            echo "Error: Request failed with error: {$e->getMessage()}\n";
+            exit(1);
+        }
+        $files        = json_decode( $response->body );
+        $headers = [
+            'Content-Type' => 'application/json; charset=utf-8'
+        ];
+        $data = [
+            "site_url"     => $siteUrl,
+            "token"        => $token, 
+            "backup_token" => $backup_token
+        ];
+        foreach ( $database as $table ) {
+            echo "Backing up table $table->table\n";
+            try {
+                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/export/database/{$table->table}", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                // Handle the exception
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+            if ($response->status_code !== 200) {
+                echo "Error: Failed to export table {$table->table}\n";
+                exit(1);
+            }
+        }
+
+        echo "Zipping database\n";
+        try {
+            $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-database", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            // Handle the exception
+            echo "Error: Request failed with error: {$e->getMessage()}\n";
+            exit(1);
+        }
+
+        $steps        = count( $files );
+        $current_step = 1;
+        $total_file_count = array_sum( array_column( $files, 'count' ) );
+        $total_file_size  = self::humanFilesize( array_sum( array_column( $files, 'size' ) ) );
+        echo "Preparing to backup $total_file_count files totaling $total_file_size files\n";
+        foreach ( $files as $file ) {
+            $size = self::humanFilesize($file->size);
+            echo "Backing up $file->count files totaling $size ($current_step/$steps) \n";
+            $data['file'] = $file->name;
+            try {
+                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-files", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                // Handle the exception
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+            if ($response->status_code !== 200) {
+                echo "Error: Failed to zip files in {$file->name}\n";
+                exit(1);
+            } 
+            $current_step++;
+        }
+
+        echo self::liveExecuteCommand("curl -s https://disembark.host/generate-zip | bash -s -- --url=\"$siteUrl\" --token=\"$token\" --backup-token=\"$backup_token\" --cleanup");
+    }
+
+    private static function version() {
+        $version = self::VERSION;
+        echo "Disembark v{$version}\n";
+    }
+
+    private static function showHelp() {
+        echo "Disembark CLI\n";
+        echo "\n";
+        echo "Usage:\n";
+        echo "  disembark backup <site-url>\n";
+        echo "  disembark connect <site-url> <token>\n";
+        echo "  disembark version\n";
+       
+    }
+
+    private static function humanFilesize($bytes, $decimals = 2) {
+        $factor = floor((strlen($bytes) - 1) / 3);
+        if ($factor > 0) $sz = 'KMGT';
+        return sprintf("%.{$decimals}f", $bytes / pow(1024, $factor)) . @$sz[$factor - 1] . 'B';
+    }
+
+    private static function liveExecuteCommand($cmd) {
+        while (@ ob_end_flush()); // end all output buffers if any
+    
+        $proc = popen("$cmd 2>&1", 'r');
+    
+        $live_output     = "";
+        $complete_output = "";
+    
+        while (!feof($proc))
+        {
+            $live_output     = fread($proc, 4096);
+            $complete_output = $complete_output . $live_output;
+            echo "$live_output";
+            @ flush();
+        }
+    
+        pclose($proc);
+    
+        // get exit status
+        preg_match('/[0-9]+$/', $complete_output, $matches);
+    
+    }
+}
+
+// Check if the script is being run directly from the command line
+if (php_sapi_name() == 'cli') {
+    require_once 'vendor/autoload.php';
+    \Disembark\Run::main($argv, $argc);
+}
