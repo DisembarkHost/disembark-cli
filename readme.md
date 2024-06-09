@@ -17,8 +17,13 @@ sudo mv disembark.phar /usr/local/bin/disembark
 
 ## Usage
 
-disembark backup `<site-url>`
+```
+disembark backup <site-url>
+```
+```
+disembark connect <site-url> <token>
+```
 
-disembark connect `<site-url>` `<token>`
-
+```
 disembark version
+```
