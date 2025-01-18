@@ -27,3 +27,18 @@ disembark connect <site-url> <token>
 ```
 disembark version
 ```
+
+## Installing Disembark Connector via WP-CLI
+
+On the source WordPress website run the following commands:
+
+```
+wp plugin install https://github.com/DisembarkHost/disembark-connector/releases/latest/download/disembark-connector.zip --activate
+```
+```
+wp disembark cli-info
+```
+This will return the connection command which will link the the website to Disembark CLI.
+```
+disembark connect https://my-site.localhost exYNhNLr5dKymZqJZXomW0ie1tkyEyOjKgTSchhmih
+```
