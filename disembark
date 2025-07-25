@@ -63,8 +63,8 @@ class Run {
         
         // Verify the site URL starts with http:// or https://
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
-            echo "Error: The site URL must start with http:// or https://.\n";
-            exit(1);
+            $siteUrl = "https://$siteUrl";
+            echo "The site URL must start with http:// or https://. Attempting to use $siteUrl\n";
         }
     
         $homeDir = getenv('HOME');
@@ -141,8 +141,8 @@ class Run {
         
         // Verify the site URL starts with http:// or https://
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
-            echo "Error: The site URL must start with http:// or https://.\n";
-            exit(1);
+            $siteUrl = "https://$siteUrl";
+            echo "The site URL must start with http:// or https://. Attempting to use $siteUrl\n";
         }
 
         $homeDir = getenv('HOME');
@@ -300,7 +300,6 @@ class Run {
         echo "  disembark connect <site-url> <token>       Connect to a site\n";
         echo "  disembark list                             Lists all sites\n";
         echo "  disembark version                          Shows version\n";
-       
     }
 
     private static function humanFilesize($bytes, $decimals = 2) {
