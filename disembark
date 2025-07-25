@@ -25,6 +25,14 @@ class Run {
                 self::connect($siteUrl, $token);
                 break;
 
+            case 'list':
+                if ($argc != 2) {
+                    echo "Error: Invalid arguments for sites\n";
+                    exit(1);
+                }
+                self::sites();
+                break;
+            
             case 'backup':
                 if ($argc != 3) {
                     echo "Error: Invalid arguments for backup.\n";
@@ -250,6 +258,35 @@ class Run {
         echo self::liveExecuteCommand("curl -s https://disembark.host/generate-zip | bash -s -- --url=\"$siteUrl\" --token=\"$token\" --backup-token=\"$backup_token\" --cleanup");
     }
 
+    private static function sites() {
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+        $filePath = $homeDir . '/.disembark';
+        $data = [];
+
+        // Check if the file already exists and read its contents
+        if (file_exists($filePath)) {
+            $jsonContents = file_get_contents($filePath);
+            $data = json_decode($jsonContents);
+            if (!is_array($data)) {
+                echo "Error: Invalid data in $filePath.\n";
+                exit(1);
+            }
+        } else {
+            echo "Error: No configuration file found at $filePath.\n";
+            exit(1);
+        }
+
+        // Find the token for the given siteUrl
+        $token = null;
+        foreach ($data as $entry) {
+            echo "$entry->siteUrl\n";
+        }
+    }
+
     private static function version() {
         $version = self::VERSION;
         echo "Disembark v{$version}\n";
@@ -259,9 +296,10 @@ class Run {
         echo "Disembark CLI\n";
         echo "\n";
         echo "Usage:\n";
-        echo "  disembark backup <site-url>\n";
-        echo "  disembark connect <site-url> <token>\n";
-        echo "  disembark version\n";
+        echo "  disembark backup <site-url>                Backups a site\n";
+        echo "  disembark connect <site-url> <token>       Connect to a site\n";
+        echo "  disembark list                             Lists all sites\n";
+        echo "  disembark version                          Shows version\n";
        
     }
 
