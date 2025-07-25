@@ -9,7 +9,7 @@ class Run {
     public static function main($argv, $argc) {
         if ($argc < 2) {
             self::showHelp();
-            exit(1);
+            exit(0);
         }
 
         $command = $argv[1];
