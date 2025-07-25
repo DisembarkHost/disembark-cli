@@ -17,7 +17,7 @@ class Run {
         switch ($command) {
             case 'connect':
                 if ($argc != 4) {
-                    echo "Error: Invalid arguments for connect.\n";
+                    echo "Error: Invalid arguments for connect\n";
                     exit(1);
                 }
                 $siteUrl = $argv[2];
@@ -34,8 +34,8 @@ class Run {
                 break;
             
             case 'backup':
-                if ($argc != 3) {
-                    echo "Error: Invalid arguments for backup.\n";
+                if ($argc < 3 || $argc > 4) {
+                    echo "Error: Invalid arguments for backup\nRequires: <site-url>\n";
                     exit(1);
                 }
                 $siteUrl = $argv[2];
@@ -44,7 +44,7 @@ class Run {
             
             case 'version':
                 if ($argc != 2) {
-                    echo "Error: Invalid arguments for version.\n";
+                    echo "Error: Invalid arguments for version\n";
                     exit(1);
                 }
                 self::version();
