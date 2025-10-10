@@ -23,7 +23,6 @@ disembark backup <site-url>
 ```
 disembark connect <site-url> <token>
 ```
-
 ```
 disembark version
 ```
@@ -42,3 +41,32 @@ This will return the connection command which will link the the website to Disem
 ```
 disembark connect https://my-site.localhost exYNhNLr5dKymZqJZXomW0ie1tkyEyOjKgTSchhmih
 ```
+
+# Changelog
+
+## **v1.1.0** - October 10th 2025
+
+### Added
+* A new **`list` command** has been added to display all connected sites.
+* A new **`upgrade` command** to update Disembark CLI to latest version.
+* The `backup` command now includes an **`--exclude-tables`** option, which allows you to exclude specific database tables from the backup. This feature supports the use of wildcards for more flexible table selection.
+* You can now use the **`-x` argument** with the `backup` command to exclude certain files or directories from the backup. You can use this option multiple times to exclude several paths.
+* A new **`--preview` argument** has been added to the `backup` command to display a list of files and tables that will be included in the backup without actually running the backup process.
+
+### **v1.0.0** - June 8th 2024
+
+### Initial Release
+* Provides a `connect` command to securely save a site URL and token.
+* Credentials are saved to a `.disembark` file in the user's home directory.
+* The tool can add new site credentials or update the token for an existing site.
+* Verifies that the site URL format is valid before attempting to connect.
+* Includes a `backup` command to initiate the backup process for a specified site.
+* Reads the appropriate token for the site from the configuration file.
+* Performs backups by making a series of requests to the Disembark WordPress plugin API.
+* The backup process includes exporting individual database tables, zipping the full database, and processing site files in batches.
+* Finalizes the backup by executing a remote script via `curl` to generate a complete zip archive.
+* The script is designed to be run from the command line.
+* A `version` command is included to display the current version of the tool.
+* A `showHelp` function displays usage instructions for available commands.
+* Provides real-time progress and status messages during the backup process.
+* Includes a utility to convert bytes into a human-readable file size format.
