@@ -65,13 +65,19 @@ class Run {
                 $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
                 self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview);
                 break;
-            
             case 'version':
                 if ($argc != 2) {
                     echo "Error: Invalid arguments for version\n";
                     exit(1);
                 }
                 self::version();
+                break;
+            case 'upgrade':
+                if ($argc != 2) {
+                    echo "Error: Invalid arguments for upgrade\n";
+                    exit(1);
+                }
+                self::upgrade();
                 break;
             default:
                 echo "Error: Unknown command '$command'.\n\n";
@@ -494,6 +500,66 @@ class Run {
         echo "Disembark v{$version}\n";
     }
 
+    private static function upgrade() {
+        echo "Checking for updates...\n";
+        $current_version = self::VERSION;
+    
+        // Get latest version from GitHub redirect
+        $latest_version_cmd = "curl -sL -o /dev/null -w '%{url_effective}' https://github.com/DisembarkHost/disembark-cli/releases/latest | sed 's/.*\\/v//'";
+        $latest_version = trim(shell_exec($latest_version_cmd));
+    
+        if (empty($latest_version)) {
+            echo "Error: Could not fetch the latest version information.\n";
+            exit(1);
+        }
+    
+        if (version_compare($latest_version, $current_version, '>')) {
+            echo "New version {$latest_version} available. Upgrading from {$current_version}...\n";
+    
+            $pharPath = \Phar::running(false);
+            if (empty($pharPath)) {
+                echo "Error: Could not determine the path of the running script. Upgrade failed.\n";
+                exit(1);
+            }
+    
+            $downloadUrl = 'https://github.com/DisembarkHost/disembark-cli/raw/main/disembark.phar';
+            
+            // Use a temporary file for the download
+            $tmpFile = tempnam(sys_get_temp_dir(), 'disembark-upgrade-');
+            if ($tmpFile === false) {
+                echo "Error: Could not create a temporary file. Upgrade failed.\n";
+                exit(1);
+            }
+    
+            echo "Downloading new version...\n";
+            $newPhar = file_get_contents($downloadUrl);
+    
+            if ($newPhar === false) {
+                echo "Error: Failed to download the new version. Upgrade failed.\n";
+                unlink($tmpFile);
+                exit(1);
+            }
+    
+            file_put_contents($tmpFile, $newPhar);
+            chmod($tmpFile, 0755); // Make it executable
+    
+            // Replace the current phar with the new one
+            if (!@rename($tmpFile, $pharPath)) {
+                echo "Error: Failed to replace the current script. You may need to run the command with sudo.\n";
+                echo "Try: sudo disembark upgrade\n";
+                // Attempt to clean up temp file if rename fails but it still exists
+                if (file_exists($tmpFile)) {
+                    unlink($tmpFile);
+                }
+                exit(1);
+            }
+    
+            echo "Upgrade complete. You are now on version {$latest_version}.\n";
+        } else {
+            echo "You are already using the latest version ({$current_version}).\n";
+        }
+    }
+
     private static function showHelp() {
         echo "Disembark CLI\n";
         echo "\n";
@@ -508,6 +574,7 @@ class Run {
         echo "Other Commands:\n";
         echo "  disembark connect <site-url> <token>          Connect to a site\n";
         echo "  disembark list                                Lists all sites\n";
+        echo "  disembark upgrade                             Upgrades the CLI to the latest version\n";
         echo "  disembark version                             Shows version\n";
     }
 
