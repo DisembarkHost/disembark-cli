@@ -6,7 +6,7 @@ Generate and download Disembark backups from the command line.
 
 Download latest version of `disembark.phar` using `wget` or from [Disembark CLI](https://github.com/DisembarkHost/disembark-cli/releases) release.
 ```
-wget https://github.com/DisembarkHost/disembark-cli/raw/main/disembark.phar
+wget https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar
 ```
 Then copy to user local bin for global availability of `disembark`.
 
