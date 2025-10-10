@@ -1,11 +1,9 @@
 #!/usr/bin/env php
 <?php
 namespace Disembark;
-
 class Run {
 
-    const VERSION = '1.0.0';
-
+    const VERSION = '1.1.0';
     public static function main($argv, $argc) {
         if ($argc < 2) {
             self::showHelp();
@@ -13,7 +11,6 @@ class Run {
         }
 
         $command = $argv[1];
-
         switch ($command) {
             case 'connect':
                 if ($argc != 4) {
@@ -32,14 +29,41 @@ class Run {
                 }
                 self::sites();
                 break;
-            
             case 'backup':
-                if ($argc < 3 || $argc > 4) {
-                    echo "Error: Invalid arguments for backup\nRequires: <site-url>\n";
+                if ($argc < 3) {
+                    echo "Error: Invalid arguments for backup\nRequires: <site-url> [options]\n";
                     exit(1);
                 }
                 $siteUrl = $argv[2];
-                self::backup($siteUrl);
+                $exclude_paths = [];
+                $exclude_tables_str = '';
+                $preview = false;
+                $i = 3;
+                while ($i < $argc) {
+                    if ($argv[$i] === '--preview') {
+                        $preview = true;
+                        $i++;
+                        continue;
+                    }
+                    if ($argv[$i] === '-x') {
+                        if (isset($argv[$i + 1])) {
+                            $exclude_paths[] = rtrim($argv[$i + 1], '/');
+                            $i += 2;
+                        } else {
+                            echo "Error: Missing value for -x option.\n";
+                            exit(1);
+                        }
+                    } elseif (strpos($argv[$i], '--exclude-tables=') === 0) {
+                        $exclude_tables_str = substr($argv[$i], strlen('--exclude-tables='));
+                        $i++;
+                    } else {
+                        echo "Error: Unknown argument '{$argv[$i]}'\n";
+                        self::showHelp();
+                        exit(1);
+                    }
+                }
+                $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
+                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview);
                 break;
             
             case 'version':
@@ -49,7 +73,6 @@ class Run {
                 }
                 self::version();
                 break;
-
             default:
                 echo "Error: Unknown command '$command'.\n\n";
                 self::showHelp();
@@ -60,7 +83,6 @@ class Run {
     private static function connect($siteUrl, $token) {
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
-        
         // Verify the site URL starts with http:// or https://
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
             $siteUrl = "https://$siteUrl";
@@ -125,7 +147,6 @@ class Run {
         }
         
         $jsonData = json_encode($data, JSON_PRETTY_PRINT);
-        
         if (file_put_contents($filePath, $jsonData) === false) {
             echo "Error: Unable to write to $filePath.\n";
             exit(1);
@@ -134,11 +155,105 @@ class Run {
         echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
     }
 
-    private static function backup($siteUrl) {
+    private static function runPreview($siteUrl, $token, $exclude_paths, $exclude_tables) {
+        echo "Fetching site manifest for preview...\n";
+    
+        // 1. Fetch full file manifest
+        try {
+            $response_files = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/full-manifest?token=$token", [], ['verify' => false, 'timeout' => 600]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            echo "Error: Failed to fetch file manifest: {$e->getMessage()}\n";
+            exit(1);
+        }
+        if ($response_files->status_code !== 200) {
+            echo "Error: Failed to fetch file manifest. HTTP response code: {$response_files->status_code}\n";
+            exit(1);
+        }
+        $all_files = json_decode($response_files->body);
+    
+        // 2. Fetch database info
+        try {
+            $response_db = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
+        } catch (\WpOrg\Requests\Exception $e) {
+            echo "Error: Failed to fetch database info: {$e->getMessage()}\n";
+            exit(1);
+        }
+        if ($response_db->status_code !== 200) {
+            echo "Error: Failed to fetch database info. HTTP response code: {$response_db->status_code}\n";
+            exit(1);
+        }
+        $all_tables = json_decode($response_db->body);
+    
+        // 3. Calculate file stats
+        $totalFiles = 0;
+        $totalSize = 0;
+        $excludedFiles = 0;
+        $excludedSize = 0;
+    
+        foreach ($all_files as $file) {
+            $totalFiles++;
+            $totalSize += $file->size;
+            $isExcluded = false;
+            foreach ($exclude_paths as $exclude_path) {
+                if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
+                    $isExcluded = true;
+                    break;
+                }
+            }
+            if ($isExcluded) {
+                $excludedFiles++;
+                $excludedSize += $file->size;
+            }
+        }
+        $remainingFiles = $totalFiles - $excludedFiles;
+        $remainingSize = $totalSize - $excludedSize;
+    
+        // 4. Calculate database stats
+        $totalTables = count($all_tables);
+        $totalDbSize = array_sum(array_column($all_tables, 'size'));
+        $excludedTables = 0;
+        $excludedDbSize = 0;
+    
+        foreach ($all_tables as $table) {
+            $is_excluded = false;
+            foreach ($exclude_tables as $pattern) {
+                if (fnmatch($pattern, $table->table)) {
+                    $is_excluded = true;
+                    break;
+                }
+            }
+            if ($is_excluded) {
+                $excludedTables++;
+                $excludedDbSize += $table->size;
+            }
+        }
+        $remainingTables = $totalTables - $excludedTables;
+        $remainingDbSize = $totalDbSize - $excludedDbSize;
+    
+        // 5. Display results
+        echo "\nBackup Preview: $siteUrl\n\n";
+    
+        echo "File Backup Summary\n";
+        printf("%-24s %12s %12s\n", "", "Count", "Size");
+        printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
+        printf("%-24s %12s %12s\n", "Total Files:", number_format($totalFiles), self::humanFilesize($totalSize));
+        printf("%-24s %12s %12s\n", "Excluded Files:", number_format($excludedFiles), self::humanFilesize($excludedSize));
+        printf("%-24s %12s %12s\n", "Files to be Backed Up:", number_format($remainingFiles), self::humanFilesize($remainingSize));
+    
+        echo "\nDatabase Backup Summary\n";
+        printf("%-24s %12s %12s\n", "", "Count", "Size");
+        printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
+        printf("%-24s %12s %12s\n", "Total Tables:", number_format($totalTables), self::humanFilesize($totalDbSize));
+        printf("%-24s %12s %12s\n", "Excluded Tables:", number_format($excludedTables), self::humanFilesize($excludedDbSize));
+        printf("%-24s %12s %12s\n", "Tables to be Backed Up:", number_format($remainingTables), self::humanFilesize($remainingDbSize));
+    
+        echo "\n* This is an estimate. Actual backup size may vary.\n";
+    }
+
+    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false) {
 
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
-        
         // Verify the site URL starts with http:// or https://
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
             $siteUrl = "https://$siteUrl";
@@ -181,6 +296,18 @@ class Run {
             exit(1);
         }
         
+        if ($preview) {
+            self::runPreview($siteUrl, $token, $exclude_paths, $exclude_tables);
+            exit(0);
+        }
+
+        if (!empty($exclude_paths)) {
+            echo "Excluding the following paths:\n";
+            foreach ($exclude_paths as $path) {
+                echo " - $path\n";
+            }
+        }
+
         // Implement the logic for backing up the site with the given URL
         $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -24);
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
@@ -191,19 +318,87 @@ class Run {
             echo "Error: Request failed with error: {$e->getMessage()}\n";
             exit(1);
         }
-        $database     = json_decode( $response->body );
-        try {
-            $response     = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/files?token=$token&backup_token=$backup_token", [], [ 'verify' => false, 'timeout' => 600 ]);
-        } catch (\WpOrg\Requests\Exception $e) {
-            // Handle the exception
-            echo "Error: Request failed with error: {$e->getMessage()}\n";
+        if ($response->status_code !== 200) {
+            echo "Error: Failed to start backup. HTTP response code: {$response->status_code}\n";
             exit(1);
         }
-        $files        = json_decode( $response->body );
+        if ( empty( $response->body )) {
+            echo "Error: Could not get list of database tables\n";
+            exit(1);
+        }
+
+        $all_tables = json_decode($response->body);
+        $database = [];
+        if (!empty($exclude_tables)) {
+            echo "Excluding database tables matching:\n";
+            foreach ($exclude_tables as $pattern) {
+                echo " - $pattern\n";
+            }
+        
+            foreach ($all_tables as $table) {
+                $is_excluded = false;
+                foreach ($exclude_tables as $pattern) {
+                    if (fnmatch($pattern, $table->table)) {
+                        $is_excluded = true;
+                        break;
+                    }
+                }
+                if (!$is_excluded) {
+                    $database[] = $table;
+                }
+            }
+        } else {
+            $database = $all_tables;
+        }
+
+        // Split up large database tables (> 200 MB) into smaller parts
+        $max_size = "209715200";
+        $skip_database_zip = false;
+        foreach ($database as $table) {
+            $table->running = false;
+            $table->done    = false;
+            if ( $table->size > $max_size ) {
+                $skip_database_zip = true;
+                $parts = ceil( $table->size / $max_size );
+                $table->parts = $parts;
+                $table->current = 0;
+                $table->rows_per_part = ceil( $table->row_count / $parts );
+            }
+        }
+        
         $headers = [
             'Content-Type' => 'application/json; charset=utf-8'
         ];
-        $data = [
+
+        if (!empty($exclude_paths)) {
+            echo "Applying file exclusions and generating manifest...\n";
+            $manifest_data = [
+                "token"         => $token,
+                "backup_token"  => $backup_token,
+                "exclude_files" => implode("\n", $exclude_paths),
+            ];
+            try {
+                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/regenerate-manifest", $headers, json_encode($manifest_data), ['verify' => false, 'timeout' => 600]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+        } else {
+            try {
+                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/files?token=$token&backup_token=$backup_token", [], ['verify' => false, 'timeout' => 600]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+        }
+
+        if ($response->status_code !== 200) {
+            echo "Error: Failed to get file list. HTTP response code: {$response->status_code}\n";
+            exit(1);
+        }
+
+        $files        = json_decode( $response->body );
+        $db_data = [
             "site_url"     => $siteUrl,
             "token"        => $token, 
             "backup_token" => $backup_token
@@ -211,7 +406,7 @@ class Run {
         foreach ( $database as $table ) {
             echo "Backing up table $table->table\n";
             try {
-                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/export/database/{$table->table}", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/export/database/{$table->table}", $headers, json_encode($db_data), [ 'verify' => false, 'timeout' => 600 ]);
             } catch (\WpOrg\Requests\Exception $e) {
                 // Handle the exception
                 echo "Error: Request failed with error: {$e->getMessage()}\n";
@@ -225,7 +420,7 @@ class Run {
 
         echo "Zipping database\n";
         try {
-            $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-database", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+            $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-database", $headers, json_encode($db_data), [ 'verify' => false, 'timeout' => 600 ]);
         } catch (\WpOrg\Requests\Exception $e) {
             // Handle the exception
             echo "Error: Request failed with error: {$e->getMessage()}\n";
@@ -237,12 +432,20 @@ class Run {
         $total_file_count = array_sum( array_column( $files, 'count' ) );
         $total_file_size  = self::humanFilesize( array_sum( array_column( $files, 'size' ) ) );
         echo "Preparing to backup $total_file_count files totaling $total_file_size files\n";
+        $zip_payload = [
+            "token" => $token,
+            "backup_token" => $backup_token
+        ];
+        if (!empty($exclude_paths)) {
+            $zip_payload['exclude_files'] = implode("\n", $exclude_paths);
+        }
+
         foreach ( $files as $file ) {
             $size = self::humanFilesize($file->size);
             echo "Backing up $file->count files totaling $size ($current_step/$steps) \n";
-            $data['file'] = $file->name;
+            $zip_payload['file'] = $file->name;
             try {
-                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-files", $headers, json_encode($data), [ 'verify' => false, 'timeout' => 600 ]);
+                $response = \WpOrg\Requests\Requests::post("$siteUrl/wp-json/disembark/v1/zip-files", $headers, json_encode($zip_payload), [ 'verify' => false, 'timeout' => 600 ]);
             } catch (\WpOrg\Requests\Exception $e) {
                 // Handle the exception
                 echo "Error: Request failed with error: {$e->getMessage()}\n";
@@ -266,7 +469,6 @@ class Run {
         }
         $filePath = $homeDir . '/.disembark';
         $data = [];
-
         // Check if the file already exists and read its contents
         if (file_exists($filePath)) {
             $jsonContents = file_get_contents($filePath);
@@ -296,26 +498,33 @@ class Run {
         echo "Disembark CLI\n";
         echo "\n";
         echo "Usage:\n";
-        echo "  disembark backup <site-url>                Backups a site\n";
-        echo "  disembark connect <site-url> <token>       Connect to a site\n";
-        echo "  disembark list                             Lists all sites\n";
-        echo "  disembark version                          Shows version\n";
+        echo "  disembark backup <site-url> [options]         Backs up a site.\n";
+        echo "\n";
+        echo "Options:\n";
+        echo "  --preview                                     Show a summary of files and DB tables to be backed up without running the backup.\n";
+        echo "  -x <path>                                     Exclude a file or directory path. Can be specified multiple times.\n";
+        echo "  --exclude-tables=<tables>                     Exclude tables (comma-separated, no spaces). Wildcards (*) are supported.\n";
+        echo "\n";
+        echo "Other Commands:\n";
+        echo "  disembark connect <site-url> <token>          Connect to a site\n";
+        echo "  disembark list                                Lists all sites\n";
+        echo "  disembark version                             Shows version\n";
     }
 
     private static function humanFilesize($bytes, $decimals = 2) {
+        if ($bytes === 0) return '0 B';
         $factor = floor((strlen($bytes) - 1) / 3);
         if ($factor > 0) $sz = 'KMGT';
         return sprintf("%.{$decimals}f", $bytes / pow(1024, $factor)) . @$sz[$factor - 1] . 'B';
     }
 
     private static function liveExecuteCommand($cmd) {
-        while (@ ob_end_flush()); // end all output buffers if any
+        while (@ ob_end_flush());
+        // end all output buffers if any
     
         $proc = popen("$cmd 2>&1", 'r');
-    
         $live_output     = "";
         $complete_output = "";
-    
         while (!feof($proc))
         {
             $live_output     = fread($proc, 4096);
@@ -325,10 +534,8 @@ class Run {
         }
     
         pclose($proc);
-    
         // get exit status
         preg_match('/[0-9]+$/', $complete_output, $matches);
-    
     }
 }
 
