@@ -51,7 +51,7 @@ disembark connect https://my-site.localhost exYNhNLr5dKymZqJZXomW0ie1tkyEyOjKgTS
 
 # Changelog
 
-## **v2.0.0** - October 17, 2025
+## **v2.0.0** - October 17th, 2025
 
 ### Changed
 
