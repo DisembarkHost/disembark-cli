@@ -254,166 +254,166 @@ class Run {
         }
     }
 
-     private static function runPreview($siteUrl, $token, $exclude_paths, $exclude_tables) {
-         echo "Fetching site info for preview...\n";
-         $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
-         // Temp token for preview
+    private static function runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables) {
+        echo "Fetching site info for preview...\n";
+        // Temp token now passed in from backup()
 
-         // 1. Fetch database info
-         $all_tables = [];
-         try {
-             $response_db = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-             if ($response_db->status_code !== 200) {
-                 echo "Error: Failed to fetch database info. HTTP response code: {$response_db->status_code}\n";
-                 exit(1); // Exit if DB info fails for preview
-             }
-             $all_tables = json_decode($response_db->body);
-             if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                  echo "Error: Invalid database info received.\n";
-                  $all_tables = [];
-             }
-         } catch (\WpOrg\Requests\Exception $e) {
+        // 1. Fetch database info
+        $all_tables = [];
+        try {
+            $response_db = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
+            if ($response_db->status_code !== 200) {
+                echo "Error: Failed to fetch database info. HTTP response code: {$response_db->status_code}\n";
+                exit(1); // Exit if DB info fails for preview
+            }
+            $all_tables = json_decode($response_db->body);
+            if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
+                 echo "Error: Invalid database info received.\n";
+                 $all_tables = [];
+            }
+        } catch (\WpOrg\Requests\Exception $e) {
              echo "Error: Failed to fetch database info: {$e->getMessage()}\n";
-             exit(1); // Exit if DB info fails for preview
-         }
+            exit(1); // Exit if DB info fails for preview
+        }
 
-         // 2. Run the multi-step manifest generation to get filtered results
-         $files_manifests = [];
-         try {
-              echo "Running analysis (this may take a while)...\n";
-              $exclude_files_string = implode("\n", $exclude_paths);
+        // 2. Run the multi-step manifest generation to get filtered results
+        $files_manifests = [];
+        try {
+            echo "Running analysis (this may take a while)...\n";
+             $exclude_files_string = implode("\n", $exclude_paths);
 
-              // Step 1: Initiate
-              self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate', 'exclude_files' => $exclude_files_string], 'POST');
-              echo "Initiated file scan.\n";
+             // Step 1: Initiate
+             self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate', 'exclude_files' => $exclude_files_string], 'POST');
+             echo "Initiated file scan.\n";
 
-              // Step 2: Scan Loop
-              $scan_complete = false;
-              $last_scan_output = "";
-              while (!$scan_complete) {
-                  $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan', 'exclude_files' => $exclude_files_string], 'POST');
-                  if (!is_object($scan_response) || !isset($scan_response->status)) {
-                       throw new \Exception("Invalid response received during scan step.");
-                  }
-
-                  if ($scan_response->status === 'scan_complete') {
-                      $scan_complete = true;
-                      echo str_pad("", strlen($last_scan_output), " ") . "\r";
-                      printf("Scanning complete. Analyzed %d directories.\n", $scan_response->total_dirs ?? 0);
-                  } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
-                      $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
-                      echo $last_scan_output . "\r";
-                  } else {
-                       echo "\nWarning: Scan step response might be incomplete.\n";
-                  }
-                  usleep(250000);
-              }
-
-              // Step 3: Chunkify
-              echo "Chunkifying file list...\n";
-              $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify', 'exclude_files' => $exclude_files_string], 'POST');
-              $total_chunks = $chunk_response->total_chunks ?? 0;
-              if ($total_chunks === 0) {
-                   echo "No files found to analyze or an error occurred during chunkification.\n";
-              } else {
-                  echo "File list divided into {$total_chunks} chunks.\n";
-              }
-
-
-              // Step 4: Process Chunks
-              $last_chunk_output = "";
-              for ($i = 1; $i <= $total_chunks; $i++) {
-                   $last_chunk_output = sprintf("Processing chunk %d of %d...", $i, $total_chunks);
-                   echo $last_chunk_output . "\r";
-                   self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i, 'exclude_files' => $exclude_files_string], 'POST');
-                   usleep(50000);
-              }
-              if ($total_chunks > 0) {
-                   echo str_pad("", strlen($last_chunk_output), " ") . "\r";
-                   echo "Chunk processing complete.\n";
-              }
-
-
-              // Step 5: Finalize
-              $files_manifests = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize', 'exclude_files' => $exclude_files_string], 'POST');
-              if (!is_array($files_manifests)) {
-                  echo "Warning: Final manifest data is not in the expected format. File stats may be inaccurate.\n";
-                  $files_manifests = [];
-              }
-              echo "Analysis complete.\n";
-         } catch (\Exception $e) {
-              echo "Error during file analysis for preview: {$e->getMessage()}\n";
-              self::cleanupTemporaryFiles($siteUrl, $token, $backup_token); // Attempt cleanup
-              exit(1); // Exit preview on analysis failure
-         }
-
-
-         // 3. Calculate file stats TO BE BACKED UP
-         $remainingFiles = empty($files_manifests) ?
-         0 : array_sum(array_column($files_manifests, 'count'));
-         $remainingSize = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'size'));
-         // 4. Calculate database stats
-         $totalTables = count($all_tables);
-         $totalDbSize = empty($all_tables) ?
-         0 : array_sum(array_column($all_tables, 'size'));
-         $excludedTables = 0;
-         $excludedDbSize = 0;
-
-         $included_table_list = [];
-         foreach ($all_tables as $table) {
-             $table_size = isset($table->size) && is_numeric($table->size) ?
-             (float)$table->size : 0;
-             $is_excluded = false;
-             foreach ($exclude_tables as $pattern) {
-                 if (fnmatch($pattern, $table->table)) {
-                     $is_excluded = true;
-                     break;
+             // Step 2: Scan Loop
+             $scan_complete = false;
+             $last_scan_output = "";
+             while (!$scan_complete) {
+                 $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan', 'exclude_files' => $exclude_files_string], 'POST');
+                 if (!is_object($scan_response) || !isset($scan_response->status)) {
+                     throw new \Exception("Invalid response received during scan step.");
                  }
-             }
-             if ($is_excluded) {
-                 $excludedTables++;
-                 $excludedDbSize += $table_size;
+
+                 if ($scan_response->status === 'scan_complete') {
+                     $scan_complete = true;
+                     echo str_pad("", strlen($last_scan_output), " ") . "\r";
+                     printf("Scanning complete. Analyzed %d directories.\n", $scan_response->total_dirs ?? 0);
+                 } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
+                     $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
+                     echo $last_scan_output . "\r";
+                 } else {
+                     echo "\nWarning: Scan step response might be incomplete.\n";
+                 }
+                 usleep(250000);
+            }
+
+             // Step 3: Chunkify
+             echo "Chunkifying file list...\n";
+             $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify', 'exclude_files' => $exclude_files_string], 'POST');
+             $total_chunks = $chunk_response->total_chunks ?? 0;
+             if ($total_chunks === 0) {
+                 echo "No files found to analyze or an error occurred during chunkification.\n";
              } else {
-                 $table->size = $table_size;
-                 $included_table_list[] = $table;
+                 echo "File list divided into {$total_chunks} chunks.\n";
              }
-         }
-         $remainingTables = $totalTables - $excludedTables;
-         $remainingDbSize = empty($included_table_list) ? 0 : array_sum(array_column($included_table_list, 'size'));
 
 
-         // 5. Display results
-         echo "\nBackup Preview: $siteUrl\n";
-         echo "* Exclusions are applied server-side during analysis.\n";
-         echo "* The summary below shows only files and tables scheduled for backup.\n\n";
-         echo "File Backup Summary\n";
-         printf("%-24s %12s %12s\n", "", "Count", "Size");
-         printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
-         printf("%-24s %12s %12s\n", "Files to be Backed Up:", number_format($remainingFiles), self::humanFilesize($remainingSize));
+             // Step 4: Process Chunks
+             $last_chunk_output = "";
+             for ($i = 1; $i <= $total_chunks; $i++) {
+                   $last_chunk_output = sprintf("Processing chunk %d of %d...", $i, $total_chunks);
+                  echo $last_chunk_output . "\r";
+                  self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i, 'exclude_files' => $exclude_files_string], 'POST');
+                  usleep(50000);
+             }
+             if ($total_chunks > 0) {
+                   echo str_pad("", strlen($last_chunk_output), " ") . "\r";
+                  echo "Chunk processing complete.\n";
+             }
 
-         echo "\nDatabase Backup Summary\n";
-         printf("%-24s %12s %12s\n", "", "Count", "Size");
-         printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
-         printf("%-24s %12s %12s\n", "Total Tables:", number_format($totalTables), self::humanFilesize($totalDbSize));
-         printf("%-24s %12s %12s\n", "Excluded Tables:", number_format($excludedTables), self::humanFilesize($excludedDbSize));
-         printf("%-24s %12s %12s\n", "Tables to be Backed Up:", number_format($remainingTables), self::humanFilesize($remainingDbSize));
-         echo "\n* This is an estimate. Actual backup size may vary.\n";
-         // 6. Cleanup temporary files generated during preview
-          self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-     }
 
-      // Helper function specifically for cleanup after preview or backup failure
-      private static function cleanupTemporaryFiles($siteUrl, $token, $backup_token) {
-          echo "Cleaning up temporary files on server...\n";
-          try {
-              $payload = ['backup_token' => $backup_token];
-              self::make_request($siteUrl, $token, $backup_token, '/cleanup', $payload, 'GET');
-              echo "Cleanup request sent.\n";
-          } catch (\Exception $e) {
-              echo "Warning: Cleanup request failed: {$e->getMessage()}\n";
-              // Don't exit here, cleanup failure is not critical for the overall process
-          }
-      }
+             // Step 5: Finalize
+             $files_manifests = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize', 'exclude_files' => $exclude_files_string], 'POST');
+             if (!is_array($files_manifests)) {
+                 echo "Warning: Final manifest data is not in the expected format. File stats may be inaccurate.\n";
+                 $files_manifests = [];
+             }
+             echo "Analysis complete.\n";
+        } catch (\Exception $e) {
+            echo "Error during file analysis for preview: {$e->getMessage()}\n";
+             self::cleanupTemporaryFiles($siteUrl, $token, $backup_token); // Attempt cleanup
+             exit(1); // Exit preview on analysis failure
+        }
+
+
+        // 3. Calculate file stats TO BE BACKED UP
+        $remainingFiles = empty($files_manifests) ?
+        0 : array_sum(array_column($files_manifests, 'count'));
+        $remainingSize = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'size'));
+        // 4. Calculate database stats
+        $totalTables = count($all_tables);
+        $totalDbSize = empty($all_tables) ?
+        0 : array_sum(array_column($all_tables, 'size'));
+        $excludedTables = 0;
+        $excludedDbSize = 0;
+
+        $included_table_list = [];
+        foreach ($all_tables as $table) {
+            $table_size = isset($table->size) && is_numeric($table->size) ?
+            (float)$table->size : 0;
+            $is_excluded = false;
+            foreach ($exclude_tables as $pattern) {
+                if (fnmatch($pattern, $table->table)) {
+                    $is_excluded = true;
+                    break;
+                }
+            }
+            if ($is_excluded) {
+                $excludedTables++;
+                $excludedDbSize += $table_size;
+            } else {
+                $table->size = $table_size;
+                $included_table_list[] = $table;
+            }
+        }
+        $remainingTables = $totalTables - $excludedTables;
+        $remainingDbSize = empty($included_table_list) ? 0 : array_sum(array_column($included_table_list, 'size'));
+
+
+        // 5. Display results
+        echo "\nBackup Preview: $siteUrl\n";
+        echo "* Exclusions are applied server-side during analysis.\n";
+        echo "* The summary below shows only files and tables scheduled for backup.\n\n";
+        echo "File Backup Summary\n";
+        printf("%-24s %12s %12s\n", "", "Count", "Size");
+        printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
+        printf("%-24s %12s %12s\n", "Files to be Backed Up:", number_format($remainingFiles), self::humanFilesize($remainingSize));
+
+        echo "\nDatabase Backup Summary\n";
+        printf("%-24s %12s %12s\n", "", "Count", "Size");
+        printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
+        printf("%-24s %12s %12s\n", "Total Tables:", number_format($totalTables), self::humanFilesize($totalDbSize));
+        printf("%-24s %12s %12s\n", "Excluded Tables:", number_format($excludedTables), self::humanFilesize($excludedDbSize));
+        printf("%-24s %12s %12s\n", "Tables to be Backed Up:", number_format($remainingTables), self::humanFilesize($remainingDbSize));
+        echo "\n* This is an estimate. Actual backup size may vary.\n";
+        
+        // Return the generated manifest
+        return $files_manifests;
+    }
+
+    // Helper function specifically for cleanup after preview or backup failure
+    private static function cleanupTemporaryFiles($siteUrl, $token, $backup_token) {
+        echo "Cleaning up temporary files on server...\n";
+        try {
+            $payload = ['backup_token' => $backup_token];
+            self::make_request($siteUrl, $token, $backup_token, '/cleanup', $payload, 'GET');
+            echo "Cleanup request sent.\n";
+        } catch (\Exception $e) {
+            echo "Warning: Cleanup request failed: {$e->getMessage()}\n";
+            // Don't exit here, cleanup failure is not critical for the overall process
+        }
+    }
 
     private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false) {
 
@@ -438,12 +438,12 @@ class Run {
             $jsonContents = file_get_contents($filePath);
             $data = json_decode($jsonContents);
             if (!is_array($data)) {
-                 if (is_object($data)) {
+                if (is_object($data)) {
                     $data = [$data];
-                 } else {
-                     echo "Error: Invalid data in $filePath.\n";
-                     exit(1);
-                 }
+                } else {
+                    echo "Error: Invalid data in $filePath.\n";
+                    exit(1);
+                }
             }
         } else {
             echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
@@ -453,7 +453,7 @@ class Run {
         // Find the token for the given siteUrl
         $token = null;
         foreach ($data as $entry) {
-             if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
                 $token = $entry->token;
                 break;
             }
@@ -464,10 +464,15 @@ class Run {
             exit(1);
         }
 
-        // Run preview first, it will exit if DB fetch fails or if analysis fails
-        self::runPreview($siteUrl, $token, $exclude_paths, $exclude_tables);
-        // If the preview flag is set, exit after showing the summary.
+        // Generate unique token for this backup session
+        $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+        
+        // Run preview, which now also generates the manifest for the actual backup
+        $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
+
+        // If the preview flag is set, clean up manifest files and exit.
         if ($preview) {
+            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
             exit(0);
         }
 
@@ -478,6 +483,8 @@ class Run {
         fclose($handle);
         if ($line !== '' && strtolower($line) !== 'yes' && strtolower($line) !== 'y') {
             echo "Backup cancelled by user.\n";
+            // Clean up the manifest files generated by the preview
+            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
             exit(0);
         }
 
@@ -489,14 +496,12 @@ class Run {
             }
         }
         if (!empty($exclude_tables)) {
-             echo "Excluding database tables matching:\n";
-             foreach ($exclude_tables as $pattern) {
-                 echo " - $pattern\n";
-             }
-         }
-
-        // Generate unique token for this backup session
-        $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+            echo "Excluding database tables matching:\n";
+            foreach ($exclude_tables as $pattern) {
+                echo " - $pattern\n";
+            }
+        }
+        
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
 
         // --- NEW: Setup Local Backup Environment ---
@@ -527,30 +532,30 @@ class Run {
                 // Fetch full table list again for the actual backup
                 $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], [ 'verify' => false, 'timeout' => 600 ]);
                 if ($response->status_code !== 200 || empty($response->body)) {
-                     throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
+                    throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
                 }
-                 $all_tables = json_decode($response->body);
-                 if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                     throw new \Exception("Invalid database list received during backup.");
-                 }
+                $all_tables = json_decode($response->body);
+                if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
+                    throw new \Exception("Invalid database list received during backup.");
+                }
 
-                 // Filter tables based on exclusions
-                 if (!empty($exclude_tables)) {
-                     foreach ($all_tables as $table) {
-                         $is_excluded = false;
-                         foreach ($exclude_tables as $pattern) {
-                             if (fnmatch($pattern, $table->table)) {
-                                 $is_excluded = true;
-                                 break;
-                             }
-                         }
-                         if (!$is_excluded) {
-                             $database[] = $table;
-                         }
-                     }
-                 } else {
-                     $database = $all_tables;
-                 }
+                // Filter tables based on exclusions
+                if (!empty($exclude_tables)) {
+                    foreach ($all_tables as $table) {
+                        $is_excluded = false;
+                        foreach ($exclude_tables as $pattern) {
+                            if (fnmatch($pattern, $table->table)) {
+                                $is_excluded = true;
+                                break;
+                            }
+                        }
+                        if (!$is_excluded) {
+                            $database[] = $table;
+                        }
+                    }
+                } else {
+                    $database = $all_tables;
+                }
 
             } catch (\Exception $e) {
                 echo "Error during database preparation: {$e->getMessage()}\n";
@@ -561,18 +566,18 @@ class Run {
             $max_size = 209715200; // 200 MB
             foreach ($database as $table) {
                  $table->running = false;
-                 $table->done    = false;
-                 $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
-                 $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
+                $table->done    = false;
+                $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
+                $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
 
-                 if ( $table_size > $max_size && $row_count > 0) {
-                     $parts = ceil( $table_size / $max_size );
-                     $table->parts = $parts;
-                     $table->current = 0;
-                     $table->rows_per_part = ceil( $row_count / $parts );
-                 } else {
-                     $table->parts = 0;
-                 }
+                if ( $table_size > $max_size && $row_count > 0) {
+                    $parts = ceil( $table_size / $max_size );
+                    $table->parts = $parts;
+                    $table->current = 0;
+                    $table->rows_per_part = ceil( $row_count / $parts );
+                } else {
+                    $table->parts = 0;
+                }
             }
 
             $headers = ['Content-Type' => 'application/json; charset=utf-8'];
@@ -584,15 +589,15 @@ class Run {
             echo "Backing up database tables...\n";
             $total_db_steps = 0;
             foreach ($database as $table) {
-                 $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
+                $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
             }
             $current_db_step = 0;
 
             foreach ( $database as $table ) {
                  if (!isset($table->table)) {
-                     echo "\nWarning: Skipping invalid table data entry in backup.\n";
-                     continue;
-                 }
+                    echo "\nWarning: Skipping invalid table data entry in backup.\n";
+                    continue;
+                }
 
                 $progress_message = "";
                 if ($table->parts > 0) {
@@ -656,78 +661,14 @@ class Run {
             rmdir($local_db_path); // Remove empty database temp dir
             // --- END DB LOOP ---
             
-            // --- File Manifest Generation ---
-            $files = [];
-            echo "Starting file analysis...\n";
-            $exclude_files_string = implode("\n", $exclude_paths);
-
-            // Step 1: Initiate
-            self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate', 'exclude_files' => $exclude_files_string], 'POST');
-            echo "Initiated file scan.\n";
-
-            // Step 2: Scan
-            $scan_complete = false;
-            $last_scan_output = "";
-            while (!$scan_complete) {
-                 $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan', 'exclude_files' => $exclude_files_string], 'POST');
-                 if (!is_object($scan_response) || !isset($scan_response->status)) {
-                     throw new \Exception("Invalid response received during file scan step.");
-                 }
-
-                 if ($scan_response->status === 'scan_complete') {
-                     $scan_complete = true;
-                     echo str_pad("", strlen($last_scan_output), " ") . "\r";
-                     printf("Scanning complete. Analyzed %d directories.\n", $scan_response->total_dirs ?? 0);
-                 } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
-                     $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
-                     echo $last_scan_output . "\r";
-                 } else {
-                      echo "\nWarning: Scan step response might be incomplete.\n";
-                 }
-                 usleep(250000);
-            }
-
-            // Step 3: Chunkify
-            echo "Chunkifying file list...\n";
-            $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify', 'exclude_files' => $exclude_files_string], 'POST');
-            $total_chunks = $chunk_response->total_chunks ?? 0;
-            if ($total_chunks === 0) {
-                 echo "No files found to backup based on exclusions.\n";
-                 $files = [];
-            } else {
-                echo "File list divided into {$total_chunks} chunks.\n";
-            }
-
-
-            // Step 4: Process Chunks
-            $last_chunk_output = "";
-            for ($i = 1; $i <= $total_chunks; $i++) {
-                $last_chunk_output = sprintf("Processing chunk %d of %d...", $i, $total_chunks);
-                echo $last_chunk_output . "\r";
-                self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i, 'exclude_files' => $exclude_files_string], 'POST');
-                usleep(50000);
-            }
-             if ($total_chunks > 0) {
-                  echo str_pad("", strlen($last_chunk_output), " ") . "\r";
-                  echo "Chunk processing complete.\n";
-             }
-
-
-            // Step 5: Finalize
-            $files = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize', 'exclude_files' => $exclude_files_string], 'POST');
-            if (!is_array($files)) {
-                 echo "Warning: Final manifest data is not in the expected format.\n";
-                 $files = [];
-            }
-            echo "File manifest generation complete.\n";
-            // --- End File Manifest Generation ---
-
+            // --- File Zipping ---
             if (!empty($files)) {
                 $steps            = count($files);
                 $current_step     = 1;
                 $total_file_count = array_sum(array_column($files, 'count'));
                 $total_file_size  = self::humanFilesize(array_sum(array_column($files, 'size')));
                 echo "Preparing to backup " . number_format($total_file_count) . " files totaling " . $total_file_size . "\n";
+                $exclude_files_string = implode("\n", $exclude_paths);
                 $zip_payload_base = [
                     "token"         => $token,
                     "backup_token"  => $backup_token,
@@ -770,9 +711,9 @@ class Run {
                     $current_step++;
                     usleep(100000);
                 }
-                 echo "File zipping and download complete.\n";
+                echo "File zipping and download complete.\n";
             } else {
-                 echo "Skipping file backup as no files were included in the manifest.\n";
+                echo "Skipping file backup as no files were included in the manifest.\n";
             }
             // --- End File Zipping ---
 
@@ -804,7 +745,6 @@ class Run {
 
         echo "\nBackup complete: $final_zip_name is ready.\n";
     }
-
 
     private static function sites() {
         $homeDir = getenv('HOME');
