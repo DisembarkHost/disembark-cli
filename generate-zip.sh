@@ -84,8 +84,15 @@ run_command() {
     done
     mkdir public
     mkdir database
+
+    # Move .sql files if they exist
     if ls *.sql 1> /dev/null 2>&1; then
       mv *.sql database/
+    fi
+    
+    # Move .sql.txt files if they exist
+    if ls *.sql.txt 1> /dev/null 2>&1; then
+      mv *.sql.txt database/
     fi
 
     # Unzip files
@@ -103,10 +110,13 @@ run_command() {
     if [ -f "database.zip" ]; then
       unzip -q database.zip -d database/
     fi
-  
-    if ls database/*.sql 1> /dev/null 2>&1; then
-      cat $(ls database/*.sql | sort -V) >> public/database-$temp_directory.sql
+ 
+    # Check if any .sql or .sql.txt files exist in the database directory
+    if ls database/*.sql database/*.sql.txt 1> /dev/null 2>&1; then
+      # Concatenate all .sql and .sql.txt files, sorted, into the main sql file
+      cat $(ls database/*.sql database/*.sql.txt | sort -V) >> public/database-$temp_directory.sql
     fi
+
     echo "Generating $temp_directory-$domain.zip"
     zip -qr $temp_directory-$domain.zip public
     mv $temp_directory-$domain.zip ../
