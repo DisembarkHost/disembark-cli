@@ -853,14 +853,19 @@ class Run {
         }
         
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
-        // --- NEW: Setup Local Backup Environment ---
-        $temp_directory = "snapshot-" . time();
+        // --- Setup Local Backup Environment ---
+        // Create the directory name
+        $temp_directory_name = "snapshot-" . time();
+        // Use getcwd() to create a full, absolute path
+        $temp_directory = getcwd() . DIRECTORY_SEPARATOR . $temp_directory_name;
+        
         $local_db_path = $temp_directory . '/database';
         $local_public_path = $temp_directory . '/public';
         $domain = preg_replace('/^https?:\/\/(www\.)?/', '', $siteUrl);
         $domain = preg_replace('/\//', '_', $domain);
-        $db_export_file = $local_public_path . '/database-' . $temp_directory . '.sql';
-        $final_zip_name = "{$temp_directory}-{$domain}.zip";
+        $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
+        $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
+
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
             if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
