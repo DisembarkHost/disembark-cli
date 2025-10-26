@@ -1235,6 +1235,8 @@ class Run {
         echo "\n";
         echo "Example:\n";
         echo "  disembark backup https://example.com --preview -x wp-content/uploads/large-dir --exclude-tables=wp_options,wp_logs\n";
+        echo "  disembark backup https://example.com --session-id=a1b2c3d4e5f6\n";
+        echo "  disembark sync https://example.com --session-id=a1b2c3d4e5f6\n";
     }
 
     /**
@@ -1262,7 +1264,7 @@ class Run {
     }
 
     /**
-     * Downloads a file directly from a URL.
+     * Downloads a file directly from a URL using WpOrg\Requests.
      */
     private static function download_file_direct($url, $destination) {
         $attempts = 0;
@@ -1272,25 +1274,31 @@ class Run {
         while ($attempts < $max_attempts) {
             $attempts++;
             try {
-                $url_arg = escapeshellarg($url);
-                $dest_arg = escapeshellarg($destination);
+                // Fetch response into memory, DO NOT stream to file
+                $options = [
+                    // 'filename' => $destination, // <-- REMOVED
+                    'verify' => false,
+                    'timeout' => 1800,
+                    'connect_timeout' => 30,
+                ];
+                $response = \WpOrg\Requests\Requests::get($url, [], $options);
 
-                $command = "curl -kLfs --connect-timeout 30 -m 1800 -o $dest_arg $url_arg";
-                exec($command, $output, $return_var);
-
-                if ($return_var !== 0) {
-                    $error_msg = "curl command failed with exit code $return_var. Error: " . implode("\n", $output);
-                    if ($return_var == 22) $error_msg = "curl failed (22): HTTP 404 Not Found or 403 Forbidden. Check file permissions on server.";
-                    if ($return_var == 28) $error_msg = "curl failed (28): Operation timed out.";
-                    if ($return_var == 92) $error_msg = "curl failed (92): HTTP/2 stream error. Server proxy likely killed the large download.";
-                    throw new \Exception($error_msg);
+                if (!$response->success) {
+                    // Add response body to the error for debugging
+                    throw new \Exception("Request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
                 
-                if (!file_exists($destination) || filesize($destination) === 0) {
-                    throw new \Exception("Downloaded file is empty. Server may have blocked the download.");
+                // Manually write the response body to the file
+                if (file_put_contents($destination, $response->body) === false) {
+                    throw new \Exception("Failed to write downloaded content to $destination.");
+                }
+
+                // Check if the body itself was empty
+                if (filesize($destination) === 0) {
+                    throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the download or sent an empty body.");
                 }
                 
-                return; // Success, exit loop
+                return; // Success
 
             } catch (\Exception $e) {
                 echo "\nWarning: Failed to download $url (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
@@ -1303,12 +1311,12 @@ class Run {
             }
         }
         
-        // If loop finishes without returning, it failed
+        // If loop finishes, it failed
         throw new \Exception("Failed to download $url after $max_attempts attempts. Last error: $last_error");
     }
 
     /**
-     * Downloads a file from the /stream-file endpoint.
+     * Downloads a file from the /stream-file endpoint using WpOrg\Requests.
      * Falls back to direct download if streaming fails.
      */
     private static function download_file_via_stream($siteUrl, $token, $relative_path, $destination) {
@@ -1321,25 +1329,37 @@ class Run {
             try {
                 $endpoint_url = $siteUrl . '/wp-json/disembark/v1/stream-file';
                 $payload = json_encode(['token' => $token, 'file' => $relative_path]);
+                $headers = ['Content-Type' => 'application/json'];
+                
+                // Fetch response into memory, DO NOT stream to file
+                $options = [
+                    // 'filename' => $destination, // <-- REMOVED
+                    'verify' => false,
+                    'timeout' => 1800,
+                    'connect_timeout' => 30,
+                ];
 
-                $dest_arg = escapeshellarg($destination);
-                $endpoint_arg = escapeshellarg($endpoint_url);
-                $payload_arg = escapeshellarg($payload);
-                $command = "curl -kLfs -X POST -H \"Content-Type: application/json\" -d $payload_arg --connect-timeout 30 -m 1800 -o $dest_arg $endpoint_arg";
-                exec($command, $output, $return_var);
-                if ($return_var !== 0) {
-                    $error_msg = "curl command failed with exit code $return_var. Error: " . implode("\n", $output);
-                    if ($return_var == 22) $error_msg = "curl failed (22): HTTP 404 Not Found or 403 Forbidden. Check stream API permissions.";
-                    if ($return_var == 28) $error_msg = "curl failed (28): Operation timed out.";
-                    if ($return_var == 92) $error_msg = "curl failed (92): HTTP/2 stream error. Server proxy likely killed the large download.";
-                    throw new \Exception($error_msg);
+                $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
+
+                if (!$response->success) {
+                     // Add response body to the error for debugging
+                     if ($response->status_code == 404 || $response->status_code == 403) {
+                         throw new \Exception("Stream API failed: HTTP {$response->status_code}. Body: " . substr($response->body, 0, 200));
+                    }
+                    throw new \Exception("Stream API request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
                 
-                if (!file_exists($destination) || filesize($destination) === 0) {
-                    throw new \Exception("Downloaded file is empty. Server may have blocked the stream request.");
+                // Manually write the response body to the file
+                if (file_put_contents($destination, $response->body) === false) {
+                    throw new \Exception("Failed to write downloaded stream content to $destination.");
+                }
+
+                // Check if the body itself was empty
+                if (filesize($destination) === 0) {
+                    throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the stream or sent an empty body.");
                 }
                 
-                return; // Success, exit loop
+                return; // Success
 
             } catch (\Exception $e) {
                 echo "\nWarning: Failed to stream $relative_path (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
