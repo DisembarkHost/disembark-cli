@@ -1372,7 +1372,7 @@ class Run {
             }
         }
         
-        // If loop finishes without returning, it failed. Try direct download.
+        // If loop finishes, streaming failed. Try direct download.
         echo "\nStream failed after $max_attempts attempts. Attempting direct download for: $relative_path\n";
         try {
             // Construct the direct URL, URL-encoding path components but not slashes
@@ -1381,15 +1381,13 @@ class Run {
             $encoded_relative_path = implode('/', $encoded_parts);
             $direct_url = $siteUrl . '/' . $encoded_relative_path;
 
-            echo "Direct URL: $direct_url\n";
             self::download_file_direct($direct_url, $destination);
             
-            // download_file_direct will throw its own exception on failure
             echo "Direct download successful for: $relative_path\n";
             return; // Success!
 
         } catch (\Exception $e) {
-            // Direct download also failed. Now we must fail.
+            // Direct download also failed.
             echo "Direct download also failed: {$e->getMessage()}\n";
             throw new \Exception("Failed to stream AND download directly '$relative_path'. Last stream error: $last_error. Direct download error: {$e->getMessage()}");
         }
