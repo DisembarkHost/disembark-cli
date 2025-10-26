@@ -1,9 +1,11 @@
 #!/usr/bin/env php
 <?php
 namespace Disembark;
+
 class Run {
 
-    const VERSION = '2.1.0';
+    const VERSION = '2.2.0';
+
     public static function main($argv, $argc) {
         if ($argc < 2) {
             self::showHelp();
@@ -1277,7 +1279,6 @@ class Run {
             try {
                 // Fetch response into memory, DO NOT stream to file
                 $options = [
-                    // 'filename' => $destination, // <-- REMOVED
                     'verify' => false,
                     'timeout' => 1800,
                     'connect_timeout' => 30,
@@ -1292,11 +1293,6 @@ class Run {
                 // Manually write the response body to the file
                 if (file_put_contents($destination, $response->body) === false) {
                     throw new \Exception("Failed to write downloaded content to $destination.");
-                }
-
-                // Check if the body itself was empty
-                if (filesize($destination) === 0) {
-                    throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the download or sent an empty body.");
                 }
 
                 return; // Success
@@ -1333,7 +1329,6 @@ class Run {
                 $headers = ['Content-Type' => 'application/json'];
                 // Fetch response into memory, DO NOT stream to file
                 $options = [
-                    // 'filename' => $destination, // <-- REMOVED
                     'verify' => false,
                     'timeout' => 1800,
                     'connect_timeout' => 30,
@@ -1351,11 +1346,6 @@ class Run {
                 // Manually write the response body to the file
                 if (file_put_contents($destination, $response->body) === false) {
                     throw new \Exception("Failed to write downloaded stream content to $destination.");
-                }
-
-                // Check if the body itself was empty
-                if (filesize($destination) === 0) {
-                    throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the stream or sent an empty body.");
                 }
 
                 return; // Success
