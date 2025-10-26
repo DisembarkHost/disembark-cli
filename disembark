@@ -110,6 +110,15 @@ class Run {
                     $folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim($siteUrl, '/'));
                 }
 
+                // Resolve $folder to an absolute path to avoid phar ambiguity.
+                // Check if $folder is already absolute (e.g., /var/www or C:\www)
+                if (
+                    substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && 
+                    !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') 
+                ) {
+                    $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
+                }
+
                 self::sync($siteUrl, $folder, $debug, $session_id);
                 break;
             default:
