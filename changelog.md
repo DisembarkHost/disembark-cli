@@ -1,5 +1,24 @@
 # Changelog
 
+## **v2.2.0** - October 26th, 2025
+
+### Added
+
+* **New `sync` Command:** A new `disembark sync <site-url> [<folder>]` command has been added to create and update a local mirror of a remote site.
+    * On the first run, it performs an "initial sync" to download all database tables and file chunks.
+    * On subsequent runs, it intelligently compares a local manifest with the remote one, downloading only new or changed files and removing deleted ones.
+    * The `sync` command supports `--debug` for saving manifest files and `--session-id` to reuse a manifest from the web UI.
+* **Session Reuse for `backup`:** The `backup` command now supports a `--session-id=<id>` argument. This allows you to reuse an existing backup session from the plugin's web UI, skipping the analysis step and downloading files from the pre-generated manifest.
+
+### Improved
+
+* **Hosting Download Compatibility:** The method for downloading database (`.sql`) files has been re-architected. This change specifically supports restrictive hosting environments (like Flywheel) that block direct URL access to `.sql` files.
+    * The tool now attempts to download database files using a new `download_file_via_stream` function, which calls a `/wp-json/disembark/v1/stream-file` API endpoint to stream the file content via PHP.
+    * If this streaming method fails, it automatically falls back to the original direct download method.
+* **Removed `curl` Dependency:** The `download_file_direct` function (used for file chunks and as a fallback) was rewritten to use the internal `rmccue/requests` PHP library. This removes the dependency on the `curl` command-line utility, increasing portability and reliability.
+* **Code Refactoring:** The file analysis and backup summary logic, which was previously part of the `runPreview` function, was refactored into new, separate functions: `runManifestGeneration` and `displayBackupSummary`. This allows the logic to be reused by the `backup`, `backup --preview`, and new `sync` commands.
+* **Build Process:** The `build-phar.php` script was improved to manually add only the required `disembark` script and `vendor` directory, which creates a smaller and cleaner final `.phar` file.
+
 ## **v2.1.0** - October 23rd, 2025
 
 ### Improved
