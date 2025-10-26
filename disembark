@@ -38,10 +38,16 @@ class Run {
                 $exclude_paths = [];
                 $exclude_tables_str = '';
                 $preview = false;
+                $session_id = null;
                 $i = 3;
                 while ($i < $argc) {
                     if ($argv[$i] === '--preview') {
                         $preview = true;
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--session-id=') === 0) {
+                        $session_id = substr($argv[$i], strlen('--session-id='));
                         $i++;
                         continue;
                     }
@@ -63,7 +69,7 @@ class Run {
                     }
                 }
                 $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
-                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview);
+                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id);
                 break;
             case 'version':
                 if ($argc != 2) {
@@ -87,11 +93,14 @@ class Run {
                 $siteUrl = $argv[2];
                 $folder = null;
                 $debug = false;
+                $session_id = null;
 
                 $args = array_slice($argv, 3);
                 foreach ($args as $arg) {
                     if ($arg === '--debug') {
                         $debug = true;
+                    } elseif (strpos($arg, '--session-id=') === 0) {
+                        $session_id = substr($arg, strlen('--session-id='));
                     } elseif ($folder === null && strpos($arg, '--') !== 0) {
                         $folder = $arg;
                     }
@@ -101,7 +110,7 @@ class Run {
                     $folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim($siteUrl, '/'));
                 }
                 
-                self::sync($siteUrl, $folder, $debug); // Pass debug flag
+                self::sync($siteUrl, $folder, $debug, $session_id);
                 break;
             default:
                 echo "Error: Unknown command '$command'.\n\n";
@@ -459,7 +468,7 @@ class Run {
     /**
      * Performs a local or remote sync.
      */
-    private static function sync($siteUrl, $folder, $debug = false) {
+    private static function sync($siteUrl, $folder, $debug = false, $session_id = null) {
         // --- 1. Authentication ---
         $siteUrl = rtrim($siteUrl, '/');
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
@@ -479,7 +488,8 @@ class Run {
                 else { echo "Error: Invalid data in $filePath.\n"; exit(1); }
             }
         } else {
-            echo "Error: No configuration file found at $filePath.\n"; exit(1);
+            echo "Error: No configuration file found at $filePath.\n";
+            exit(1);
         }
         $token = null;
         foreach ($data as $entry) {
@@ -489,17 +499,25 @@ class Run {
             }
         }
         if (empty($token)) {
-            echo "Error: No token found for $siteUrl.\n"; exit(1);
+            echo "Error: No token found for $siteUrl.\n";
+            exit(1);
         }
 
         // --- 2. Setup ---
-        $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+        $backup_token = "";
+        if ($session_id) {
+            $backup_token = $session_id;
+            echo "Reusing backup session: $backup_token\n";
+        } else {
+            $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+        }
         $is_initial_sync = !is_dir($folder);
         
         if ($is_initial_sync) {
             echo "Performing initial sync to new folder: $folder\n";
             if (!mkdir($folder, 0755, true)) {
-                echo "Error: Could not create folder at $folder.\n"; exit(1);
+                echo "Error: Could not create folder at $folder.\n";
+                exit(1);
             }
         } else {
             echo "Performing subsequent sync to existing folder: $folder\n";
@@ -507,7 +525,6 @@ class Run {
 
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
-
         try {
            // --- 3. Database Sync (Always run) ---
             echo "Starting database sync...\n";
@@ -525,7 +542,6 @@ class Run {
             if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
             $database = json_decode($response->body);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
-            
             // (Skipping exclude_tables logic for sync, backup all tables)
             $max_size = 209715200; // 200 MB
             foreach ($database as $table) {
@@ -534,7 +550,9 @@ class Run {
                 if ( $table_size > $max_size && $row_count > 0) {
                     $parts = ceil( $table_size / $max_size );
                     $table->parts = $parts; $table->current = 0; $table->rows_per_part = ceil( $row_count / $parts );
-                } else { $table->parts = 0; }
+                } else {
+                    $table->parts = 0;
+                }
             }
             
             $total_db_steps = 0; foreach ($database as $table) { $total_db_steps += ($table->parts > 0) ? $table->parts : 1; }
@@ -597,19 +615,16 @@ class Run {
                     self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
                     unlink($local_zip_chunk_path); // Delete temp zip
                     self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    
                     echo $progress_message . " - Done.\n";
                     $current_step++;
                 }
                 echo "Initial file sync complete.\n";
-
             } else {
                 // --- 4b. Subsequent Sync: Diff and download ---
                 echo "Fetching remote file manifest...\n";
                 $remote_files_map = [];
                 $temp_manifest_dir = $folder . '/.disembark-manifests';
                 if (!mkdir($temp_manifest_dir, 0755, true)) throw new \Exception("Could not create temp manifest dir.");
-                
                 $all_remote_files = []; // Store all files here
 
                 foreach ($files_manifest_chunks as $file_manifest) {
@@ -628,7 +643,6 @@ class Run {
                     unlink($local_chunk_path);
                 }
                 self::delete_directory($temp_manifest_dir);
-                
                 if ($debug) {
                     $remote_manifest_path = $folder . '/.disembark-remote-manifest.json';
                     file_put_contents($remote_manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
@@ -675,16 +689,22 @@ class Run {
 
         } catch (\Exception $e) {
             echo "\nSync failed: {$e->getMessage()}\n";
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            if (!$session_id) {
+                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            }
             exit(1);
         }
 
         // --- 5. Final Cleanup ---
-        self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        if (!$session_id) {
+            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        } else {
+            echo "\nSkipping remote cleanup to preserve UI session files.\n";
+        }
         echo "\nSync complete: $folder is up to date.\n";
     }
 
-    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false) {
+    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null) {
 
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
@@ -733,14 +753,47 @@ class Run {
             exit(1);
         }
 
-        // Generate unique token for this backup session
-        $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
-        // Run preview, which now also generates the manifest for the actual backup
-        $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
-        // If the preview flag is set, clean up manifest files and exit.
-        if ($preview) {
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-            exit(0);
+        $files = [];
+        if ($session_id) {
+            $backup_token = $session_id;
+            echo "Reusing backup session: $backup_token\n";
+
+            try {
+                echo "Fetching existing manifest...\n";
+                // Use the new /manifest GET endpoint
+                $files = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+                if (!is_array($files)) {
+                    throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid or is the manifest still generating?");
+                }
+                echo "Successfully fetched manifest with " . count($files) . " file chunks.\n";
+                
+                // Now display the summary based on the fetched manifest.
+                // We pass an empty $exclude_tables array because the manifest is pre-generated.
+                self::displayBackupSummary($siteUrl, $token, $files, []); 
+                echo "* Database exclusion summary reflects the pre-generated manifest; local --exclude-tables flag is ignored.\n";
+
+            } catch (\Exception $e) {
+                echo "Error fetching manifest: {$e->getMessage()}\n";
+                // Do NOT clean up, it's not our session
+                exit(1);
+            }
+            
+            // If the preview flag is set, exit here.
+            if ($preview) {
+                echo "Preview complete. No cleanup performed as this is a reused session.\n";
+                exit(0);
+            }
+
+        } else {
+            // Generate unique token for this backup session
+            $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+            // Run preview, which now also generates the manifest for the actual backup
+            $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
+            // If the preview flag is set, clean up manifest files and exit.
+            if ($preview) {
+                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+                exit(0);
+            }
         }
 
         // Ask for confirmation before proceeding
@@ -750,8 +803,10 @@ class Run {
         fclose($handle);
         if ($line !== '' && strtolower($line) !== 'yes' && strtolower($line) !== 'y') {
             echo "Backup cancelled by user.\n";
-            // Clean up the manifest files generated by the preview
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            if (!$session_id) {
+                // Only clean up if this was a new session
+                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            }
             exit(0);
         }
 
@@ -963,6 +1018,7 @@ class Run {
 
                     // 2. Download (use new direct download function)
                     self::download_file_direct($file_url, $local_file_path);
+                    
                     // 3. Unzip locally
                     self::unzip_file($local_file_path, $local_public_path);
                     unlink($local_file_path); // Delete local zip chunk
@@ -979,7 +1035,7 @@ class Run {
             }
             // --- End File Zipping ---
 
-            // --- NEW: Final Local Zipping ---
+            // --- Final Local Zipping ---
             echo "Generating final local zip file: $final_zip_name...\n";
             self::zip_directory($local_public_path, $final_zip_name);
             echo "Successfully created $final_zip_name\n";
@@ -989,8 +1045,10 @@ class Run {
             // Catch any exception thrown during the backup process
             echo "\nBackup failed: {$e->getMessage()}\n";
             echo "Partial files may be left in {$temp_directory}\n";
-            // Attempt remote cleanup even if backup failed
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            // Attempt remote cleanup even if backup failed, but only if it's not a reused session
+            if (!$session_id) {
+                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            }
             exit(1); // Exit with error status
         }
         
@@ -1002,8 +1060,12 @@ class Run {
             echo "\nWarning: Failed to clean up local directory {$temp_directory}: {$e->getMessage()}\n";
         }
         
-        // Final remote cleanup
-        self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        // Final remote cleanup, only if it's not a reused session
+        if (!$session_id) {
+            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        } else {
+            echo "\nSkipping remote cleanup to preserve UI session files.\n";
+        }
         echo "\nBackup complete: $final_zip_name is ready.\n";
     }
 
@@ -1126,12 +1188,15 @@ class Run {
         echo "  --preview                              Show a summary of files and DB tables to be backed up without running the backup.\n";
         echo "  -x <path>                              Exclude a file or directory path relative to the WordPress root (e.g., wp-content/cache). Can be specified multiple times.\n";
         echo "  --exclude-tables=<tables>              Exclude specific database tables (comma-separated, no spaces). Wildcards (*) are supported (e.g., wp_log*,*_temp).\n";
+        echo "  --session-id=<id>                      Reuse a specific backup session ID (backup token) generated by the plugin UI.\n";
         echo "\n";
         echo "Other Commands:\n";
         echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
         echo "  disembark list                         List all sites currently connected.\n";
         echo "  disembark upgrade                      Upgrade the Disembark CLI tool to the latest version.\n";
         echo "  disembark sync <site-url> [<folder>]   Create or update a local mirror of the site.\n";
+        echo "    --debug                              Save local and remote manifest files for debugging.\n";
+        echo "    --session-id=<id>                    Reuse a backup session ID from the UI.\A[n";
         echo "  disembark version                      Show the current version of the Disembark CLI tool.\n";
         echo "\n";
         echo "Example:\n";
