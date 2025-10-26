@@ -109,7 +109,7 @@ class Run {
                 if ($folder === null) {
                     $folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim($siteUrl, '/'));
                 }
-                
+
                 self::sync($siteUrl, $folder, $debug, $session_id);
                 break;
             default:
@@ -134,13 +134,13 @@ class Run {
             exit(1);
         }
 
-        if ( empty( $siteUrl ) ||  empty( $token ) ) {
+        if (empty($siteUrl) || empty($token)) {
             echo "Error: Required arguments <site-url> and <token>.\n";
             exit(1);
         }
         try {
             // Test connection by fetching database info
-            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], [ 'verify' => false, 'timeout' => 60 ]);
+            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 60]);
         } catch (\WpOrg\Requests\Exception $e) {
             // Handle the exception
             echo "Error: Request failed with error: {$e->getMessage()}\n";
@@ -153,7 +153,7 @@ class Run {
         }
 
         $tables = json_decode($response->body);
-        if ( empty( $tables ) ) {
+        if (empty($tables)) {
             echo "Error: Connected to $siteUrl, but failed to retrieve database information. Please check plugin functionality.\n";
             exit(1);
         }
@@ -166,22 +166,21 @@ class Run {
             $data = json_decode($jsonContents);
             // Ensure $data is always an array for consistent processing
             if (!is_array($data)) {
-                 // Try decoding as an object first for legacy compatibility
-                 if (is_object($data)) {
+                // Try decoding as an object first for legacy compatibility
+                if (is_object($data)) {
                     // Convert object to array of objects
-   
                     $data = [$data];
-                 } else {
-                     $data = []; // Initialize as empty array if decoding failed or was invalid
-                 }
+                } else {
+                    $data = []; // Initialize as empty array if decoding failed or was invalid
+                }
             }
         }
 
         // Check if the siteUrl already exists and update it, otherwise add new
         $found = false;
         foreach ($data as $key => $entry) {
-             // Ensure entry is an object before accessing properties
-             if (is_object($entry) && !empty($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+            // Ensure entry is an object before accessing properties
+            if (is_object($entry) && !empty($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
                 $data[$key]->token = $token; // Update token directly on the object within the array
                 $found = true;
                 break;
@@ -190,7 +189,7 @@ class Run {
 
         if (!$found) {
             // Add new entry as an object
-            $data[] = (object)[
+            $data[] = (object) [
                 'siteUrl' => $siteUrl,
                 'token' => $token
             ];
@@ -215,20 +214,19 @@ class Run {
             switch (strtoupper($method)) {
                 case 'POST':
                     // Increase timeout specifically for zip operations which can take longer
-                 
                     if ($endpoint === '/zip-files' || $endpoint === '/zip-database') {
                         $options['timeout'] = 1800; // 30 minutes
                     } elseif (strpos($endpoint, '/export/database/') === 0 && isset($payload['parts'])) {
-                         $options['timeout'] = 1200; // 20 minutes for large table parts
+                        $options['timeout'] = 1200; // 20 minutes for large table parts
                     }
                     $response = \WpOrg\Requests\Requests::post($url, $headers, json_encode($data), $options);
                     break;
                 case 'GET':
                 default:
-                     // Increase timeout for cleanup as well
-                     if ($endpoint === '/cleanup') {
-                         $options['timeout'] = 120;
-                     }
+                    // Increase timeout for cleanup as well
+                    if ($endpoint === '/cleanup') {
+                        $options['timeout'] = 120;
+                    }
                     // For GET, build query params correctly
                     $query_params = http_build_query($data);
                     $response = \WpOrg\Requests\Requests::get($url . '?' . $query_params, [], $options); // Pass empty headers array for GET
@@ -258,11 +256,12 @@ class Run {
             if (strpos($endpoint, '/export/database/') === 0) {
                 $is_raw_endpoint = true;
             }
-            
+
             if (json_last_error() !== JSON_ERROR_NONE) {
-                // Not JSON. Is it an endpoint that *should* return a raw string?
+                // Not JSON.
+                // Is it an endpoint that *should* return a raw string?
                 if (!empty(trim($response->body)) && $is_raw_endpoint) {
-                     return trim($response->body); // Return the raw body (e.g., URL)
+                    return trim($response->body); // Return the raw body (e.g., URL)
                 }
                 // Not JSON and not an allowed raw endpoint, or it's empty
                 if (!empty(trim($response->body))) {
@@ -298,71 +297,71 @@ class Run {
             echo "Running analysis (this may take a while)...\n";
             $exclude_files_string = implode("\n", $exclude_paths);
 
-             $payload = [
+            $payload = [
                 'exclude_files' => $exclude_files_string
-             ];
-             if ($include_checksums) {
+            ];
+            if ($include_checksums) {
                 $payload['include_checksums'] = true;
-             }
+            }
 
-             // Step 1: Initiate
-             self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate'] + $payload, 'POST');
-             echo "Initiated file scan.\n";
+            // Step 1: Initiate
+            self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate'] + $payload, 'POST');
+            echo "Initiated file scan.\n";
 
-             // Step 2: Scan Loop
-             $scan_complete = false;
-             $last_scan_output = "";
-             while (!$scan_complete) {
-                 $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan'] + $payload, 'POST');
-                 if (!is_object($scan_response) || !isset($scan_response->status)) {
-                     throw new \Exception("Invalid response received during scan step.");
-                 }
+            // Step 2: Scan Loop
+            $scan_complete = false;
+            $last_scan_output = "";
+            while (!$scan_complete) {
+                $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan'] + $payload, 'POST');
+                if (!is_object($scan_response) || !isset($scan_response->status)) {
+                    throw new \Exception("Invalid response received during scan step.");
+                }
 
-                 if ($scan_response->status === 'scan_complete') {
-                     $scan_complete = true;
-                     echo str_pad("", strlen($last_scan_output), " ") . "\r";
-                     printf("Scanning complete. Analyzed %d directories.\n", $scan_response->total_dirs ?? 0);
-                 } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
-                     $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
-                     echo $last_scan_output . "\r";
-                 } else {
-                     echo "\nWarning: Scan step response might be incomplete.\n";
-                 }
-                 usleep(250000);
-             }
+                if ($scan_response->status === 'scan_complete') {
+                    $scan_complete = true;
+                    echo str_pad("", strlen($last_scan_output), " ") . "\r";
+                    printf("Scanning complete. Analyzed %d directories.\n", $scan_response->total_dirs ?? 0);
+                } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
+                    $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
+                    echo $last_scan_output . "\r";
+                } else {
+                    echo "\nWarning: Scan step response might be incomplete.\n";
+                }
+                usleep(250000);
+            }
 
-             // Step 3: Chunkify
-             echo "Chunkifying file list...\n";
-             $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify'] + $payload, 'POST');
-             $total_chunks = $chunk_response->total_chunks ?? 0;
-             if ($total_chunks === 0) {
-                 echo "No files found to analyze or an error occurred during chunkification.\n";
-             } else {
-                 echo "File list divided into {$total_chunks} chunks.\n";
-             }
+            // Step 3: Chunkify
+            echo "Chunkifying file list...\n";
+            $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify'] + $payload, 'POST');
+            $total_chunks = $chunk_response->total_chunks ?? 0;
+            if ($total_chunks === 0) {
+                echo "No files found to analyze or an error occurred during chunkification.\n";
+            } else {
+                echo "File list divided into {$total_chunks} chunks.\n";
+            }
 
 
-             // Step 4: Process Chunks
-             $last_chunk_output = "";
-             for ($i = 1; $i <= $total_chunks; $i++) {
+            // Step 4: Process Chunks
+            $last_chunk_output = "";
+            for ($i = 1; $i <= $total_chunks; $i++) {
                 $last_chunk_output = sprintf("Processing chunk %d of %d...", $i, $total_chunks);
                 echo $last_chunk_output . "\r";
                 self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i] + $payload, 'POST');
                 usleep(50000);
-             }
-             if ($total_chunks > 0) {
+            }
+            if ($total_chunks > 0) {
                 echo str_pad("", strlen($last_chunk_output), " ") . "\r";
                 echo "Chunk processing complete.\n";
-             }
+            }
 
 
-             // Step 5: Finalize
-             $files_manifests = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize'] + $payload, 'POST');
-             if (!is_array($files_manifests)) {
+            // Step 5: Finalize
+            $files_manifests = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize'] + $payload, 'POST');
+            if (!is_array($files_manifests)) {
                 echo "Warning: Final manifest data is not in the expected format. File stats may be inaccurate.\n";
                 $files_manifests = [];
-             }
-             echo "Analysis complete.\n";
+            }
+            echo "Analysis complete.\n";
         } catch (\Exception $e) {
             echo "Error during file analysis: {$e->getMessage()}\n";
             self::cleanupTemporaryFiles($siteUrl, $token, $backup_token); // Attempt cleanup
@@ -384,30 +383,26 @@ class Run {
             }
             $all_tables = json_decode($response_db->body);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                 echo "Error: Invalid database info received.\n";
-                 $all_tables = [];
+                echo "Error: Invalid database info received.\n";
+                $all_tables = [];
             }
         } catch (\WpOrg\Requests\Exception $e) {
-             echo "Error: Failed to fetch database info: {$e->getMessage()}\n";
-             exit(1);
+            echo "Error: Failed to fetch database info: {$e->getMessage()}\n";
+            exit(1);
         }
 
         // 3. Calculate file stats TO BE BACKED UP
-        $remainingFiles = empty($files_manifests) ?
-        0 : array_sum(array_column($files_manifests, 'count'));
+        $remainingFiles = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'count'));
         $remainingSize = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'size'));
-        
         // 4. Calculate database stats
         $totalTables = count($all_tables);
-        $totalDbSize = empty($all_tables) ?
-        0 : array_sum(array_column($all_tables, 'size'));
+        $totalDbSize = empty($all_tables) ? 0 : array_sum(array_column($all_tables, 'size'));
         $excludedTables = 0;
         $excludedDbSize = 0;
 
         $included_table_list = [];
         foreach ($all_tables as $table) {
-            $table_size = isset($table->size) && is_numeric($table->size) ?
-            (float)$table->size : 0;
+            $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
             $is_excluded = false;
             foreach ($exclude_tables as $pattern) {
                 if (fnmatch($pattern, $table->table)) {
@@ -446,13 +441,11 @@ class Run {
     }
 
     private static function runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables) {
-        
+
         // 1. Run the manifest generation
         $files_manifests = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
-        
         // 2. Display the summary
         self::displayBackupSummary($siteUrl, $token, $files_manifests, $exclude_tables);
-
         // 3. Return the generated manifest
         return $files_manifests;
     }
@@ -490,7 +483,10 @@ class Run {
             $data = json_decode(file_get_contents($filePath));
             if (!is_array($data)) {
                 if (is_object($data)) $data = [$data];
-                else { echo "Error: Invalid data in $filePath.\n"; exit(1); }
+                else {
+                    echo "Error: Invalid data in $filePath.\n";
+                    exit(1);
+                }
             }
         } else {
             echo "Error: No configuration file found at $filePath.\n";
@@ -514,10 +510,9 @@ class Run {
             $backup_token = $session_id;
             echo "Reusing backup session: $backup_token\n";
         } else {
-            $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
         }
         $is_initial_sync = !is_dir($folder);
-        
         if ($is_initial_sync) {
             echo "Performing initial sync to new folder: $folder\n";
             if (!mkdir($folder, 0755, true)) {
@@ -531,7 +526,7 @@ class Run {
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
         try {
-           // --- 3. Database Sync (Always run) ---
+            // --- 3. Database Sync (Always run) ---
             echo "Starting database sync...\n";
             // Check if dir exists before creating it
             if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
@@ -541,61 +536,66 @@ class Run {
             if (file_put_contents($db_export_file, $sql_header) === false) {
                 throw new \Exception("Could not write to local SQL file.");
             }
-            
+
             // Copy database backup logic from backup()
-            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], [ 'verify' => false, 'timeout' => 600 ]);
+            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
             if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
             $database = json_decode($response->body);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
             // (Skipping exclude_tables logic for sync, backup all tables)
             $max_size = 209715200; // 200 MB
             foreach ($database as $table) {
-                 $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
-                 $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
-                if ( $table_size > $max_size && $row_count > 0) {
-                    $parts = ceil( $table_size / $max_size );
-                    $table->parts = $parts; $table->current = 0; $table->rows_per_part = ceil( $row_count / $parts );
+                $table_size = isset($table->size) && is_numeric($table->size) ?
+                    (float)$table->size : 0;
+                $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
+                if ($table_size > $max_size && $row_count > 0) {
+                    $parts = ceil($table_size / $max_size);
+                    $table->parts = $parts;
+                    $table->current = 0;
+                    $table->rows_per_part = ceil($row_count / $parts);
                 } else {
                     $table->parts = 0;
                 }
             }
-            
+
             $total_db_steps = 0;
             foreach ($database as $table) {
                 $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
             }
             $current_db_step = 0;
-            foreach ( $database as $table ) {
-                 if (!isset($table->table)) continue;
-                 $progress_message = "";
-                 if ($table->parts > 0) {
-                     for ($part = 1; $part <= $table->parts; $part++) {
+            foreach ($database as $table) {
+                if (!isset($table->table)) continue;
+                $progress_message = "";
+                if ($table->parts > 0) {
+                    for ($part = 1; $part <= $table->parts; $part++) {
                         $current_db_step++;
                         $progress_message = sprintf(" - DB Sync %s (Part %d/%d) (%d/%d)", $table->table, $part, $table->parts, $current_db_step, $total_db_steps);
                         echo $progress_message . "\r";
                         $part_data = ['parts' => $part, 'rows_per_part' => $table->rows_per_part];
                         $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
                         if (strpos($file_url, 'http') !== 0) throw new \Exception("Export failed for {$table->table}");
-                        $file_name = basename($file_url); $local_file_path = $local_db_parts_path . '/' . $file_name;
+                        $file_name = basename($file_url);
+                        $local_file_path = $local_db_parts_path . '/' . $file_name;
                         self::download_file_via_stream($siteUrl, $token, ltrim(parse_url($file_url, PHP_URL_PATH), '/'), $local_file_path);
                         file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
                         unlink($local_file_path);
                         self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                     }
-                     echo $progress_message . " - Done.\n";
-                 } else {
+                    }
+                    echo $progress_message . " - Done.\n";
+                } else {
                     $current_db_step++;
                     $progress_message = sprintf(" - DB Sync %s (%d/%d)", $table->table, $current_db_step, $total_db_steps);
                     echo $progress_message . "\r";
                     $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", [], 'POST');
                     if (strpos($file_url, 'http') !== 0) throw new \Exception("Export failed for {$table->table}");
-                    $file_name = basename($file_url); $local_file_path = $local_db_parts_path . '/' . $file_name;
+                    $file_name = basename($file_url);
+                    $local_file_path = $local_db_parts_path . '/' . $file_name;
                     self::download_file_via_stream($siteUrl, $token, ltrim(parse_url($file_url, PHP_URL_PATH), '/'), $local_file_path);
                     file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
                     unlink($local_file_path);
                     self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
                     echo $progress_message . " - Done.\n";
-                 }
+                }
             }
             echo "Database sync complete.\n";
             self::delete_directory($local_db_parts_path);
@@ -613,7 +613,7 @@ class Run {
                 } catch (\Exception $e) {
                     echo "Error fetching manifest: {$e->getMessage()}\n";
                     if (!$session_id) {
-                         self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+                        self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
                     }
                     exit(1);
                 }
@@ -627,7 +627,8 @@ class Run {
             if ($is_initial_sync) {
                 // --- 4a. Initial Sync: Download all zips and extract ---
                 echo "Performing initial file download...\n";
-                $steps = count($files_manifest_chunks); $current_step = 1;
+                $steps = count($files_manifest_chunks);
+                $current_step = 1;
                 foreach ($files_manifest_chunks as $file_manifest) {
                     if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) continue;
                     $size = self::humanFilesize($file_manifest->size);
@@ -635,7 +636,7 @@ class Run {
                     echo $progress_message . "...\r";
                     $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', ['file' => $file_manifest->name, 'exclude_files' => ''], 'POST');
                     if (strpos($file_url, 'http') !== 0) throw new \Exception("Zip failed for {$file_manifest->name}");
-                    
+
                     $file_name = basename($file_url);
                     $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
 
@@ -714,7 +715,6 @@ class Run {
                 self::delete_empty_dirs($folder);
                 echo "File sync complete.\n";
             }
-
         } catch (\Exception $e) {
             echo "\nSync failed: {$e->getMessage()}\n";
             if (!$session_id) {
@@ -794,27 +794,25 @@ class Run {
                     throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid or is the manifest still generating?");
                 }
                 echo "Successfully fetched manifest with " . count($files) . " file chunks.\n";
-                
+
                 // Now display the summary based on the fetched manifest.
                 // We pass an empty $exclude_tables array because the manifest is pre-generated.
-                self::displayBackupSummary($siteUrl, $token, $files, []); 
+                self::displayBackupSummary($siteUrl, $token, $files, []);
                 echo "* Database exclusion summary reflects the pre-generated manifest; local --exclude-tables flag is ignored.\n";
-
             } catch (\Exception $e) {
                 echo "Error fetching manifest: {$e->getMessage()}\n";
                 // Do NOT clean up, it's not our session
                 exit(1);
             }
-            
+
             // If the preview flag is set, exit here.
             if ($preview) {
                 echo "Preview complete. No cleanup performed as this is a reused session.\n";
                 exit(0);
             }
-
         } else {
             // Generate unique token for this backup session
-            $backup_token = substr( bin2hex( random_bytes( 20 ) ), 0, -28);
+            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
             // Run preview, which now also generates the manifest for the actual backup
             $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
             // If the preview flag is set, clean up manifest files and exit.
@@ -826,7 +824,7 @@ class Run {
 
         // Ask for confirmation before proceeding
         echo "\nDo you want to proceed with the backup? (yes/no) [yes]: ";
-        $handle = fopen ("php://stdin","r");
+        $handle = fopen("php://stdin", "r");
         $line = trim(fgets($handle));
         fclose($handle);
         if ($line !== '' && strtolower($line) !== 'yes' && strtolower($line) !== 'y') {
@@ -851,21 +849,20 @@ class Run {
                 echo " - $pattern\n";
             }
         }
-        
+
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
         // --- Setup Local Backup Environment ---
         // Create the directory name
         $temp_directory_name = "snapshot-" . time();
         // Use getcwd() to create a full, absolute path
         $temp_directory = getcwd() . DIRECTORY_SEPARATOR . $temp_directory_name;
-        
+
         $local_db_path = $temp_directory . '/database';
         $local_public_path = $temp_directory . '/public';
         $domain = preg_replace('/^https?:\/\/(www\.)?/', '', $siteUrl);
         $domain = preg_replace('/\//', '_', $domain);
         $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
         $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
-
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
             if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
@@ -882,7 +879,7 @@ class Run {
             $database = [];
             try {
                 // Fetch full table list again for the actual backup
-                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], [ 'verify' => false, 'timeout' => 600 ]);
+                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
                 if ($response->status_code !== 200 || empty($response->body)) {
                     throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
                 }
@@ -908,7 +905,6 @@ class Run {
                 } else {
                     $database = $all_tables;
                 }
-
             } catch (\Exception $e) {
                 echo "Error during database preparation: {$e->getMessage()}\n";
                 throw $e; // Re-throw to signal failure and trigger finally block
@@ -918,15 +914,15 @@ class Run {
             $max_size = 209715200; // 200 MB
             foreach ($database as $table) {
                 $table->running = false;
-                $table->done    = false;
+                $table->done = false;
                 $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
                 $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
 
-                if ( $table_size > $max_size && $row_count > 0) {
-                    $parts = ceil( $table_size / $max_size );
+                if ($table_size > $max_size && $row_count > 0) {
+                    $parts = ceil($table_size / $max_size);
                     $table->parts = $parts;
                     $table->current = 0;
-                    $table->rows_per_part = ceil( $row_count / $parts );
+                    $table->rows_per_part = ceil($row_count / $parts);
                 } else {
                     $table->parts = 0;
                 }
@@ -934,10 +930,9 @@ class Run {
 
             $headers = ['Content-Type' => 'application/json; charset=utf-8'];
             $db_data_base = [ // Use a base payload
-                "token"        => $token,
+                "token" => $token,
                 "backup_token" => $backup_token
             ];
-
             // Export Database Tables
             echo "Backing up database tables...\n";
             $total_db_steps = 0;
@@ -945,8 +940,8 @@ class Run {
                 $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
             }
             $current_db_step = 0;
-            foreach ( $database as $table ) {
-                 if (!isset($table->table)) {
+            foreach ($database as $table) {
+                if (!isset($table->table)) {
                     echo "\nWarning: Skipping invalid table data entry in backup.\n";
                     continue;
                 }
@@ -973,7 +968,7 @@ class Run {
                         $parsed_url = parse_url($file_url);
                         $relative_path = ltrim($parsed_url['path'], '/');
                         self::download_file_via_stream($siteUrl, $token, $relative_path, $local_file_path);
-                        
+
                         // 3. Append to main SQL
                         file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
                         unlink($local_file_path); // Delete local SQL part
@@ -1003,7 +998,7 @@ class Run {
                     // 3. Append to main SQL
                     file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
                     unlink($local_file_path); // Delete local SQL part
-                    
+
                     // 4. Delete remote SQL part
                     self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
                     echo $progress_message . " - Done.\n";
@@ -1013,18 +1008,18 @@ class Run {
             echo "Database export and download complete.\n";
             rmdir($local_db_path); // Remove empty database temp dir
             // --- END DB LOOP ---
-            
+
             // --- File Zipping ---
             if (!empty($files)) {
-                $steps            = count($files);
-                $current_step     = 1;
+                $steps = count($files);
+                $current_step = 1;
                 $total_file_count = array_sum(array_column($files, 'count'));
-                $total_file_size  = self::humanFilesize(array_sum(array_column($files, 'size')));
+                $total_file_size = self::humanFilesize(array_sum(array_column($files, 'size')));
                 echo "Preparing to backup " . number_format($total_file_count) . " files totaling " . $total_file_size . "\n";
                 $exclude_files_string = implode("\n", $exclude_paths);
                 $zip_payload_base = [
-                    "token"         => $token,
-                    "backup_token"  => $backup_token,
+                    "token" => $token,
+                    "backup_token" => $backup_token,
                     "exclude_files" => $exclude_files_string,
                 ];
                 foreach ($files as $file_manifest) {
@@ -1041,7 +1036,7 @@ class Run {
 
                     $zip_payload = $zip_payload_base;
                     $zip_payload['file'] = $file_manifest->name;
-                    
+
                     // 1. Zip (now returns a full URL)
                     $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', $zip_payload, 'POST');
                     if (strpos($file_url, 'http') !== 0) {
@@ -1052,7 +1047,6 @@ class Run {
 
                     // 2. Download (use new direct download function)
                     self::download_file_direct($file_url, $local_file_path);
-                    
                     // 3. Unzip locally
                     self::unzip_file($local_file_path, $local_public_path);
                     unlink($local_file_path); // Delete local zip chunk
@@ -1073,8 +1067,6 @@ class Run {
             echo "Generating final local zip file: $final_zip_name...\n";
             self::zip_directory($local_public_path, $final_zip_name);
             echo "Successfully created $final_zip_name\n";
-
-
         } catch (\Exception $e) {
             // Catch any exception thrown during the backup process
             echo "\nBackup failed: {$e->getMessage()}\n";
@@ -1085,7 +1077,7 @@ class Run {
             }
             exit(1); // Exit with error status
         }
-        
+
         // --- Final Cleanup ---
         try {
             echo "Cleaning up local temporary files...\n";
@@ -1093,7 +1085,7 @@ class Run {
         } catch (\Exception $e) {
             echo "\nWarning: Failed to clean up local directory {$temp_directory}: {$e->getMessage()}\n";
         }
-        
+
         // Final remote cleanup, only if it's not a reused session
         if (!$session_id) {
             self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
@@ -1116,12 +1108,12 @@ class Run {
             $jsonContents = file_get_contents($filePath);
             $data = json_decode($jsonContents);
             if (!is_array($data)) {
-                 if (is_object($data)) {
+                if (is_object($data)) {
                     $data = [$data];
-                 } else {
-                     echo "Error: Invalid data in $filePath.\n";
-                     exit(1);
-                 }
+                } else {
+                    echo "Error: Invalid data in $filePath.\n";
+                    exit(1);
+                }
             }
         } else {
             echo "No configuration file found at $filePath. No sites connected.\n";
@@ -1133,12 +1125,12 @@ class Run {
         } else {
             echo "Connected sites:\n";
             foreach ($data as $entry) {
-                 if (is_object($entry) && isset($entry->siteUrl)) {
-                     echo "- {$entry->siteUrl}\n";
-                 } else {
-                      echo "- (Invalid entry in config file)\n";
-                 }
-             }
+                if (is_object($entry) && isset($entry->siteUrl)) {
+                    echo "- {$entry->siteUrl}\n";
+                } else {
+                    echo "- (Invalid entry in config file)\n";
+                }
+            }
         }
     }
 
@@ -1163,16 +1155,16 @@ class Run {
             echo "New version {$latest_version} available. Upgrading from {$current_version}...\n";
             $pharPath = \Phar::running(false);
             if (empty($pharPath)) {
-                 $scriptPath = realpath($_SERVER['argv'][0]);
-                 if ($scriptPath && is_file($scriptPath)) {
-                      $pharPath = $scriptPath;
-                      echo "Info: Determined script path as {$pharPath}.\n";
-                 } else {
+                $scriptPath = realpath($_SERVER['argv'][0]);
+                if ($scriptPath && is_file($scriptPath)) {
+                    $pharPath = $scriptPath;
+                    echo "Info: Determined script path as {$pharPath}.\n";
+                } else {
                     echo "Error: Could not determine the path of the running script. Upgrade failed.\n";
                     echo "Please download the latest version manually from:\n";
                     echo "https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar\n";
                     exit(1);
-                 }
+                }
             }
 
             $downloadUrl = 'https://github.com/DisembarkHost/disembark-cli/releases/latest/download/disembark.phar';
@@ -1184,24 +1176,24 @@ class Run {
 
             echo "Downloading new version from {$downloadUrl}...\n";
             $download_cmd = sprintf("curl -sL '%s' -o '%s'", $downloadUrl, $tmpFile);
-             shell_exec($download_cmd);
-             if (!file_exists($tmpFile) || filesize($tmpFile) === 0) {
-                 echo "Error: Failed to download the new version. File is empty or does not exist at {$tmpFile}. Upgrade failed.\n";
-                 if (file_exists($tmpFile)) unlink($tmpFile);
-                 exit(1);
-             }
+            shell_exec($download_cmd);
+            if (!file_exists($tmpFile) || filesize($tmpFile) === 0) {
+                echo "Error: Failed to download the new version. File is empty or does not exist at {$tmpFile}. Upgrade failed.\n";
+                if (file_exists($tmpFile)) unlink($tmpFile);
+                exit(1);
+            }
 
             chmod($tmpFile, 0755);
             $move_cmd = sprintf("mv '%s' '%s'", $tmpFile, $pharPath);
             exec($move_cmd, $output, $return_var);
             if ($return_var !== 0) {
-                 echo "Error: Failed to replace the current script at {$pharPath}.\n";
-                 echo "You might need to run the command with sufficient permissions (e.g., using sudo):\n";
-                 echo "sudo disembark upgrade\n";
-                 if (file_exists($tmpFile)) {
-                     unlink($tmpFile);
-                 }
-                 exit(1);
+                echo "Error: Failed to replace the current script at {$pharPath}.\n";
+                echo "You might need to run the command with sufficient permissions (e.g., using sudo):\n";
+                echo "sudo disembark upgrade\n";
+                if (file_exists($tmpFile)) {
+                    unlink($tmpFile);
+                }
+                exit(1);
             }
 
 
@@ -1287,7 +1279,7 @@ class Run {
                     // Add response body to the error for debugging
                     throw new \Exception("Request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
-                
+
                 // Manually write the response body to the file
                 if (file_put_contents($destination, $response->body) === false) {
                     throw new \Exception("Failed to write downloaded content to $destination.");
@@ -1297,7 +1289,7 @@ class Run {
                 if (filesize($destination) === 0) {
                     throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the download or sent an empty body.");
                 }
-                
+
                 return; // Success
 
             } catch (\Exception $e) {
@@ -1310,7 +1302,7 @@ class Run {
                 }
             }
         }
-        
+
         // If loop finishes, it failed
         throw new \Exception("Failed to download $url after $max_attempts attempts. Last error: $last_error");
     }
@@ -1330,7 +1322,6 @@ class Run {
                 $endpoint_url = $siteUrl . '/wp-json/disembark/v1/stream-file';
                 $payload = json_encode(['token' => $token, 'file' => $relative_path]);
                 $headers = ['Content-Type' => 'application/json'];
-                
                 // Fetch response into memory, DO NOT stream to file
                 $options = [
                     // 'filename' => $destination, // <-- REMOVED
@@ -1338,17 +1329,16 @@ class Run {
                     'timeout' => 1800,
                     'connect_timeout' => 30,
                 ];
-
                 $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
 
                 if (!$response->success) {
-                     // Add response body to the error for debugging
-                     if ($response->status_code == 404 || $response->status_code == 403) {
-                         throw new \Exception("Stream API failed: HTTP {$response->status_code}. Body: " . substr($response->body, 0, 200));
+                    // Add response body to the error for debugging
+                    if ($response->status_code == 404 || $response->status_code == 403) {
+                        throw new \Exception("Stream API failed: HTTP {$response->status_code}. Body: " . substr($response->body, 0, 200));
                     }
                     throw new \Exception("Stream API request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
-                
+
                 // Manually write the response body to the file
                 if (file_put_contents($destination, $response->body) === false) {
                     throw new \Exception("Failed to write downloaded stream content to $destination.");
@@ -1358,7 +1348,7 @@ class Run {
                 if (filesize($destination) === 0) {
                     throw new \Exception("Downloaded file is empty (200 OK response). Server may have blocked the stream or sent an empty body.");
                 }
-                
+
                 return; // Success
 
             } catch (\Exception $e) {
@@ -1371,8 +1361,9 @@ class Run {
                 }
             }
         }
-        
-        // If loop finishes, streaming failed. Try direct download.
+
+        // If loop finishes, streaming failed.
+        // Try direct download.
         echo "\nStream failed after $max_attempts attempts. Attempting direct download for: $relative_path\n";
         try {
             // Construct the direct URL, URL-encoding path components but not slashes
@@ -1382,7 +1373,6 @@ class Run {
             $direct_url = $siteUrl . '/' . $encoded_relative_path;
 
             self::download_file_direct($direct_url, $destination);
-            
             echo "Direct download successful for: $relative_path\n";
             return; // Success!
 
@@ -1405,22 +1395,20 @@ class Run {
             new \RecursiveDirectoryIterator($real_root, \RecursiveDirectoryIterator::SKIP_DOTS),
             \RecursiveIteratorIterator::SELF_FIRST
         );
-
         foreach ($iterator as $file) {
             if ($file->isDir()) continue;
-
             $path = $file->getRealPath();
             $relative_path = ltrim(substr($path, strlen($real_root)), DIRECTORY_SEPARATOR);
 
             // Skip sync-specific files
-            if ($relative_path === 'database.sql' || 
+            if ($relative_path === 'database.sql' ||
                 $relative_path === 'db_export.sql' || // Skip this file if it came from remote
                 strpos($relative_path, '.disembark-db-parts') === 0 ||
                 strpos($relative_path, '.disembark-manifests') === 0) {
                 continue;
             }
 
-            $files_map[$relative_path] = (object)[
+            $files_map[$relative_path] = (object) [
                 'name' => $relative_path,
                 'size' => $file->getSize(),
                 'checksum' => md5_file($path)
@@ -1453,8 +1441,8 @@ class Run {
         $zip = new \ZipArchive;
         if ($zip->open($file) === TRUE) {
             if ($zip->extractTo($destination) === FALSE) {
-                 $zip->close();
-                 throw new \Exception("Failed to extract $file to $destination.");
+                $zip->close();
+                throw new \Exception("Failed to extract $file to $destination.");
             }
             $zip->close();
         } else {
@@ -1477,9 +1465,9 @@ class Run {
 
         $source = realpath($source);
         if ($source === false) {
-             throw new \Exception("Source directory $source does not exist.");
+            throw new \Exception("Source directory $source does not exist.");
         }
-        
+
         $files = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($source, \RecursiveDirectoryIterator::SKIP_DOTS),
             \RecursiveIteratorIterator::SELF_FIRST
@@ -1489,7 +1477,7 @@ class Run {
         foreach ($files as $file) {
             $file = realpath($file);
             // Get relative path for root of zip
-            $relativePath = 'public'. DIRECTORY_SEPARATOR . substr($file, strlen($source) + 1);
+            $relativePath = 'public' . DIRECTORY_SEPARATOR . substr($file, strlen($source) + 1);
 
             if (empty($relativePath)) continue; // Skip the root folder itself
 
@@ -1511,8 +1499,8 @@ class Run {
         }
         $it = new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS);
         $files = new \RecursiveIteratorIterator($it, \RecursiveIteratorIterator::CHILD_FIRST);
-        foreach($files as $file) {
-            if ($file->isDir()){
+        foreach ($files as $file) {
+            if ($file->isDir()) {
                 rmdir($file->getRealPath());
             } else {
                 unlink($file->getRealPath());
@@ -1520,29 +1508,28 @@ class Run {
         }
         rmdir($dir);
     }
-     // liveExecuteCommand is (no longer used by backup)
-     private static function liveExecuteCommand($cmd) {
-         while (@ ob_end_flush());
-         $proc = popen("$cmd 2>&1", 'r');
-         if ($proc === false) {
-             echo "Error: Failed to execute command: $cmd\n";
-             return;
-         }
-         $live_output     = "";
-         $complete_output = "";
-         while (!feof($proc))
-         {
-             $live_output     = fread($proc, 4096);
-             if ($live_output === false) {
-                 break;
-             }
-             $complete_output = $complete_output . $live_output;
-             echo "$live_output";
-             @ flush();
-         }
+    // liveExecuteCommand is (no longer used by backup)
+    private static function liveExecuteCommand($cmd) {
+        while (@ ob_end_flush());
+        $proc = popen("$cmd 2>&1", 'r');
+        if ($proc === false) {
+            echo "Error: Failed to execute command: $cmd\n";
+            return;
+        }
+        $live_output = "";
+        $complete_output = "";
+        while (!feof($proc)) {
+            $live_output = fread($proc, 4096);
+            if ($live_output === false) {
+                break;
+            }
+            $complete_output = $complete_output . $live_output;
+            echo "$live_output";
+            @ flush();
+        }
 
-         pclose($proc);
-     }
+        pclose($proc);
+    }
 }
 
 // Check if the script is being run directly from the command line
