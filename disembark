@@ -373,11 +373,7 @@ class Run {
         return $files_manifests;
     }
 
-    private static function runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables) {
-        
-        // 1. Run the manifest generation
-        $files_manifests = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
-
+    private static function displayBackupSummary($siteUrl, $token, $files_manifests, $exclude_tables) {
         // 2. Fetch database info
         $all_tables = [];
         try {
@@ -447,8 +443,17 @@ class Run {
         printf("%-24s %12s %12s\n", "Excluded Tables:", number_format($excludedTables), self::humanFilesize($excludedDbSize));
         printf("%-24s %12s %12s\n", "Tables to be Backed Up:", number_format($remainingTables), self::humanFilesize($remainingDbSize));
         echo "\n* This is an estimate. Actual backup size may vary.\n";
+    }
+
+    private static function runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables) {
         
-        // Return the generated manifest
+        // 1. Run the manifest generation
+        $files_manifests = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
+        
+        // 2. Display the summary
+        self::displayBackupSummary($siteUrl, $token, $files_manifests, $exclude_tables);
+
+        // 3. Return the generated manifest
         return $files_manifests;
     }
 
@@ -555,14 +560,18 @@ class Run {
                 }
             }
             
-            $total_db_steps = 0; foreach ($database as $table) { $total_db_steps += ($table->parts > 0) ? $table->parts : 1; }
+            $total_db_steps = 0;
+            foreach ($database as $table) {
+                $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
+            }
             $current_db_step = 0;
             foreach ( $database as $table ) {
                  if (!isset($table->table)) continue;
                  $progress_message = "";
                  if ($table->parts > 0) {
                      for ($part = 1; $part <= $table->parts; $part++) {
-                        $current_db_step++; $progress_message = sprintf(" - DB Sync %s (Part %d/%d) (%d/%d)", $table->table, $part, $table->parts, $current_db_step, $total_db_steps);
+                        $current_db_step++;
+                        $progress_message = sprintf(" - DB Sync %s (Part %d/%d) (%d/%d)", $table->table, $part, $table->parts, $current_db_step, $total_db_steps);
                         echo $progress_message . "\r";
                         $part_data = ['parts' => $part, 'rows_per_part' => $table->rows_per_part];
                         $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
@@ -575,7 +584,8 @@ class Run {
                      }
                      echo $progress_message . " - Done.\n";
                  } else {
-                    $current_db_step++; $progress_message = sprintf(" - DB Sync %s (%d/%d)", $table->table, $current_db_step, $total_db_steps);
+                    $current_db_step++;
+                    $progress_message = sprintf(" - DB Sync %s (%d/%d)", $table->table, $current_db_step, $total_db_steps);
                     echo $progress_message . "\r";
                     $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", [], 'POST');
                     if (strpos($file_url, 'http') !== 0) throw new \Exception("Export failed for {$table->table}");
@@ -591,9 +601,28 @@ class Run {
             self::delete_directory($local_db_parts_path);
 
             // --- 4. File Sync ---
-            echo "Starting file sync analysis...\n";
-            $exclude_paths = []; // Syncs don't support exclusions by default
-            $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
+            $files_manifest_chunks = [];
+            if ($session_id) {
+                echo "Fetching existing manifest for sync...\n";
+                try {
+                    $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+                    if (!is_array($files_manifest_chunks)) {
+                        throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid?");
+                    }
+                    echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
+                } catch (\Exception $e) {
+                    echo "Error fetching manifest: {$e->getMessage()}\n";
+                    if (!$session_id) {
+                         self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+                    }
+                    exit(1);
+                }
+            } else {
+                // --- Run generation if no $session_id ---
+                echo "Starting file sync analysis...\n";
+                $exclude_paths = []; // Syncs don't support exclusions by default
+                $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
+            }
 
             if ($is_initial_sync) {
                 // --- 4a. Initial Sync: Download all zips and extract ---
@@ -604,7 +633,6 @@ class Run {
                     $size = self::humanFilesize($file_manifest->size);
                     $progress_message = sprintf(" - Downloading and extracting chunk %d/%d (%s)", $current_step, $steps, $size);
                     echo $progress_message . "...\r";
-                    
                     $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', ['file' => $file_manifest->name, 'exclude_files' => ''], 'POST');
                     if (strpos($file_url, 'http') !== 0) throw new \Exception("Zip failed for {$file_manifest->name}");
                     
@@ -904,6 +932,7 @@ class Run {
                 "token"        => $token,
                 "backup_token" => $backup_token
             ];
+
             // Export Database Tables
             echo "Backing up database tables...\n";
             $total_db_steps = 0;
