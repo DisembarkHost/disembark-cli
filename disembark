@@ -556,8 +556,7 @@ class Run {
             // (Skipping exclude_tables logic for sync, backup all tables)
             $max_size = 209715200; // 200 MB
             foreach ($database as $table) {
-                $table_size = isset($table->size) && is_numeric($table->size) ?
-                    (float)$table->size : 0;
+                $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
                 $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
                 if ($table_size > $max_size && $row_count > 0) {
                     $parts = ceil($table_size / $max_size);
@@ -664,7 +663,7 @@ class Run {
                 echo "Fetching remote file manifest...\n";
                 $remote_files_map = [];
                 $temp_manifest_dir = $folder . '/.disembark-manifests';
-                if (!mkdir($temp_manifest_dir, 0755, true)) throw new \Exception("Could not create temp manifest dir.");
+                if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) throw new \Exception("Could not create temp manifest dir.");
                 $all_remote_files = []; // Store all files here
 
                 foreach ($files_manifest_chunks as $file_manifest) {
@@ -700,26 +699,61 @@ class Run {
                 }
 
                 echo "Comparing manifests and syncing changes...\n";
-                // 1. Check for new or changed files
+                
+                // 1. Find files to download and files to delete
+                $files_to_download = [];
+                $files_to_delete = [];
+
                 foreach ($remote_files_map as $path => $remote_file) {
                     $local_file = $local_files_map[$path] ?? null;
-                    // Check if local file exists, if remote has checksum, or if checksums mismatch
                     if (!$local_file || !isset($remote_file->checksum) || $local_file->checksum !== $remote_file->checksum) {
-                        echo " - Syncing: $path\n";
-                        $local_destination = $folder . DIRECTORY_SEPARATOR . $path;
-                        $dir = dirname($local_destination);
-                        if (!is_dir($dir)) mkdir($dir, 0755, true);
-                        self::download_file_via_stream($siteUrl, $token, $path, $local_destination);
+                        $files_to_download[] = $remote_file; // Add the file object
                     }
                 }
 
-                // 2. Check for deleted files
                 foreach ($local_files_map as $path => $local_file) {
                     if (!isset($remote_files_map[$path])) {
+                        $files_to_delete[] = $path;
+                    }
+                }
+
+                // 2. Download a zip of new/changed files
+                if (!empty($files_to_download)) {
+                    $file_count = count($files_to_download);
+                    echo " - Syncing $file_count new/changed file(s) as a zip...\n";
+
+                    // Call the new server endpoint
+                    $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $files_to_download], 'POST');
+                    if (strpos($file_url, 'http') !== 0) {
+                        throw new \Exception("Sync zip failed, did not receive a valid URL. Got: $file_url");
+                    }
+
+                    $file_name = basename($file_url);
+                    $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
+
+                    self::download_file_direct($file_url, $local_zip_chunk_path);
+                    self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
+                    unlink($local_zip_chunk_path); // Delete temp zip
+                    
+                    // Clean up remote zip chunk
+                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                    echo " - Sync zip downloaded and extracted.\n";
+
+                } else {
+                    echo " - No new or changed files to download.\n";
+                }
+
+                // 3. Check for deleted files
+                if (!empty($files_to_delete)) {
+                    foreach ($files_to_delete as $path) {
                         echo " - Removing: $path\n";
                         $file_to_delete = $folder . DIRECTORY_SEPARATOR . $path;
-                        if (file_exists($file_to_delete)) unlink($file_to_delete);
+                        if (file_exists($file_to_delete)) {
+                            unlink($file_to_delete);
+                        }
                     }
+                } else {
+                    echo " - No files to remove.\n";
                 }
 
                 echo "Cleaning up empty directories...\n";
