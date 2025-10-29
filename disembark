@@ -4,7 +4,7 @@ namespace Disembark;
 
 class Run {
 
-    const VERSION = '2.2.0';
+    const VERSION = '2.3.0';
 
     public static function main($argv, $argc) {
         if ($argc < 2) {

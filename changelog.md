@@ -1,5 +1,19 @@
 # Changelog
 
+## **v2.3.0** - October 28th, 2025
+
+### Improved
+
+* **Database Download Strategy:** Reversed the database download logic to attempt a fast, direct download first. If the direct download fails (e.g., due to hosting restrictions), it now automatically falls back to using the PHP streaming API. This logic is consolidated in a new `download_db_file` function and replaces the v2.2.0 "stream-first" approach.
+* **Database Backup Efficiency:** Refactored the database backup logic for both the `backup` and `sync` commands into a new, centralized `processDatabaseBackup` function.
+* **Hybrid Batching:** The new `processDatabaseBackup` function introduces a "hybrid batching" strategy, which groups numerous small tables into batches to be exported together while processing very large tables individually in parts. This improves reliability for complex databases.
+* **Sync Reliability:** The `sync` command's file download step for subsequent syncs is now more robust. It processes new or changed files in chunks (of 2,500 files) and includes a retry mechanism to handle intermittent network or server errors during the download and extraction of a chunk.
+* **Help Command:** Reorganized the help output (`disembark` or `disembark --help`) for better readability, grouping `backup` and `sync` as "Primary Commands".
+
+### Changed
+
+* **Removed Backup Confirmation:** Removed the "Do you want to proceed? (yes/no)" prompt from the `backup` command to allow for non-interactive scripting and automation.
+
 ## **v2.2.0** - October 26th, 2025
 
 ### Added
