@@ -475,6 +475,141 @@ class Run {
     }
 
     /**
+     * Processes the database backup using hybrid batching.
+     *
+     * @param string $siteUrl
+     * @param string $token
+     * @param string $backup_token
+     * @param array $tables_to_backup List of table objects to be backed up.
+     * @param string $db_export_file The final, local SQL file path to append to.
+     * @param string $local_db_parts_path A temporary directory to store downloaded SQL chunks.
+     * @throws \Exception
+     */
+    private static function processDatabaseBackup($siteUrl, $token, $backup_token, $tables_to_backup, $db_export_file, $local_db_parts_path) {
+        
+        echo "Backing up database tables...\n";
+
+        // --- Hybrid Batching Logic ---
+        $large_tables = [];
+        $small_tables = [];
+        $max_size = 209715200; // 200 MB
+        $max_rows = 1000000;   // 1 million rows
+
+        foreach ($tables_to_backup as $table) {
+            $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
+            $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
+
+            if (($table_size > $max_size || $row_count > $max_rows) && $row_count > 0) {
+                $parts_by_size = ceil($table_size / $max_size);
+                $parts_by_rows = ceil($row_count / $max_rows);
+                $parts = max($parts_by_size, $parts_by_rows);
+                
+                $table->parts = $parts;
+                $table->current = 0;
+                $table->rows_per_part = ceil($row_count / $parts);
+                $large_tables[] = $table;
+            } else {
+                $table->parts = 0;
+                $small_tables[] = $table;
+            }
+        }
+
+        $small_table_batches = [];
+        $current_batch = [];
+        $current_batch_size = 0;
+        foreach ($small_tables as $table) {
+            $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
+            if ($current_batch_size + $table_size > $max_size && !empty($current_batch)) {
+                $small_table_batches[] = $current_batch;
+                $current_batch = [];
+                $current_batch_size = 0;
+            }
+            $current_batch[] = $table;
+            $current_batch_size += $table_size;
+        }
+        if (!empty($current_batch)) {
+            $small_table_batches[] = $current_batch;
+        }
+        // --- End Hybrid Batching ---
+
+        // Calculate total steps
+        $total_db_steps = count($small_table_batches);
+        foreach ($large_tables as $table) {
+            $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
+        }
+        $current_db_step = 0;
+
+        // --- Loop 1: Process small table batches ---
+        foreach ($small_table_batches as $batch) {
+            $current_db_step++;
+            $table_names = array_column($batch, 'table');
+            $batch_size = array_sum(array_column($batch, 'size'));
+            $progress_message = sprintf(" - Exporting batch %d/%d (%d tables, %s)", $current_db_step, $total_db_steps, count($batch), self::humanFilesize($batch_size));
+            echo $progress_message . "...\r";
+
+            $file_url = self::make_request($siteUrl, $token, $backup_token, "/export-database-batch", ['tables' => $table_names], 'POST');
+            if (strpos($file_url, 'http') !== 0) {
+                throw new \Exception("Export failed for batch, did not receive a valid URL. Got: $file_url");
+            }
+            $file_name = basename($file_url);
+            $local_file_path = $local_db_parts_path . '/' . $file_name;
+
+            $parsed_url = parse_url($file_url);
+            $relative_path = ltrim($parsed_url['path'], '/');
+            self::download_db_file($siteUrl, $token, $relative_path, $local_file_path);
+
+            file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
+            unlink($local_file_path); // Delete local SQL part
+
+            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+            echo $progress_message . " - Done.\n";
+            usleep(50000);
+        }
+
+        // --- Loop 2: Process large tables ---
+        foreach ($large_tables as $table) {
+            if (!isset($table->table)) {
+                echo "\nWarning: Skipping invalid table data entry in backup.\n";
+                continue;
+            }
+
+            for ($part = 1; $part <= $table->parts; $part++) {
+                $current_db_step++;
+                $total_table_size = (float)$table->size;
+                $current_part_size = $max_size;
+                if ($part == $table->parts) {
+                    $current_part_size = $total_table_size - ($max_size * ($table->parts - 1));
+                }
+                
+                $description = sprintf("%s %d/%d", $table->table, $part, $table->parts);
+                $size_string = self::humanFilesize($current_part_size);
+                $progress_message = sprintf(" - Exporting batch %d/%d (%s, %s)", $current_db_step, $total_db_steps, $description, $size_string);
+                echo $progress_message . "...\r";
+                
+                $part_data = ['parts' => $part, 'rows_per_part' => $table->rows_per_part];
+                $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
+                if (strpos($file_url, 'http') !== 0) {
+                    throw new \Exception("Export failed, did not receive a valid URL. Got: $file_url");
+                }
+                $file_name = basename($file_url);
+                $local_file_path = $local_db_parts_path . '/' . $file_name;
+
+                $parsed_url = parse_url($file_url);
+                $relative_path = ltrim($parsed_url['path'], '/');
+                self::download_db_file($siteUrl, $token, $relative_path, $local_file_path);
+
+                file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
+                unlink($local_file_path); // Delete local SQL part
+
+                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                echo $progress_message . " - Done.\n";
+                usleep(50000);
+            }
+        }
+        echo "Database export and download complete.\n";
+    }
+
+    /**
      * Performs a local or remote sync.
      */
     private static function sync($siteUrl, $folder, $debug = false, $session_id = null) {
@@ -539,7 +674,6 @@ class Run {
         try {
             // --- 3. Database Sync (Always run) ---
             echo "Starting database sync...\n";
-            // Check if dir exists before creating it
             if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
                 throw new \Exception("Could not create temp DB directory.");
             }
@@ -548,67 +682,15 @@ class Run {
                 throw new \Exception("Could not write to local SQL file.");
             }
 
-            // Copy database backup logic from backup()
+            // Fetch the full database list
             $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
             if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
             $database = json_decode($response->body);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
-            // (Skipping exclude_tables logic for sync, backup all tables)
-            $max_size = 209715200; // 200 MB
-            foreach ($database as $table) {
-                $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
-                $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
-                if ($table_size > $max_size && $row_count > 0) {
-                    $parts = ceil($table_size / $max_size);
-                    $table->parts = $parts;
-                    $table->current = 0;
-                    $table->rows_per_part = ceil($row_count / $parts);
-                } else {
-                    $table->parts = 0;
-                }
-            }
 
-            $total_db_steps = 0;
-            foreach ($database as $table) {
-                $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
-            }
-            $current_db_step = 0;
-            foreach ($database as $table) {
-                if (!isset($table->table)) continue;
-                $progress_message = "";
-                if ($table->parts > 0) {
-                    for ($part = 1; $part <= $table->parts; $part++) {
-                        $current_db_step++;
-                        $progress_message = sprintf(" - DB Sync %s (Part %d/%d) (%d/%d)", $table->table, $part, $table->parts, $current_db_step, $total_db_steps);
-                        echo $progress_message . "\r";
-                        $part_data = ['parts' => $part, 'rows_per_part' => $table->rows_per_part];
-                        $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
-                        if (strpos($file_url, 'http') !== 0) throw new \Exception("Export failed for {$table->table}");
-                        $file_name = basename($file_url);
-                        $local_file_path = $local_db_parts_path . '/' . $file_name;
-                        self::download_file_via_stream($siteUrl, $token, ltrim(parse_url($file_url, PHP_URL_PATH), '/'), $local_file_path);
-                        file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-                        unlink($local_file_path);
-                        self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    }
-                    echo $progress_message . " - Done.\n";
-                } else {
-                    $current_db_step++;
-                    $progress_message = sprintf(" - DB Sync %s (%d/%d)", $table->table, $current_db_step, $total_db_steps);
-                    echo $progress_message . "\r";
-                    $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", [], 'POST');
-                    if (strpos($file_url, 'http') !== 0) throw new \Exception("Export failed for {$table->table}");
-                    $file_name = basename($file_url);
-                    $local_file_path = $local_db_parts_path . '/' . $file_name;
-                    self::download_file_via_stream($siteUrl, $token, ltrim(parse_url($file_url, PHP_URL_PATH), '/'), $local_file_path);
-                    file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-                    unlink($local_file_path);
-                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    echo $progress_message . " - Done.\n";
-                }
-            }
-            echo "Database sync complete.\n";
-            self::delete_directory($local_db_parts_path);
+            // Sync always backs up all tables, so we pass the full $database list
+            self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_parts_path);
+            self::delete_directory($local_db_parts_path); // Clean up temp dir
 
             // --- 4. File Sync ---
             $files_manifest_chunks = [];
@@ -683,7 +765,8 @@ class Run {
                 }
                 self::delete_directory($temp_manifest_dir);
                 if ($debug) {
-                    $remote_manifest_path = $folder . '/.disembark-remote-manifest.json';
+                    $remote_manifest_path = $folder .
+                        '/.disembark-remote-manifest.json';
                     file_put_contents($remote_manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
                     echo "Debug: Saved remote manifest to $remote_manifest_path\n";
                 }
@@ -699,7 +782,6 @@ class Run {
                 }
 
                 echo "Comparing manifests and syncing changes...\n";
-                
                 // 1. Find files to download and files to delete
                 $files_to_download = [];
                 $files_to_delete = [];
@@ -719,25 +801,70 @@ class Run {
 
                 // 2. Download a zip of new/changed files
                 if (!empty($files_to_download)) {
-                    $file_count = count($files_to_download);
-                    echo " - Syncing $file_count new/changed file(s) as a zip...\n";
+                    $total_files_to_download = count($files_to_download);
+                    echo " - Syncing $total_files_to_download new/changed file(s) in chunks...\n";
 
-                    // Call the new server endpoint
-                    $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $files_to_download], 'POST');
-                    if (strpos($file_url, 'http') !== 0) {
-                        throw new \Exception("Sync zip failed, did not receive a valid URL. Got: $file_url");
+                    $chunk_size = 2500;
+                    // Process 5000 files per zip
+                    $file_chunks = array_chunk($files_to_download, $chunk_size);
+                    $total_chunks = count($file_chunks);
+
+                    foreach ($file_chunks as $index => $chunk) {
+                        $chunk_num = $index + 1;
+                        $chunk_file_count = count($chunk);
+                        $progress_message = sprintf(" - Processing sync chunk %d of %d (%d files)", $chunk_num, $total_chunks, $chunk_file_count);
+                        echo $progress_message . "...\r";
+
+                        $attempts = 0;
+                        $max_attempts = 3;
+                        $success = false;
+                        while ($attempts < $max_attempts && !$success) {
+                            $attempts++;
+                            $file_url = null;
+                            $file_name = null;
+                            $local_zip_chunk_path = null;
+
+                            try {
+                                // Call the server endpoint for the current chunk
+                                $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
+                                if (strpos($file_url, 'http') !== 0) {
+                                    // This is a server-side error, not a 503. Throw to trigger retry.
+                                    throw new \Exception("Sync zip for chunk $chunk_num failed. Did not receive a valid URL. Got: $file_url");
+                                }
+
+                                $file_name = basename($file_url);
+                                $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
+
+                                self::download_file_direct($file_url, $local_zip_chunk_path);
+                                self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
+                                unlink($local_zip_chunk_path);
+                                // Delete temp zip
+                                
+                                // Clean up remote zip chunk
+                            
+                                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                                echo $progress_message . " - Done.        \n";
+                                $success = true;
+                                // Mark as successful to exit the while loop
+
+                            } catch (\Exception $e) {
+                                echo "\nWarning: Failed to process chunk $chunk_num (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
+                                if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                                // Also try to clean up remote file if it exists
+                                if ($file_name) {
+                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                                }
+
+                                if ($attempts < $max_attempts) {
+                                    echo "Retrying in 5 seconds...\n";
+                                    sleep(5);
+                                } else {
+                                    echo "Skipping this chunk after $max_attempts failed attempts. You may need to run sync again.\n";
+                                }
+                            }
+                        } // end while $attempts
                     }
-
-                    $file_name = basename($file_url);
-                    $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
-
-                    self::download_file_direct($file_url, $local_zip_chunk_path);
-                    self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
-                    unlink($local_zip_chunk_path); // Delete temp zip
-                    
-                    // Clean up remote zip chunk
-                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    echo " - Sync zip downloaded and extracted.\n";
+                    echo " - All sync chunks processed.\n";
 
                 } else {
                     echo " - No new or changed files to download.\n";
@@ -908,7 +1035,7 @@ class Run {
             // --- Database Backup ---
             $database = [];
             try {
-                // Fetch full table list again for the actual backup
+                // Fetch full table list
                 $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
                 if ($response->status_code !== 200 || empty($response->body)) {
                     throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
@@ -929,115 +1056,25 @@ class Run {
                             }
                         }
                         if (!$is_excluded) {
-                            $database[] = $table;
+                            $database[] = $table; // Add non-excluded tables
                         }
                     }
                 } else {
-                    $database = $all_tables;
+                    $database = $all_tables; // No exclusions, use all tables
                 }
             } catch (\Exception $e) {
                 echo "Error during database preparation: {$e->getMessage()}\n";
-                throw $e; // Re-throw to signal failure and trigger finally block
+                throw $e; 
             }
 
-            // Split large tables
-            $max_size = 209715200; // 200 MB
-            foreach ($database as $table) {
-                $table->running = false;
-                $table->done = false;
-                $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
-                $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
-
-                if ($table_size > $max_size && $row_count > 0) {
-                    $parts = ceil($table_size / $max_size);
-                    $table->parts = $parts;
-                    $table->current = 0;
-                    $table->rows_per_part = ceil($row_count / $parts);
-                } else {
-                    $table->parts = 0;
-                }
+            if (!empty($database)) {
+                // Call the new helper function with the *filtered* list
+                self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_path);
+            } else {
+                echo "No database tables to back up (all were excluded or list is empty).\n";
             }
 
-            $headers = ['Content-Type' => 'application/json; charset=utf-8'];
-            $db_data_base = [ // Use a base payload
-                "token" => $token,
-                "backup_token" => $backup_token
-            ];
-            // Export Database Tables
-            echo "Backing up database tables...\n";
-            $total_db_steps = 0;
-            foreach ($database as $table) {
-                $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
-            }
-            $current_db_step = 0;
-            foreach ($database as $table) {
-                if (!isset($table->table)) {
-                    echo "\nWarning: Skipping invalid table data entry in backup.\n";
-                    continue;
-                }
-
-                $progress_message = "";
-                if ($table->parts > 0) {
-                    for ($part = 1; $part <= $table->parts; $part++) {
-                        $current_db_step++;
-                        $progress_message = sprintf(" - Exporting and downloading %s (Part %d/%d) (%d/%d)", $table->table, $part, $table->parts, $current_db_step, $total_db_steps);
-                        echo $progress_message . "\r";
-                        $part_data = $db_data_base;
-                        $part_data['parts'] = $part;
-                        $part_data['rows_per_part'] = $table->rows_per_part;
-
-                        // 1. Export (now returns a full URL)
-                        $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
-                        if (strpos($file_url, 'http') !== 0) {
-                            throw new \Exception("Export failed, did not receive a valid URL. Got: $file_url");
-                        }
-                        $file_name = basename($file_url);
-                        $local_file_path = $local_db_path . '/' . $file_name;
-
-                        // 2. Download (use new stream function)
-                        $parsed_url = parse_url($file_url);
-                        $relative_path = ltrim($parsed_url['path'], '/');
-                        self::download_file_via_stream($siteUrl, $token, $relative_path, $local_file_path);
-
-                        // 3. Append to main SQL
-                        file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-                        unlink($local_file_path); // Delete local SQL part
-
-                        // 4. Delete remote SQL part
-                        self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                        usleep(50000);
-                    }
-                    echo $progress_message . " - Done.\n";
-                } else {
-                    $current_db_step++;
-                    $progress_message = sprintf(" - Exporting and downloading %s (%d/%d)", $table->table, $current_db_step, $total_db_steps);
-                    echo $progress_message . "\r";
-                    // 1. Export (now returns a full URL)
-                    $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", [], 'POST');
-                    if (strpos($file_url, 'http') !== 0) {
-                        throw new \Exception("Export failed, did not receive a valid URL. Got: $file_url");
-                    }
-                    $file_name = basename($file_url);
-                    $local_file_path = $local_db_path . '/' . $file_name;
-
-                    // 2. Download (use new stream function)
-                    $parsed_url = parse_url($file_url);
-                    $relative_path = ltrim($parsed_url['path'], '/');
-                    self::download_file_via_stream($siteUrl, $token, $relative_path, $local_file_path);
-
-                    // 3. Append to main SQL
-                    file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-                    unlink($local_file_path); // Delete local SQL part
-
-                    // 4. Delete remote SQL part
-                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    echo $progress_message . " - Done.\n";
-                    usleep(50000);
-                }
-            }
-            echo "Database export and download complete.\n";
             rmdir($local_db_path); // Remove empty database temp dir
-            // --- END DB LOOP ---
 
             // --- File Zipping ---
             if (!empty($files)) {
@@ -1163,7 +1200,6 @@ class Run {
             }
         }
     }
-
 
     private static function version() {
         $version = self::VERSION;
@@ -1343,7 +1379,6 @@ class Run {
 
     /**
      * Downloads a file from the /stream-file endpoint using WpOrg\Requests.
-     * Falls back to direct download if streaming fails.
      */
     private static function download_file_via_stream($siteUrl, $token, $relative_path, $destination) {
         $attempts = 0;
@@ -1363,7 +1398,6 @@ class Run {
                     'connect_timeout' => 30,
                 ];
                 $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
-
                 if (!$response->success) {
                     // Add response body to the error for debugging
                     if ($response->status_code == 404 || $response->status_code == 403) {
@@ -1377,7 +1411,8 @@ class Run {
                     throw new \Exception("Failed to write downloaded stream content to $destination.");
                 }
 
-                return; // Success
+                return;
+                // Success
 
             } catch (\Exception $e) {
                 echo "\nWarning: Failed to stream $relative_path (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
@@ -1391,23 +1426,39 @@ class Run {
         }
 
         // If loop finishes, streaming failed.
-        // Try direct download.
-        echo "\nStream failed after $max_attempts attempts. Attempting direct download for: $relative_path\n";
+        throw new \Exception("Stream failed after $max_attempts attempts. Last error: $last_error");
+    }
+
+    /**
+     * Downloads a database export file, trying direct download first and falling back to stream.
+     */
+    private static function download_db_file($siteUrl, $token, $relative_path, $destination) {
+        // --- 1. Construct Direct URL ---
+        // The relative path is already the full path from the WP root, e.g., wp-content/uploads/disembark/token/file.sql.txt
+        // We need to URL-encode the components
+        $path_parts = explode('/', $relative_path);
+        $encoded_parts = array_map('rawurlencode', $path_parts);
+        $encoded_relative_path = implode('/', $encoded_parts);
+        $direct_url = $siteUrl . '/' . $encoded_relative_path;
+
+        // --- 2. Try Direct Download First ---
         try {
-            // Construct the direct URL, URL-encoding path components but not slashes
-            $path_parts = explode('/', $relative_path);
-            $encoded_parts = array_map('rawurlencode', $path_parts);
-            $encoded_relative_path = implode('/', $encoded_parts);
-            $direct_url = $siteUrl . '/' . $encoded_relative_path;
-
             self::download_file_direct($direct_url, $destination);
-            echo "Direct download successful for: $relative_path\n";
-            return; // Success!
-
+            // If it succeeds, just return.
+            return;
         } catch (\Exception $e) {
-            // Direct download also failed.
-            echo "Direct download also failed: {$e->getMessage()}\n";
-            throw new \Exception("Failed to stream AND download directly '$relative_path'. Last stream error: $last_error. Direct download error: {$e->getMessage()}");
+            echo "\nWarning: Direct download failed for '$relative_path': {$e->getMessage()}\n";
+            echo "Attempting to download via stream API as fallback...\n";
+        }
+
+        // --- 3. Fallback to Stream API ---
+        try {
+            self::download_file_via_stream($siteUrl, $token, $relative_path, $destination);
+            echo "Stream API download successful for: $relative_path\n";
+        } catch (\Exception $e) {
+            // Both methods failed. This is a fatal error for this file.
+            echo "\nStream API fallback also failed: {$e->getMessage()}\n";
+            throw new \Exception("Failed to download '$relative_path' using both direct and stream methods.");
         }
     }
 
