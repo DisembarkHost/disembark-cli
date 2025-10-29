@@ -867,21 +867,6 @@ class Run {
             }
         }
 
-        // Ask for confirmation before proceeding
-        echo "\nDo you want to proceed with the backup? (yes/no) [yes]: ";
-        $handle = fopen("php://stdin", "r");
-        $line = trim(fgets($handle));
-        fclose($handle);
-        if ($line !== '' && strtolower($line) !== 'yes' && strtolower($line) !== 'y') {
-            echo "Backup cancelled by user.\n";
-            if (!$session_id) {
-                // Only clean up if this was a new session
-                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-            }
-            exit(0);
-        }
-
-
         if (!empty($exclude_paths)) {
             echo "Excluding the following paths during backup:\n";
             foreach ($exclude_paths as $path) {
