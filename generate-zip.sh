@@ -111,11 +111,10 @@ run_command() {
       unzip -q database.zip -d database/
     fi
  
-    # Check if any .sql or .sql.txt files exist in the database directory
-    if ls database/*.sql database/*.sql.txt 1> /dev/null 2>&1; then
-      # Concatenate all .sql and .sql.txt files, sorted, into the main sql file
-      cat $(ls database/*.sql database/*.sql.txt | sort -V) >> public/database-$temp_directory.sql
-    fi
+    # Concatenate all .sql and .sql.txt files, sorted, into the main sql file
+    find database/ \( -name "*.sql" -o -name "*.sql.txt" \) | sort -V | while IFS= read -r file; do
+        cat "$file" >> public/database-$temp_directory.sql
+    done
 
     echo "Generating $temp_directory-$domain.zip"
     zip -qr $temp_directory-$domain.zip public
