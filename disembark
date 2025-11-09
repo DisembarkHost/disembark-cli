@@ -41,10 +41,18 @@ class Run {
                 $exclude_tables_str = '';
                 $preview = false;
                 $session_id = null;
+                $db_max_size_str = null;
+                $db_max_rows_str = null;
+                $skip_db = false;
                 $i = 3;
                 while ($i < $argc) {
                     if ($argv[$i] === '--preview') {
                         $preview = true;
+                        $i++;
+                        continue;
+                    }
+                    if ($argv[$i] === '--skip-db') {
+                        $skip_db = true;
                         $i++;
                         continue;
                     }
@@ -64,6 +72,12 @@ class Run {
                     } elseif (strpos($argv[$i], '--exclude-tables=') === 0) {
                         $exclude_tables_str = substr($argv[$i], strlen('--exclude-tables='));
                         $i++;
+                    } elseif (strpos($argv[$i], '--db-max-size=') === 0) {
+                        $db_max_size_str = substr($argv[$i], strlen('--db-max-size='));
+                        $i++;
+                    } elseif (strpos($argv[$i], '--db-max-rows=') === 0) {
+                        $db_max_rows_str = substr($argv[$i], strlen('--db-max-rows='));
+                        $i++;
                     } else {
                         echo "Error: Unknown argument '{$argv[$i]}'\n";
                         self::showHelp();
@@ -71,7 +85,7 @@ class Run {
                     }
                 }
                 $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
-                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id);
+                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db);
                 break;
             case 'version':
                 if ($argc != 2) {
@@ -96,13 +110,28 @@ class Run {
                 $folder = null;
                 $debug = false;
                 $session_id = null;
+                $db_max_size_str = null;
+                $db_max_rows_str = null;
+                $file_chunk_size_str = null;
+                $file_chunk_max_size_str = null;
+                $skip_db = false;
 
                 $args = array_slice($argv, 3);
                 foreach ($args as $arg) {
                     if ($arg === '--debug') {
                         $debug = true;
+                    } elseif ($arg === '--skip-db') {
+                        $skip_db = true;
                     } elseif (strpos($arg, '--session-id=') === 0) {
                         $session_id = substr($arg, strlen('--session-id='));
+                    } elseif (strpos($arg, '--db-max-size=') === 0) {
+                        $db_max_size_str = substr($arg, strlen('--db-max-size='));
+                    } elseif (strpos($arg, '--db-max-rows=') === 0) {
+                        $db_max_rows_str = substr($arg, strlen('--db-max-rows='));
+                    } elseif (strpos($arg, '--file-chunk-size=') === 0) {
+                        $file_chunk_size_str = substr($arg, strlen('--file-chunk-size='));
+                    } elseif (strpos($arg, '--file-chunk-max-size=') === 0) {
+                        $file_chunk_max_size_str = substr($arg, strlen('--file-chunk-max-size='));
                     } elseif ($folder === null && strpos($arg, '--') !== 0) {
                         $folder = $arg;
                     }
@@ -114,14 +143,12 @@ class Run {
 
                 // Resolve $folder to an absolute path to avoid phar ambiguity.
                 // Check if $folder is already absolute (e.g., /var/www or C:\www)
-                if (
-                    substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && 
-                    !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') 
+                if ( substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') 
                 ) {
                     $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
                 }
 
-                self::sync($siteUrl, $folder, $debug, $session_id);
+                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str);
                 break;
             default:
                 echo "Error: Unknown command '$command'.\n\n";
@@ -485,20 +512,16 @@ class Run {
      * @param string $local_db_parts_path A temporary directory to store downloaded SQL chunks.
      * @throws \Exception
      */
-    private static function processDatabaseBackup($siteUrl, $token, $backup_token, $tables_to_backup, $db_export_file, $local_db_parts_path) {
+    private static function processDatabaseBackup($siteUrl, $token, $backup_token, $tables_to_backup, $db_export_file, $local_db_parts_path, $max_size, $max_rows) {
         
         echo "Backing up database tables...\n";
-
         // --- Hybrid Batching Logic ---
         $large_tables = [];
         $small_tables = [];
-        $max_size = 209715200; // 200 MB
-        $max_rows = 1000000;   // 1 million rows
 
         foreach ($tables_to_backup as $table) {
             $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
             $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
-
             if (($table_size > $max_size || $row_count > $max_rows) && $row_count > 0) {
                 $parts_by_size = ceil($table_size / $max_size);
                 $parts_by_rows = ceil($row_count / $max_rows);
@@ -576,13 +599,33 @@ class Run {
             for ($part = 1; $part <= $table->parts; $part++) {
                 $current_db_step++;
                 $total_table_size = (float)$table->size;
-                $current_part_size = $max_size;
+                $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
+                
+                // Determine what the size of this part *should* be for logging
+                $current_part_size = 0;
+                
+                // Recalculate parts to see which logic won
+                $parts_by_size = ($max_size > 0) ? ceil($total_table_size / $max_size) : 1;
+                $parts_by_rows = ($max_rows > 0) ? ceil($row_count / $max_rows) : 1;
+                
+                if ($parts_by_rows > $parts_by_size) {
+                    // Row-based split. Estimate size.
+                    $current_part_size = $total_table_size / $table->parts;
+                } else {
+                    // Size-based split.
+                    $current_part_size = $max_size;
+                }
+
                 if ($part == $table->parts) {
-                    $current_part_size = $total_table_size - ($max_size * ($table->parts - 1));
+                    // Last part. Calculate remaining size.
+                    // This is the size of all previous parts.
+                    $previous_parts_size = $current_part_size * ($table->parts - 1);
+                    $current_part_size = $total_table_size - $previous_parts_size;
                 }
                 
                 $description = sprintf("%s %d/%d", $table->table, $part, $table->parts);
-                $size_string = self::humanFilesize($current_part_size);
+                // Use max(0, ...) to prevent any weird negative display
+                $size_string = self::humanFilesize(max(0, $current_part_size));
                 $progress_message = sprintf(" - Exporting batch %d/%d (%s, %s)", $current_db_step, $total_db_steps, $description, $size_string);
                 echo $progress_message . "...\r";
                 
@@ -597,7 +640,6 @@ class Run {
                 $parsed_url = parse_url($file_url);
                 $relative_path = ltrim($parsed_url['path'], '/');
                 self::download_db_file($siteUrl, $token, $relative_path, $local_file_path);
-
                 file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
                 unlink($local_file_path); // Delete local SQL part
 
@@ -609,10 +651,10 @@ class Run {
         echo "Database export and download complete.\n";
     }
 
-    /**
+   /**
      * Performs a local or remote sync.
      */
-    private static function sync($siteUrl, $folder, $debug = false, $session_id = null) {
+    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null) {
         // --- 1. Authentication ---
         $siteUrl = rtrim($siteUrl, '/');
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
@@ -669,28 +711,37 @@ class Run {
             echo "Performing subsequent sync to existing folder: $folder\n";
         }
 
+        // Convert DB threshold arguments, using defaults if not provided
+        $db_max_size = $db_max_size_str ? self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
+        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000; // 1M rows default
+        $file_chunk_size = $file_chunk_size_str ? (int)$file_chunk_size_str : 2500; // 2500 files default
+        $file_chunk_max_size = $file_chunk_max_size_str ? self::convert_to_bytes($file_chunk_max_size_str) : 524288000; // 500MB default
+
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
         try {
-            // --- 3. Database Sync (Always run) ---
-            echo "Starting database sync...\n";
-            if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
-                throw new \Exception("Could not create temp DB directory.");
-            }
-            $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
-            if (file_put_contents($db_export_file, $sql_header) === false) {
-                throw new \Exception("Could not write to local SQL file.");
-            }
+            if (!$skip_db) {
+                // --- 3. Database Sync (Always run) ---
+                echo "Starting database sync...\n";
+                if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
+                    throw new \Exception("Could not create temp DB directory.");
+                }
+                $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
+                if (file_put_contents($db_export_file, $sql_header) === false) {
+                    throw new \Exception("Could not write to local SQL file.");
+                }
 
-            // Fetch the full database list
-            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-            if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
-            $database = json_decode($response->body);
-            if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
-
-            // Sync always backs up all tables, so we pass the full $database list
-            self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_parts_path);
-            self::delete_directory($local_db_parts_path); // Clean up temp dir
+                // Fetch the full database list
+                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
+                if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
+                $database = json_decode($response->body);
+                if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
+                // Sync always backs up all tables, so we pass the full $database list
+                self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_parts_path, $db_max_size, $db_max_rows);
+                self::delete_directory($local_db_parts_path); // Clean up temp dir
+            } else {
+                echo "Skipping database sync as requested.\n";
+            }
 
             // --- 4. File Sync ---
             $files_manifest_chunks = [];
@@ -804,9 +855,51 @@ class Run {
                     $total_files_to_download = count($files_to_download);
                     echo " - Syncing $total_files_to_download new/changed file(s) in chunks...\n";
 
-                    $chunk_size = 2500;
-                    // Process 5000 files per zip
-                    $file_chunks = array_chunk($files_to_download, $chunk_size);
+                    $file_chunks = [];
+                    $current_chunk = [];
+                    $current_chunk_size = 0;
+
+                    foreach ($files_to_download as $file) {
+                        $file_size = isset($file->size) && is_numeric($file->size) ? (int)$file->size : 0;
+
+                        // Case 1: This single file is larger than the max size.
+                        // It must get its own chunk.
+                        if ($file_size > $file_chunk_max_size) {
+                            // First, if we have a pending chunk, save it.
+                            if (!empty($current_chunk)) {
+                                $file_chunks[] = $current_chunk;
+                            }
+                            // Add this huge file as its own standalone chunk.
+                            $file_chunks[] = [$file];
+                            // Reset for the next loop.
+                            $current_chunk = [];
+                            $current_chunk_size = 0;
+                            continue; // Move to the next file
+                        }
+
+                        // Case 2: Adding this file would break either the SIZE or COUNT limit.
+                        if (
+                            (!empty($current_chunk) && $current_chunk_size + $file_size > $file_chunk_max_size) ||
+                            (count($current_chunk) >= $file_chunk_size)
+                        ) {
+                            // We hit a limit. Save the current chunk.
+                            $file_chunks[] = $current_chunk;
+                            
+                            // Start a new chunk with the current file.
+                            $current_chunk = [$file];
+                            $current_chunk_size = $file_size;
+                        } else {
+                            // Case 3: Add the file to the current chunk.
+                            $current_chunk[] = $file;
+                            $current_chunk_size += $file_size;
+                        }
+                    }
+
+                    // After the loop, save the last remaining chunk.
+                    if (!empty($current_chunk)) {
+                        $file_chunks[] = $current_chunk;
+                    }
+
                     $total_chunks = count($file_chunks);
 
                     foreach ($file_chunks as $index => $chunk) {
@@ -828,7 +921,6 @@ class Run {
                                 // Call the server endpoint for the current chunk
                                 $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
                                 if (strpos($file_url, 'http') !== 0) {
-                                    // This is a server-side error, not a 503. Throw to trigger retry.
                                     throw new \Exception("Sync zip for chunk $chunk_num failed. Did not receive a valid URL. Got: $file_url");
                                 }
 
@@ -840,12 +932,9 @@ class Run {
                                 unlink($local_zip_chunk_path);
                                 // Delete temp zip
                                 
-                                // Clean up remote zip chunk
-                            
                                 self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
                                 echo $progress_message . " - Done.        \n";
-                                $success = true;
-                                // Mark as successful to exit the while loop
+                                $success = true; // Mark as successful to exit the while loop
 
                             } catch (\Exception $e) {
                                 echo "\nWarning: Failed to process chunk $chunk_num (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
@@ -859,7 +948,42 @@ class Run {
                                     echo "Retrying in 5 seconds...\n";
                                     sleep(5);
                                 } else {
-                                    echo "Skipping this chunk after $max_attempts failed attempts. You may need to run sync again.\n";
+                                    // LAST ATTEMPT FAILED. INITIATE FALLBACK.
+                                    echo "Skipping zip retry. Attempting single-file download for $chunk_file_count files...\n";
+                                    $files_succeeded = 0;
+                                    $files_failed = 0;
+                                    
+                                    foreach ($chunk as $file_obj) {
+                                        if (!is_object($file_obj) || empty($file_obj->name)) continue;
+                                        
+                                        $relative_path = $file_obj->name;
+                                        $local_destination = $folder . DIRECTORY_SEPARATOR . $relative_path;
+                                        
+                                        // Ensure the local directory exists
+                                        $local_dir = dirname($local_destination);
+                                        if (!is_dir($local_dir)) {
+                                            @mkdir($local_dir, 0755, true);
+                                        }
+                                        
+                                        try {
+                                            echo "   - Downloading: $relative_path\r";
+                                            // Use the robust stream function
+                                            self::download_file_via_stream($siteUrl, $token, $relative_path, $local_destination);
+                                            $files_succeeded++;
+                                        } catch (\Exception $file_e) {
+                                            echo "\n   - FAILED: $relative_path. Error: {$file_e->getMessage()}\n";
+                                            $files_failed++;
+                                        }
+                                    }
+                                    
+                                    echo str_pad("", 80, " ") . "\r"; // Clear the "Downloading..." line
+                                    if ($files_failed === 0) {
+                                        echo "   - Fallback complete: Successfully downloaded all $files_succeeded files individually.\n";
+                                        $success = true; // Mark the chunk as successful
+                                    } else {
+                                        echo "   - Fallback partial: $files_succeeded succeeded, $files_failed FAILED. You may need to run sync again for the failed files.\n";
+                                        $success = true; // Mark as successful anyway to avoid skipping
+                                    }
                                 }
                             }
                         } // end while $attempts
@@ -904,7 +1028,7 @@ class Run {
         echo "\nSync complete: $folder is up to date.\n";
     }
 
-    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null) {
+    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false) {
 
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
@@ -1007,6 +1131,11 @@ class Run {
             }
         }
 
+        // --- Setup Local Backup Environment ---
+        // Convert DB threshold arguments, using defaults if not provided
+        $db_max_size = $db_max_size_str ? self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
+        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000; // 1M rows default
+
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
         // --- Setup Local Backup Environment ---
         // Create the directory name
@@ -1022,59 +1151,68 @@ class Run {
         $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
-            if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
+            if (!$skip_db) {
+                if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
+            }
             if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create temp directory $local_public_path.");
-            // Write SQL headers
-            $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
-            if (file_put_contents($db_export_file, $sql_header) === false) {
-                throw new \Exception("Could not write to local SQL file $db_export_file.");
+            
+            if (!$skip_db) {
+                // Write SQL headers
+                $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
+                if (file_put_contents($db_export_file, $sql_header) === false) {
+                    throw new \Exception("Could not write to local SQL file $db_export_file.");
+                }
             }
             echo "Created local temporary directory at $temp_directory\n";
             // --- END Local Setup ---
 
-            // --- Database Backup ---
-            $database = [];
-            try {
-                // Fetch full table list
-                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-                if ($response->status_code !== 200 || empty($response->body)) {
-                    throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
-                }
-                $all_tables = json_decode($response->body);
-                if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                    throw new \Exception("Invalid database list received during backup.");
-                }
+            if (!$skip_db) {
+                // --- Database Backup ---
+                $database = [];
+                try {
+                    // Fetch full table list
+                    $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
+                    if ($response->status_code !== 200 || empty($response->body)) {
+                        throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
+                    }
+                    $all_tables = json_decode($response->body);
+                    if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
+                        throw new \Exception("Invalid database list received during backup.");
+                    }
 
-                // Filter tables based on exclusions
-                if (!empty($exclude_tables)) {
-                    foreach ($all_tables as $table) {
-                        $is_excluded = false;
-                        foreach ($exclude_tables as $pattern) {
-                            if (fnmatch($pattern, $table->table)) {
-                                $is_excluded = true;
-                                break;
+                    // Filter tables based on exclusions
+                    if (!empty($exclude_tables)) {
+                        foreach ($all_tables as $table) {
+                            $is_excluded = false;
+                            foreach ($exclude_tables as $pattern) {
+                                if (fnmatch($pattern, $table->table)) {
+                                    $is_excluded = true;
+                                    break;
+                                }
+                            }
+                            if (!$is_excluded) {
+                                $database[] = $table; // Add non-excluded tables
                             }
                         }
-                        if (!$is_excluded) {
-                            $database[] = $table; // Add non-excluded tables
-                        }
+                    } else {
+                        $database = $all_tables; // No exclusions, use all tables
                     }
-                } else {
-                    $database = $all_tables; // No exclusions, use all tables
+                } catch (\Exception $e) {
+                    echo "Error during database preparation: {$e->getMessage()}\n";
+                    throw $e; 
                 }
-            } catch (\Exception $e) {
-                echo "Error during database preparation: {$e->getMessage()}\n";
-                throw $e; 
-            }
 
-            if (!empty($database)) {
-                // Call the new helper function with the *filtered* list
-                self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_path);
+                if (!empty($database)) {
+                    // Call the new helper function with the *filtered* list
+                    self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_path, $db_max_size, $db_max_rows);
+                } else {
+                    echo "No database tables to back up (all were excluded or list is empty).\n";
+                }
+
+                rmdir($local_db_path); // Remove empty database temp dir
             } else {
-                echo "No database tables to back up (all were excluded or list is empty).\n";
+                echo "Skipping database backup as requested.\n";
             }
-
-            rmdir($local_db_path); // Remove empty database temp dir
 
             // --- File Zipping ---
             if (!empty($files)) {
@@ -1284,8 +1422,11 @@ class Run {
         echo "\n";
         echo "    Options for backup:\n";
         echo "      --preview                          Show a summary of files and DB tables to be backed up without running the backup.\n";
+        echo "      --skip-db                          Skip the database backup and only process files.\n";
         echo "      -x <path>                          Exclude a file or directory path (e.g., wp-content/cache). Can be specified multiple times.\n";
         echo "      --exclude-tables=<tables>          Exclude specific database tables (comma-separated, no spaces). Wildcards (*) are supported.\n";
+        echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
+        echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
         echo "      --session-id=<id>                  Reuse a specific backup session ID (backup token) generated by the plugin UI.\n";
         echo "\n";
         echo "  disembark sync <site-url> [<folder>] [options]\n";
@@ -1293,6 +1434,11 @@ class Run {
         echo "\n";
         echo "    Options for sync:\n";
         echo "      --debug                            Save local and remote manifest files for debugging.\n";
+        echo "      --skip-db                          Skip the database sync and only process files.\n";
+        echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
+        echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
+        echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
+        echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 500MB.\n";
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI.\n";
         echo "\n";
         echo "Other Commands:\n";
@@ -1304,7 +1450,33 @@ class Run {
         echo "Example:\n";
         echo "  disembark backup https://example.com --preview -x wp-content/uploads/large-dir --exclude-tables=wp_options,wp_logs\n";
         echo "  disembark backup https://example.com --session-id=a1b2c3d4e5f6\n";
-        echo "  disembark sync https://example.com --session-id=a1b2c3d4e5f6\n";
+        echo "  disembark sync https://example.com --session-id=a1b2c3d4e5f6 --skip-db\n";
+    }
+
+    private static function convert_to_bytes($size_str) {
+        $size_str = strtolower(trim($size_str));
+        
+        // Use preg_match to separate the number and the unit
+        preg_match('/^([0-9\.]+)\s*(kb|mb|gb|k|m|g)?$/', $size_str, $matches);
+        
+        $value = isset($matches[1]) ? (float) $matches[1] : 0;
+        $unit = isset($matches[2]) ? $matches[2] : '';
+
+        switch ($unit) {
+            case 'g':
+            case 'gb':
+                $value *= 1024 * 1024 * 1024;
+                break;
+            case 'm':
+            case 'mb':
+                $value *= 1024 * 1024;
+                break;
+            case 'k':
+            case 'kb':
+                $value *= 1024;
+                break;
+        }
+        return (int) $value;
     }
 
     /**
