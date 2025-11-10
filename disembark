@@ -44,6 +44,7 @@ class Run {
                 $db_max_size_str = null;
                 $db_max_rows_str = null;
                 $skip_db = false;
+                $skip_files = false;
                 $i = 3;
                 while ($i < $argc) {
                     if ($argv[$i] === '--preview') {
@@ -53,6 +54,11 @@ class Run {
                     }
                     if ($argv[$i] === '--skip-db') {
                         $skip_db = true;
+                        $i++;
+                        continue;
+                    }
+                    if ($argv[$i] === '--skip-files') {
+                        $skip_files = true;
                         $i++;
                         continue;
                     }
@@ -85,7 +91,7 @@ class Run {
                     }
                 }
                 $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
-                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db);
+                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db, $skip_files);
                 break;
             case 'version':
                 if ($argc != 2) {
@@ -115,6 +121,7 @@ class Run {
                 $file_chunk_size_str = null;
                 $file_chunk_max_size_str = null;
                 $skip_db = false;
+                $skip_files = false;
 
                 $args = array_slice($argv, 3);
                 foreach ($args as $arg) {
@@ -122,6 +129,8 @@ class Run {
                         $debug = true;
                     } elseif ($arg === '--skip-db') {
                         $skip_db = true;
+                    } elseif ($arg === '--skip-files') {
+                        $skip_files = true;
                     } elseif (strpos($arg, '--session-id=') === 0) {
                         $session_id = substr($arg, strlen('--session-id='));
                     } elseif (strpos($arg, '--db-max-size=') === 0) {
@@ -143,12 +152,11 @@ class Run {
 
                 // Resolve $folder to an absolute path to avoid phar ambiguity.
                 // Check if $folder is already absolute (e.g., /var/www or C:\www)
-                if ( substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') 
-                ) {
+                if ( substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') ) {
                     $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
                 }
 
-                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str);
+                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files);
                 break;
             case 'ncdu':
                 if ($argc < 3) {
@@ -678,7 +686,7 @@ class Run {
    /**
      * Performs a local or remote sync.
      */
-    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null) {
+    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false) {
         // --- 1. Authentication ---
         $siteUrl = rtrim($siteUrl, '/');
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
@@ -767,273 +775,351 @@ class Run {
                 echo "Skipping database sync as requested.\n";
             }
 
-            // --- 4. File Sync ---
-            $files_manifest_chunks = [];
-            if ($session_id) {
-                echo "Fetching existing manifest for sync...\n";
-                try {
-                    $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
-                    if (!is_array($files_manifest_chunks)) {
-                        throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid?");
-                    }
-                    echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
-                } catch (\Exception $e) {
-                    echo "Error fetching manifest: {$e->getMessage()}\n";
-                    if (!$session_id) {
-                        self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-                    }
-                    exit(1);
-                }
-            } else {
-                // --- Run generation if no $session_id ---
-                echo "Starting file sync analysis...\n";
-                $exclude_paths = []; // Syncs don't support exclusions by default
-                $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
-            }
-
-            if ($is_initial_sync) {
-                // --- 4a. Initial Sync: Download all zips and extract ---
-                echo "Performing initial file download...\n";
-                $steps = count($files_manifest_chunks);
-                $current_step = 1;
-                foreach ($files_manifest_chunks as $file_manifest) {
-                    if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) continue;
-                    $size = self::humanFilesize($file_manifest->size);
-                    $progress_message = sprintf(" - Downloading and extracting chunk %d/%d (%s)", $current_step, $steps, $size);
-                    echo $progress_message . "...\r";
-                    $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', ['file' => $file_manifest->name, 'exclude_files' => ''], 'POST');
-                    if (strpos($file_url, 'http') !== 0) throw new \Exception("Zip failed for {$file_manifest->name}");
-
-                    $file_name = basename($file_url);
-                    $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
-
-                    self::download_file_direct($file_url, $local_zip_chunk_path);
-                    self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
-                    unlink($local_zip_chunk_path); // Delete temp zip
-                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    echo $progress_message . " - Done.\n";
-                    $current_step++;
-                }
-                echo "Initial file sync complete.\n";
-            } else {
-                // --- 4b. Subsequent Sync: Diff and download ---
-                echo "Fetching remote file manifest...\n";
-                $remote_files_map = [];
-                $temp_manifest_dir = $folder . '/.disembark-manifests';
-                if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) throw new \Exception("Could not create temp manifest dir.");
-                $all_remote_files = []; // Store all files here
-
-                foreach ($files_manifest_chunks as $file_manifest) {
-                    $chunk_url = $file_manifest->url;
-                    $local_chunk_path = $temp_manifest_dir . '/' . $file_manifest->name;
-                    self::download_file_direct($chunk_url, $local_chunk_path);
-                    $files = json_decode(file_get_contents($local_chunk_path));
-                    if (is_array($files)) {
-                        foreach ($files as $file) {
-                            if (isset($file->name)) {
-                                $remote_files_map[$file->name] = $file;
-                                $all_remote_files[] = $file; // Add to full list
-                            }
+            if (!$skip_files) {
+                // --- 4. File Sync ---
+                $files_manifest_chunks = [];
+                if ($session_id) {
+                    echo "Fetching existing manifest for sync...\n";
+                    try {
+                        $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+                        if (!is_array($files_manifest_chunks)) {
+                            throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid?");
                         }
-                    }
-                    unlink($local_chunk_path);
-                }
-                self::delete_directory($temp_manifest_dir);
-                if ($debug) {
-                    $remote_manifest_path = $folder .
-                        '/.disembark-remote-manifest.json';
-                    file_put_contents($remote_manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
-                    echo "Debug: Saved remote manifest to $remote_manifest_path\n";
-                }
-
-                echo "Generating local file manifest...\n";
-                $local_files_map = self::generate_local_manifest($folder);
-
-                if ($debug) {
-                    $local_manifest_path = $folder . '/.disembark-local-manifest.json';
-                    // We need the list, not the map, for a comparable JSON
-                    file_put_contents($local_manifest_path, json_encode(array_values($local_files_map), JSON_PRETTY_PRINT));
-                    echo "Debug: Saved local manifest to $local_manifest_path\n";
-                }
-
-                echo "Comparing manifests and syncing changes...\n";
-                // 1. Find files to download and files to delete
-                $files_to_download = [];
-                $files_to_delete = [];
-
-                foreach ($remote_files_map as $path => $remote_file) {
-                    $local_file = $local_files_map[$path] ?? null;
-                    if (!$local_file || !isset($remote_file->checksum) || $local_file->checksum !== $remote_file->checksum) {
-                        $files_to_download[] = $remote_file; // Add the file object
-                    }
-                }
-
-                foreach ($local_files_map as $path => $local_file) {
-                    if (!isset($remote_files_map[$path])) {
-                        $files_to_delete[] = $path;
-                    }
-                }
-
-                // 2. Download a zip of new/changed files
-                if (!empty($files_to_download)) {
-                    $total_files_to_download = count($files_to_download);
-                    echo " - Syncing $total_files_to_download new/changed file(s) in chunks...\n";
-
-                    $file_chunks = [];
-                    $current_chunk = [];
-                    $current_chunk_size = 0;
-
-                    foreach ($files_to_download as $file) {
-                        $file_size = isset($file->size) && is_numeric($file->size) ? (int)$file->size : 0;
-
-                        // Case 1: This single file is larger than the max size.
-                        // It must get its own chunk.
-                        if ($file_size > $file_chunk_max_size) {
-                            // First, if we have a pending chunk, save it.
-                            if (!empty($current_chunk)) {
-                                $file_chunks[] = $current_chunk;
-                            }
-                            // Add this huge file as its own standalone chunk.
-                            $file_chunks[] = [$file];
-                            // Reset for the next loop.
-                            $current_chunk = [];
-                            $current_chunk_size = 0;
-                            continue; // Move to the next file
+                        echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
+                    } catch (\Exception $e) {
+                        echo "Error fetching manifest: {$e->getMessage()}\n";
+                        if (!$session_id) {
+                            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
                         }
+                        exit(1);
+                    }
+                } else {
+                    // --- Run generation if no $session_id ---
+                    echo "Starting file sync analysis...\n";
+                    $exclude_paths = []; // Syncs don't support exclusions by default
+                    $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
+                }
 
-                        // Case 2: Adding this file would break either the SIZE or COUNT limit.
-                        if (
-                            (!empty($current_chunk) && $current_chunk_size + $file_size > $file_chunk_max_size) ||
-                            (count($current_chunk) >= $file_chunk_size)
-                        ) {
-                            // We hit a limit. Save the current chunk.
-                            $file_chunks[] = $current_chunk;
-                            
-                            // Start a new chunk with the current file.
-                            $current_chunk = [$file];
-                            $current_chunk_size = $file_size;
-                        } else {
-                            // Case 3: Add the file to the current chunk.
-                            $current_chunk[] = $file;
-                            $current_chunk_size += $file_size;
+                if ($is_initial_sync) {
+                    // --- 4a. Initial Sync: Download all zips and extract (with fallback) ---
+                    echo "Performing initial file download...\n";
+                    $steps = count($files_manifest_chunks);
+                    $current_step = 1;
+                    foreach ($files_manifest_chunks as $file_manifest) {
+                        if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) {
+                            $current_step++;
+                            continue;
                         }
-                    }
-
-                    // After the loop, save the last remaining chunk.
-                    if (!empty($current_chunk)) {
-                        $file_chunks[] = $current_chunk;
-                    }
-
-                    $total_chunks = count($file_chunks);
-
-                    foreach ($file_chunks as $index => $chunk) {
-                        $chunk_num = $index + 1;
-                        $chunk_file_count = count($chunk);
-                        $progress_message = sprintf(" - Processing sync chunk %d of %d (%d files)", $chunk_num, $total_chunks, $chunk_file_count);
+                        $size = self::humanFilesize($file_manifest->size);
+                        $progress_message = sprintf(" - Processing chunk %d/%d (%s)", $current_step, $steps, $size);
                         echo $progress_message . "...\r";
+                        
+                        $file_url = null;
+                        $file_name = null;
+                        $local_zip_chunk_path = null;
 
-                        $attempts = 0;
-                        $max_attempts = 3;
-                        $success = false;
-                        while ($attempts < $max_attempts && !$success) {
-                            $attempts++;
-                            $file_url = null;
-                            $file_name = null;
-                            $local_zip_chunk_path = null;
+                        try {
+                            // --- Attempt 1: Download the pre-generated ZIP chunk ---
+                            $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', ['file' => $file_manifest->name, 'exclude_files' => ''], 'POST');
+                            if (strpos($file_url, 'http') !== 0) throw new \Exception("Zip failed for {$file_manifest->name}");
+
+                            $file_name = basename($file_url);
+                            $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
+
+                            self::download_file_direct($file_url, $local_zip_chunk_path);
+                            self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
+                            unlink($local_zip_chunk_path); // Delete temp zip
+                            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                            
+                            echo $progress_message . " - Done (Zip).\n";
+
+                        } catch (\Exception $e) {
+                            // --- Attempt 2: Fallback to single-file download ---
+                            echo "\nWarning: Zip download failed for {$file_manifest->name}: {$e->getMessage()}\n";
+                            echo "Attempting single-file download fallback for this chunk...\n";
+
+                            // Clean up any partial zip file
+                            if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                            // Clean up remote zip file if it was created
+                            if ($file_name) {
+                                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                            }
+
+                            $files_succeeded = 0;
+                            $files_failed = 0;
+                            $chunk_file_list = [];
 
                             try {
-                                // Call the server endpoint for the current chunk
-                                $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
-                                if (strpos($file_url, 'http') !== 0) {
-                                    throw new \Exception("Sync zip for chunk $chunk_num failed. Did not receive a valid URL. Got: $file_url");
-                                }
-
-                                $file_name = basename($file_url);
-                                $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
-
-                                self::download_file_direct($file_url, $local_zip_chunk_path);
-                                self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
-                                unlink($local_zip_chunk_path);
-                                // Delete temp zip
+                                // 1. Download the JSON manifest for this chunk
+                                // $file_manifest->url is the URL to the .../files-X.json file
+                                $temp_json_path = $folder . '/' . $file_manifest->name; // e.g., /path/to/sync/files-3.json
+                                self::download_file_direct($file_manifest->url, $temp_json_path);
+                                $json_content = file_get_contents($temp_json_path);
+                                unlink($temp_json_path); // Delete temp json
                                 
-                                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                                echo $progress_message . " - Done.        \n";
-                                $success = true; // Mark as successful to exit the while loop
-
-                            } catch (\Exception $e) {
-                                echo "\nWarning: Failed to process chunk $chunk_num (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
-                                if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
-                                // Also try to clean up remote file if it exists
-                                if ($file_name) {
-                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                                $chunk_file_list = json_decode($json_content);
+                                if (!is_array($chunk_file_list)) {
+                                    throw new \Exception("Could not decode file list from {$file_manifest->url}");
                                 }
 
-                                if ($attempts < $max_attempts) {
-                                    echo "Retrying in 5 seconds...\n";
-                                    sleep(5);
+                                $total_files_in_chunk = count($chunk_file_list);
+                                echo "   - Manifest contains $total_files_in_chunk files. Starting download...\n";
+
+                                // 2. Loop and download each file
+                                foreach ($chunk_file_list as $file_obj) {
+                                    if (!is_object($file_obj) || empty($file_obj->name)) continue;
+                                    
+                                    $relative_path = $file_obj->name;
+                                    $local_destination = $folder . DIRECTORY_SEPARATOR . $relative_path;
+                                    $local_dir = dirname($local_destination);
+                                    
+                                    if (!is_dir($local_dir)) {
+                                        @mkdir($local_dir, 0755, true);
+                                    }
+                                    
+                                    try {
+                                        echo "   - Downloading: $relative_path\r";
+                                        // Use the robust stream function
+                                        self::download_file_via_stream($siteUrl, $token, $relative_path, $local_destination);
+                                        $files_succeeded++;
+                                    } catch (\Exception $file_e) {
+                                        echo "\n   - FAILED: $relative_path. Error: {$file_e->getMessage()}\n";
+                                        $files_failed++;
+                                    }
+                                }
+                                
+                                echo str_pad("", 80, " ") . "\r"; // Clear the "Downloading..." line
+                                if ($files_failed === 0) {
+                                    echo $progress_message . " - Done (Fallback).\n";
                                 } else {
-                                    // LAST ATTEMPT FAILED. INITIATE FALLBACK.
-                                    echo "Skipping zip retry. Attempting single-file download for $chunk_file_count files...\n";
-                                    $files_succeeded = 0;
-                                    $files_failed = 0;
-                                    
-                                    foreach ($chunk as $file_obj) {
-                                        if (!is_object($file_obj) || empty($file_obj->name)) continue;
-                                        
-                                        $relative_path = $file_obj->name;
-                                        $local_destination = $folder . DIRECTORY_SEPARATOR . $relative_path;
-                                        
-                                        // Ensure the local directory exists
-                                        $local_dir = dirname($local_destination);
-                                        if (!is_dir($local_dir)) {
-                                            @mkdir($local_dir, 0755, true);
-                                        }
-                                        
-                                        try {
-                                            echo "   - Downloading: $relative_path\r";
-                                            // Use the robust stream function
-                                            self::download_file_via_stream($siteUrl, $token, $relative_path, $local_destination);
-                                            $files_succeeded++;
-                                        } catch (\Exception $file_e) {
-                                            echo "\n   - FAILED: $relative_path. Error: {$file_e->getMessage()}\n";
-                                            $files_failed++;
-                                        }
-                                    }
-                                    
-                                    echo str_pad("", 80, " ") . "\r"; // Clear the "Downloading..." line
-                                    if ($files_failed === 0) {
-                                        echo "   - Fallback complete: Successfully downloaded all $files_succeeded files individually.\n";
-                                        $success = true; // Mark the chunk as successful
-                                    } else {
-                                        echo "   - Fallback partial: $files_succeeded succeeded, $files_failed FAILED. You may need to run sync again for the failed files.\n";
-                                        $success = true; // Mark as successful anyway to avoid skipping
-                                    }
+                                    echo $progress_message . " - Partial (Fallback: $files_succeeded succeeded, $files_failed failed).\n";
+                                }
+
+                            } catch (\Exception $fallback_e) {
+                                echo "\nFATAL: Fallback failed for chunk $current_step: {$fallback_e->getMessage()}\n";
+                                // Don't re-throw, just continue to the next chunk.
+                            }
+                        }
+                        $current_step++;
+                    }
+                    echo "Initial file sync complete.\n";
+                } else {
+                    // --- 4b. Subsequent Sync: Diff and download ---
+                    echo "Fetching remote file manifest...\n";
+                    $remote_files_map = [];
+                    $temp_manifest_dir = $folder . '/.disembark-manifests';
+                    if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) throw new \Exception("Could not create temp manifest dir.");
+                    $all_remote_files = []; // Store all files here
+
+                    foreach ($files_manifest_chunks as $file_manifest) {
+                        $chunk_url = $file_manifest->url;
+                        $local_chunk_path = $temp_manifest_dir . '/' . $file_manifest->name;
+                        self::download_file_direct($chunk_url, $local_chunk_path);
+                        $files = json_decode(file_get_contents($local_chunk_path));
+                        if (is_array($files)) {
+                            foreach ($files as $file) {
+                                if (isset($file->name)) {
+                                    $remote_files_map[$file->name] = $file;
+                                    $all_remote_files[] = $file; // Add to full list
                                 }
                             }
-                        } // end while $attempts
+                        }
+                        unlink($local_chunk_path);
                     }
-                    echo " - All sync chunks processed.\n";
+                    self::delete_directory($temp_manifest_dir);
+                    if ($debug) {
+                        $remote_manifest_path = $folder .
+                            '/.disembark-remote-manifest.json';
+                        file_put_contents($remote_manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
+                        echo "Debug: Saved remote manifest to $remote_manifest_path\n";
+                    }
 
-                } else {
-                    echo " - No new or changed files to download.\n";
-                }
+                    echo "Generating local file manifest...\n";
+                    $local_files_map = self::generate_local_manifest($folder);
 
-                // 3. Check for deleted files
-                if (!empty($files_to_delete)) {
-                    foreach ($files_to_delete as $path) {
-                        echo " - Removing: $path\n";
-                        $file_to_delete = $folder . DIRECTORY_SEPARATOR . $path;
-                        if (file_exists($file_to_delete)) {
-                            unlink($file_to_delete);
+                    if ($debug) {
+                        $local_manifest_path = $folder . '/.disembark-local-manifest.json';
+                        // We need the list, not the map, for a comparable JSON
+                        file_put_contents($local_manifest_path, json_encode(array_values($local_files_map), JSON_PRETTY_PRINT));
+                        echo "Debug: Saved local manifest to $local_manifest_path\n";
+                    }
+
+                    echo "Comparing manifests and syncing changes...\n";
+                    // 1. Find files to download and files to delete
+                    $files_to_download = [];
+                    $files_to_delete = [];
+
+                    foreach ($remote_files_map as $path => $remote_file) {
+                        $local_file = $local_files_map[$path] ?? null;
+                        if (!$local_file || !isset($remote_file->checksum) || $local_file->checksum !== $remote_file->checksum) {
+                            $files_to_download[] = $remote_file; // Add the file object
                         }
                     }
-                } else {
-                    echo " - No files to remove.\n";
-                }
 
-                echo "Cleaning up empty directories...\n";
-                self::delete_empty_dirs($folder);
-                echo "File sync complete.\n";
+                    foreach ($local_files_map as $path => $local_file) {
+                        if (!isset($remote_files_map[$path])) {
+                            $files_to_delete[] = $path;
+                        }
+                    }
+
+                    // 2. Download a zip of new/changed files
+                    if (!empty($files_to_download)) {
+                        $total_files_to_download = count($files_to_download);
+                        echo " - Syncing $total_files_to_download new/changed file(s) in chunks...\n";
+
+                        $file_chunks = [];
+                        $current_chunk = [];
+                        $current_chunk_size = 0;
+                        foreach ($files_to_download as $file) {
+                            $file_size = isset($file->size) && is_numeric($file->size) ? (int)$file->size : 0;
+
+                            // Case 1: This single file is larger than the max size.
+                            // It must get its own chunk.
+                            if ($file_size > $file_chunk_max_size) {
+                                // First, if we have a pending chunk, save it.
+                                if (!empty($current_chunk)) {
+                                    $file_chunks[] = $current_chunk;
+                                }
+                                // Add this huge file as its own standalone chunk.
+                                $file_chunks[] = [$file];
+                                // Reset for the next loop.
+                                $current_chunk = [];
+                                $current_chunk_size = 0;
+                                continue; // Move to the next file
+                            }
+
+                            // Case 2: Adding this file would break either the SIZE or COUNT limit.
+                            if (
+                                (!empty($current_chunk) && $current_chunk_size + $file_size > $file_chunk_max_size) ||
+                                (count($current_chunk) >= $file_chunk_size)
+                            ) {
+                                // We hit a limit. Save the current chunk.
+                                $file_chunks[] = $current_chunk;
+                                
+                                // Start a new chunk with the current file.
+                                $current_chunk = [$file];
+                                $current_chunk_size = $file_size;
+                            } else {
+                                // Case 3: Add the file to the current chunk.
+                                $current_chunk[] = $file;
+                                $current_chunk_size += $file_size;
+                            }
+                        }
+
+                        // After the loop, save the last remaining chunk.
+                        if (!empty($current_chunk)) {
+                            $file_chunks[] = $current_chunk;
+                        }
+
+                        $total_chunks = count($file_chunks);
+                        foreach ($file_chunks as $index => $chunk) {
+                            $chunk_num = $index + 1;
+                            $chunk_file_count = count($chunk);
+                            $progress_message = sprintf(" - Processing sync chunk %d of %d (%d files)", $chunk_num, $total_chunks, $chunk_file_count);
+                            echo $progress_message . "...\r";
+
+                            $attempts = 0;
+                            $max_attempts = 3;
+                            $success = false;
+                            while ($attempts < $max_attempts && !$success) {
+                                $attempts++;
+                                $file_url = null;
+                                $file_name = null;
+                                $local_zip_chunk_path = null;
+
+                                try {
+                                    // Call the server endpoint for the current chunk
+                                    $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
+                                    if (strpos($file_url, 'http') !== 0) {
+                                        throw new \Exception("Sync zip for chunk $chunk_num failed. Did not receive a valid URL. Got: $file_url");
+                                    }
+
+                                    $file_name = basename($file_url);
+                                    $local_zip_chunk_path = $folder . '/' . $file_name; // Temp file in root
+
+                                    self::download_file_direct($file_url, $local_zip_chunk_path);
+                                    self::unzip_file($local_zip_chunk_path, $folder); // Unzip directly to target
+                                    unlink($local_zip_chunk_path);
+                                    // Delete temp zip
+                                    
+                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                                    echo $progress_message . " - Done.        \n";
+                                    $success = true; // Mark as successful to exit the while loop
+
+                                } catch (\Exception $e) {
+                                    echo "\nWarning: Failed to process chunk $chunk_num (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
+                                    if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                                    // Also try to clean up remote file if it exists
+                                    if ($file_name) {
+                                        self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                                    }
+
+                                    if ($attempts < $max_attempts) {
+                                        echo "Retrying in 5 seconds...\n";
+                                        sleep(5);
+                                    } else {
+                                        // LAST ATTEMPT FAILED.
+                                        // INITIATE FALLBACK.
+                                        echo "Skipping zip retry. Attempting single-file download for $chunk_file_count files...\n";
+                                        $files_succeeded = 0;
+                                        $files_failed = 0;
+                                        foreach ($chunk as $file_obj) {
+                                            if (!is_object($file_obj) || empty($file_obj->name)) continue;
+                                            $relative_path = $file_obj->name;
+                                            $local_destination = $folder . DIRECTORY_SEPARATOR . $relative_path;
+                                            // Ensure the local directory exists
+                                            $local_dir = dirname($local_destination);
+                                            if (!is_dir($local_dir)) {
+                                                @mkdir($local_dir, 0755, true);
+                                            }
+                                            
+                                            try {
+                                                echo "   - Downloading: $relative_path\r";
+                                                // Use the robust stream function
+                                                self::download_file_via_stream($siteUrl, $token, $relative_path, $local_destination);
+                                                $files_succeeded++;
+                                            } catch (\Exception $file_e) {
+                                                echo "\n   - FAILED: $relative_path. Error: {$file_e->getMessage()}\n";
+                                                $files_failed++;
+                                            }
+                                        }
+
+                                        echo str_pad("", 80, " ") . "\r"; // Clear the "Downloading..." line
+                                        if ($files_failed === 0) {
+                                            echo "   - Fallback complete: Successfully downloaded all $files_succeeded files individually.\n";
+                                            $success = true; // Mark the chunk as successful
+                                        } else {
+                                            echo "   - Fallback partial: $files_succeeded succeeded, $files_failed FAILED. You may need to run sync again for the failed files.\n";
+                                            $success = true; // Mark as successful anyway to avoid skipping
+                                        }
+                                    }
+                                }
+                            } // end while $attempts
+                        }
+                        echo " - All sync chunks processed.\n";
+                    } else {
+                        echo " - No new or changed files to download.\n";
+                    }
+
+                    // 3. Check for deleted files
+                    if (!empty($files_to_delete)) {
+                        foreach ($files_to_delete as $path) {
+                            echo " - Removing: $path\n";
+                            $file_to_delete = $folder . DIRECTORY_SEPARATOR . $path;
+                            if (file_exists($file_to_delete)) {
+                                unlink($file_to_delete);
+                            }
+                        }
+                    } else {
+                        echo " - No files to remove.\n";
+                    }
+
+                    echo "Cleaning up empty directories...\n";
+                    self::delete_empty_dirs($folder);
+                    echo "File sync complete.\n";
+                }
+            } else {
+                echo "Skipping file sync as requested.\n";
             }
         } catch (\Exception $e) {
             echo "\nSync failed: {$e->getMessage()}\n";
@@ -1453,7 +1539,7 @@ class Run {
         return $output;
     }
 
-    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false) {
+    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false, $skip_files = false) {
 
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
@@ -1505,6 +1591,10 @@ class Run {
         $files = [];
         if ($session_id) {
             $backup_token = $session_id;
+
+            $all_remote_files = [];
+            $client_side_filtering = false;
+
             echo "Reusing backup session: $backup_token\n";
 
             try {
@@ -1514,32 +1604,87 @@ class Run {
                 if (!is_array($files)) {
                     throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid or is the manifest still generating?");
                 }
-                echo "Successfully fetched manifest with " . count($files) . " file chunks.\n";
+                echo "Successfully fetched manifest with " .
+                    count($files) . " file chunks.\n";
 
-                // Now display the summary based on the fetched manifest.
-                // We pass an empty $exclude_tables array because the manifest is pre-generated.
-                self::displayBackupSummary($siteUrl, $token, $files, []);
-                echo "* Database exclusion summary reflects the pre-generated manifest; local --exclude-tables flag is ignored.\n";
+                if (!empty($exclude_paths)) {
+                    // We only apply client-side filtering if exclusions are *actually* passed with a session-id
+                    $client_side_filtering = true;
+                    echo "Applying client-side exclusions to session manifest...\n";
+
+                    // 1. Download all manifest JSONs
+                    $temp_manifest_dir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) .
+                        '/disembark-manifests-' . $backup_token;
+                    if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) {
+                        throw new \Exception("Could not create temp manifest dir for filtering.");
+                    }
+
+                    $total_chunks_to_fetch = count($files);
+                    $fetched_chunks = 0;
+                    foreach ($files as $file_manifest) {
+                        $fetched_chunks++;
+                        echo sprintf(" - Downloading manifest chunk %d/%d...\r", $fetched_chunks, $total_chunks_to_fetch);
+                        $chunk_url = $file_manifest->url;
+                        $local_chunk_path = $temp_manifest_dir . '/' . $file_manifest->name;
+                        self::download_file_direct($chunk_url, $local_chunk_path);
+                        $chunk_json = file_get_contents($local_chunk_path);
+                        unlink($local_chunk_path);
+                        $chunk_files = json_decode($chunk_json);
+                        if (is_array($chunk_files)) {
+                            $all_remote_files = array_merge($all_remote_files, $chunk_files);
+                        }
+                    }
+                    self::delete_directory($temp_manifest_dir);
+                    echo str_pad("", 80, " ") . "\r"; // Clear line
+
+                    // 2. Filter the aggregated file list
+                    $filtered_files = [];
+                    foreach ($all_remote_files as $file) {
+                        if (!is_object($file) || empty($file->name)) continue;
+                        $is_excluded = false;
+                        foreach ($exclude_paths as $exclude_path) {
+                            if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
+                                $is_excluded = true;
+                                break;
+                            }
+                        }
+
+                        if (!$is_excluded) {
+                            $filtered_files[] = $file;
+                        }
+                    }
+                }
+
+                // 3. Display correct summary
+                self::displayBackupSummary($siteUrl, $token, $client_side_filtering ? [] : $files, $exclude_tables);
+                // Pass empty files manifest if we filtered, as we'll override
+                if ($client_side_filtering) {
+                    echo "\n--- Client-side File Filter Summary ---\n";
+                    printf("%-24s %12s %12s\n", "Original Session Files:", number_format(count($all_remote_files)), self::humanFilesize(array_sum(array_column($all_remote_files, 'size'))));
+                    printf("%-24s %12s %12s\n", "Files after Exclusions:", number_format(count($filtered_files)), self::humanFilesize(array_sum(array_column($filtered_files, 'size'))));
+                    echo "-----------------------------------------\n";
+                } elseif (!empty($exclude_tables)) {
+                    echo "* Database exclusion summary reflects the pre-generated manifest; local --exclude-tables flag is ignored.\n";
+                }
             } catch (\Exception $e) {
                 echo "Error fetching manifest: {$e->getMessage()}\n";
                 // Do NOT clean up, it's not our session
                 exit(1);
             }
-
-            // If the preview flag is set, exit here.
-            if ($preview) {
-                echo "Preview complete. No cleanup performed as this is a reused session.\n";
-                exit(0);
-            }
         } else {
-            // Generate unique token for this backup session
-            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
-            // Run preview, which now also generates the manifest for the actual backup
-            $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
-            // If the preview flag is set, clean up manifest files and exit.
-            if ($preview) {
-                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-                exit(0);
+            if (!$skip_files) {
+                // Generate unique token for this backup session
+                $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+                $client_side_filtering = false;
+                // Run preview, which now also generates the manifest for the actual backup
+                $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
+            } else {
+                // Still need a token for the DB summary
+                $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+                $client_side_filtering = false;
+                $files = []; // Empty files
+                self::displayBackupSummary($siteUrl, $token, $files, $exclude_tables);
+                echo "Skipping file analysis as requested.\n";
             }
         }
 
@@ -1558,15 +1703,19 @@ class Run {
 
         // --- Setup Local Backup Environment ---
         // Convert DB threshold arguments, using defaults if not provided
-        $db_max_size = $db_max_size_str ? self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
-        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000; // 1M rows default
+        $db_max_size = $db_max_size_str ?
+            self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
+        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000;
+        // 1M rows default
 
         echo "Starting backup for $siteUrl using backup token $backup_token\n";
         // --- Setup Local Backup Environment ---
         // Create the directory name
-        $temp_directory_name = "snapshot-" . time();
+        $temp_directory_name = "snapshot-" .
+            time();
         // Use getcwd() to create a full, absolute path
-        $temp_directory = getcwd() . DIRECTORY_SEPARATOR . $temp_directory_name;
+        $temp_directory = getcwd() .
+            DIRECTORY_SEPARATOR . $temp_directory_name;
 
         $local_db_path = $temp_directory . '/database';
         $local_public_path = $temp_directory . '/public';
@@ -1580,7 +1729,6 @@ class Run {
                 if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
             }
             if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create temp directory $local_public_path.");
-            
             if (!$skip_db) {
                 // Write SQL headers
                 $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
@@ -1608,6 +1756,7 @@ class Run {
                     // Filter tables based on exclusions
                     if (!empty($exclude_tables)) {
                         foreach ($all_tables as $table) {
+                         
                             $is_excluded = false;
                             foreach ($exclude_tables as $pattern) {
                                 if (fnmatch($pattern, $table->table)) {
@@ -1616,11 +1765,12 @@ class Run {
                                 }
                             }
                             if (!$is_excluded) {
-                                $database[] = $table; // Add non-excluded tables
+                                $database[] = $table;
                             }
                         }
                     } else {
-                        $database = $all_tables; // No exclusions, use all tables
+                       
+                         $database = $all_tables; // No exclusions, use all tables
                     }
                 } catch (\Exception $e) {
                     echo "Error during database preparation: {$e->getMessage()}\n";
@@ -1634,64 +1784,152 @@ class Run {
                     echo "No database tables to back up (all were excluded or list is empty).\n";
                 }
 
-                rmdir($local_db_path); // Remove empty database temp dir
+                rmdir($local_db_path);
+                // Remove empty database temp dir
             } else {
                 echo "Skipping database backup as requested.\n";
             }
+            
+            if (!$skip_files) {
+                // --- File Zipping ---
+                if (!$client_side_filtering) {
+                    // Process server-generated manifest chunks
+                    if (!empty($files)) {
+  
+                        $steps = count($files);
+                        $current_step = 1;
+                        $total_file_count = array_sum(array_column($files, 'count'));
+                        $total_file_size = self::humanFilesize(array_sum(array_column($files, 'size')));
+                        echo "Preparing to backup " . number_format($total_file_count) .
+                            " files totaling " . $total_file_size . "\n";
+                        $exclude_files_string = implode("\n", $exclude_paths);
+                        $zip_payload_base = [
+                            "token" => $token,
+                            "backup_token" => $backup_token,
+                            "exclude_files" => $exclude_files_string,
+        
+                        ];
+                        foreach ($files as $file_manifest) {
+                            // Check for URL from manifest
+                            if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) {
+                             
+                                echo "Warning: Skipping invalid manifest chunk data in zipping loop.\n";
+                                $current_step++;
+                                continue;
+                            }
 
-            // --- File Zipping ---
-            if (!empty($files)) {
-                $steps = count($files);
-                $current_step = 1;
-                $total_file_count = array_sum(array_column($files, 'count'));
-                $total_file_size = self::humanFilesize(array_sum(array_column($files, 'size')));
-                echo "Preparing to backup " . number_format($total_file_count) . " files totaling " . $total_file_size . "\n";
-                $exclude_files_string = implode("\n", $exclude_paths);
-                $zip_payload_base = [
-                    "token" => $token,
-                    "backup_token" => $backup_token,
-                    "exclude_files" => $exclude_files_string,
-                ];
-                foreach ($files as $file_manifest) {
-                    // Check for URL from manifest
-                    if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) {
-                        echo "Warning: Skipping invalid manifest chunk data in zipping loop.\n";
-                        $current_step++;
-                        continue;
+                            $size = self::humanFilesize($file_manifest->size);
+                            $progress_message = sprintf(" - Zipping and downloading chunk %d/%d: %s files totaling %s", $current_step, $steps, number_format($file_manifest->count), $size);
+                            echo $progress_message .
+                                "...\r";
+
+                            $zip_payload = $zip_payload_base;
+                            $zip_payload['file'] = $file_manifest->name;
+
+                            // 1. Zip (now returns a full URL)
+                            $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', $zip_payload, 'POST');
+                            if (strpos($file_url, 'http') !== 0) {
+                                throw new \Exception("Zip failed, did not receive a valid URL. Got: $file_url");
+                            }
+                            $file_name = basename($file_url);
+                            $local_file_path = $temp_directory . '/' . $file_name;
+
+                            // 2. Download (use new direct download function)
+                            self::download_file_direct($file_url, $local_file_path);
+                            // 3. Unzip locally
+                            self::unzip_file($local_file_path, $local_public_path);
+                            unlink($local_file_path); // Delete local zip chunk
+
+                            // 4. Clean up remote zip chunk
+                            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                            echo $progress_message . " - Done.\n";
+                            $current_step++;
+                            usleep(100000);
+                        }
+                        echo "File zipping and download complete.\n";
+                    } else {
+                        echo "Skipping file backup as no files were included in the manifest.\n";
                     }
+                } else {
+                    // Process client-side filtered file list
+                    echo "Starting client-side filtered file backup...\n";
+                    // 1. Re-chunk $filtered_files (which was populated in the --session-id block)
+                    $file_chunks = [];
+                    $current_chunk = [];
+                    $current_chunk_size = 0;
+                    // Use sync's defaults
+                    $file_chunk_size = 2500;
+                    $file_chunk_max_size = 524288000; // 500MB
 
-                    $size = self::humanFilesize($file_manifest->size);
-                    $progress_message = sprintf(" - Zipping and downloading chunk %d/%d: %s files totaling %s", $current_step, $steps, number_format($file_manifest->count), $size);
-                    echo $progress_message . "...\r";
-
-                    $zip_payload = $zip_payload_base;
-                    $zip_payload['file'] = $file_manifest->name;
-
-                    // 1. Zip (now returns a full URL)
-                    $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-files', $zip_payload, 'POST');
-                    if (strpos($file_url, 'http') !== 0) {
-                        throw new \Exception("Zip failed, did not receive a valid URL. Got: $file_url");
+                    foreach ($filtered_files as $file) {
+                        $file_size = isset($file->size) && is_numeric($file->size) ?
+                            (int)$file->size : 0;
+                        if ($file_size > $file_chunk_max_size) {
+                            if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
+                            $file_chunks[] = [$file];
+                            $current_chunk = [];
+                            $current_chunk_size = 0;
+                            continue;
+                        }
+                        if (
+                            (!empty($current_chunk) && $current_chunk_size + $file_size > $file_chunk_max_size) ||
+                            (count($current_chunk) >= $file_chunk_size)
+                        ) {
+     
+                            $file_chunks[] = $current_chunk;
+                            $current_chunk = [$file];
+                            $current_chunk_size = $file_size;
+                        } else {
+                            $current_chunk[] = $file;
+                            $current_chunk_size += $file_size;
+                        }
                     }
-                    $file_name = basename($file_url);
-                    $local_file_path = $temp_directory . '/' . $file_name;
+                    if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
+                    // 2. Process new chunks
+                    $total_chunks = count($file_chunks);
+                    $current_chunk_num = 0;
+                    foreach ($file_chunks as $chunk) {
+                        $current_chunk_num++;
+                        $chunk_file_count = count($chunk);
+                        $chunk_total_size = self::humanFilesize(array_sum(array_column($chunk, 'size')));
+                        $progress_message = sprintf(" - Zipping and downloading filtered chunk %d/%d (%d files, %s)", $current_chunk_num, $total_chunks, $chunk_file_count, $chunk_total_size);
+                        echo $progress_message . "...\r";
 
-                    // 2. Download (use new direct download function)
-                    self::download_file_direct($file_url, $local_file_path);
-                    // 3. Unzip locally
-                    self::unzip_file($local_file_path, $local_public_path);
-                    unlink($local_file_path); // Delete local zip chunk
+                        $file_url = null;
+                        $file_name = null;
+                        $local_zip_chunk_path = null;
+                        try {
+                            // Call /zip-sync-files
+                            $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
+                            if (strpos($file_url, 'http') !== 0) {
+                                throw new \Exception("Sync zip for chunk $current_chunk_num failed. Got: $file_url");
+                            }
 
-                    // 4. Clean up remote zip chunk
-                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                    echo $progress_message . " - Done.\n";
-                    $current_step++;
-                    usleep(100000);
+                            $file_name = basename($file_url);
+                            $local_zip_chunk_path = $temp_directory . '/' . $file_name;
+
+                            self::download_file_direct($file_url, $local_zip_chunk_path);
+                            self::unzip_file($local_zip_chunk_path, $local_public_path);
+                            unlink($local_zip_chunk_path);
+
+                            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                            echo $progress_message . " - Done.        \n";
+                        } catch (\Exception $e) {
+                            echo "\nWarning: Failed to process chunk $current_chunk_num: {$e->getMessage()}\n";
+                            if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                            if ($file_name) {
+                                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                            }
+                            // We'll just skip this chunk and continue
+                        }
+                    }
+                    echo "Filtered file zipping and download complete.\n";
                 }
-                echo "File zipping and download complete.\n";
+                // --- End File Zipping ---
             } else {
-                echo "Skipping file backup as no files were included in the manifest.\n";
+                echo "Skipping file backup as requested.\n";
             }
-            // --- End File Zipping ---
+
 
             // --- Final Local Zipping ---
             echo "Generating final local zip file: $final_zip_name...\n";
@@ -1705,7 +1943,8 @@ class Run {
             if (!$session_id) {
                 self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
             }
-            exit(1); // Exit with error status
+            exit(1);
+            // Exit with error status
         }
 
         // --- Final Cleanup ---
@@ -1848,6 +2087,7 @@ class Run {
         echo "    Options for backup:\n";
         echo "      --preview                          Show a summary of files and DB tables to be backed up without running the backup.\n";
         echo "      --skip-db                          Skip the database backup and only process files.\n";
+        echo "      --skip-files                       Skip the file backup and only process the database.\n";
         echo "      -x <path>                          Exclude a file or directory path (e.g., wp-content/cache). Can be specified multiple times.\n";
         echo "      --exclude-tables=<tables>          Exclude specific database tables (comma-separated, no spaces). Wildcards (*) are supported.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
@@ -1860,6 +2100,7 @@ class Run {
         echo "    Options for sync:\n";
         echo "      --debug                            Save local and remote manifest files for debugging.\n";
         echo "      --skip-db                          Skip the database sync and only process files.\n";
+        echo "      --skip-files                       Skip the file sync and only process the database.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
         echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
         echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
