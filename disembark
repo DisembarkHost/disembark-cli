@@ -150,6 +150,30 @@ class Run {
 
                 self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str);
                 break;
+            case 'ncdu':
+                if ($argc < 3) {
+                    echo "Error: Invalid arguments for ncdu\nRequires: <site-url> [--session-id=<id>] [--debug]\n";
+                    exit(1);
+                }
+                $siteUrl = $argv[2];
+                $session_id = null;
+                $debug = false;
+
+                // Parse arguments
+                $args = array_slice($argv, 3);
+                foreach ($args as $arg) {
+                    if (strpos($arg, '--session-id=') === 0) {
+                        $session_id = substr($arg, strlen('--session-id='));
+                    } elseif ($arg === '--debug') {
+                        $debug = true;
+                    } else {
+                        echo "Error: Unknown argument '{$arg}'\n";
+                        self::showHelp();
+                        exit(1);
+                    }
+                }
+                self::ncdu($siteUrl, $session_id, $debug);
+                break;
             default:
                 echo "Error: Unknown command '$command'.\n\n";
                 self::showHelp();
@@ -1028,6 +1052,407 @@ class Run {
         echo "\nSync complete: $folder is up to date.\n";
     }
 
+    /**
+     * Adds a single file object to the ncdu tree by reference.
+     * @param array $root The ncdu tree, passed by reference.
+     * @param object $file The file object (must have ->name and ->size).
+     * @param array $processed_files Pass-by-ref array for de-duplication
+     * @return int Returns 1 if a duplicate was skipped, 2 if a dir (trailing /) was skipped, 3 if a dir-total (conflicting) entry was skipped, 0 otherwise.
+     */
+    private static function add_file_to_ncdu_tree(&$root, $file, &$processed_files) {
+        
+        if (empty($file->name) || !isset($file->size)) return 0;
+        
+        if (substr($file->name, -1) === '/') {
+            return 2; 
+        }
+
+        if (isset($processed_files[$file->name])) {
+            return 1; 
+        }
+        $processed_files[$file->name] = true; 
+
+        $path = $file->name; 
+        $parts = explode('/', $path);
+        $filename = array_pop($parts); 
+        $file_size = (int)$file->size; 
+        
+        $node = &$root;
+        
+        $node['count']++;
+        
+        $current_parts_path = [];
+        
+        foreach ($parts as $part) { 
+            if (empty($part)) continue;
+            if (!isset($node['children'][$part])) { 
+                
+                $node['children'][$part] = ['name' => $part, 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
+            } else if ($node['children'][$part]['isdir'] === false) {
+                
+                
+                
+                $root['count']--;
+                
+                
+                $temp_node = &$root;
+                foreach ($current_parts_path as $parent_part) {
+                    if (isset($temp_node['children'][$parent_part])) {
+                        $temp_node = &$temp_node['children'][$parent_part];
+                        
+                        $temp_node['count']--;
+                    }
+                }
+                
+                return 0; 
+            }
+
+            $node = &$node['children'][$part];
+            
+            
+            $node['count']++;
+            $current_parts_path[] = $part; 
+        }
+        
+        if ($filename !== '') { 
+            
+            
+            if (isset($node['children'][$filename]) && $node['children'][$filename]['isdir']) { 
+                
+                
+                
+                
+                $temp_node = &$root;
+                $temp_node['count']--;
+                foreach ($parts as $part) {
+                    if (isset($temp_node['children'][$part])) { 
+                        $temp_node = &$temp_node['children'][$part];
+                        
+                        $temp_node['count']--;
+                    }
+                }
+                
+                return 3; 
+            } else {
+                
+                if (!isset($node['children'][$filename])) {
+                    $node['children'][$filename] = ['name' => $filename, 'asize' => $file_size, 'dsize' => $file_size, 'count' => 1, 'isdir' => false];
+                }
+            }
+        }
+        return 0; 
+    }
+
+    /**
+     * Browses a remote site's file system using ncdu.
+     */
+    private static function ncdu($siteUrl, $session_id = null, $debug = false) {
+        // 1. Check for ncdu dependency
+        $ncdu_path = trim((string) shell_exec('command -v ncdu'));
+        if (empty($ncdu_path)) {
+            echo "Error: The 'ncdu' command is not found in your system's PATH.\n";
+            echo "Please install ncdu (NCurses Disk Usage) to use this feature.\n";
+            exit(1);
+        }
+
+        // 2. Authentication and Token Setup
+        $siteUrl = rtrim($siteUrl, '/');
+        if (!preg_match('/^https?:\/\//', $siteUrl)) {
+            $siteUrl = "https://$siteUrl";
+        }
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+        $filePath = $homeDir . '/.disembark';
+        if (!file_exists($filePath)) {
+            echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
+            exit(1);
+        }
+        $data = json_decode(file_get_contents($filePath));
+        if (!is_array($data)) {
+            if (is_object($data)) $data = [$data];
+            else {
+                echo "Error: Invalid data in $filePath.\n";
+                exit(1);
+            }
+        }
+        $token = null;
+        foreach ($data as $entry) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $token = $entry->token;
+                break;
+            }
+        }
+        if (empty($token)) {
+            echo "Error: No token found for $siteUrl.\n";
+            exit(1);
+        }
+
+        // 3. Backup Token Setup
+        $backup_token = "";
+        if ($session_id) {
+            $backup_token = $session_id;
+            echo "Reusing backup session: $backup_token\n";
+        } else {
+            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+        }
+
+        // 4. Fetch Manifest
+        $files_manifest_chunks = [];
+        try {
+            if ($session_id) {
+                echo "Fetching existing manifest...\n";
+                $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+            } else {
+                echo "Generating new file manifest (this may take a while)...\n";
+                $exclude_paths = [];
+                $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
+            }
+            if (!is_array($files_manifest_chunks)) {
+                throw new \Exception("Could not fetch or parse manifest. Is the session ID valid?");
+            }
+        } catch (\Exception $e) {
+            echo "Error: {$e->getMessage()}\n";
+            if (!$session_id) self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            exit(1);
+        }
+
+        // 5. Download, Process, and Build Tree
+        echo "Processing remote file manifest and building tree...\n";
+        
+        $ncdu_tree = ['name' => '/', 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
+        $all_remote_files = []; // Only for debug
+        $processed_files = []; // For de-duplication
+
+        if ($debug) {
+            echo "Debug mode enabled, will aggregate files in memory for manifest export.\n";
+        }
+
+        // --- Batching Logic ---
+        $batch_size = 25;
+        $manifest_batches = array_chunk($files_manifest_chunks, $batch_size);
+        $total_batches = count($manifest_batches);
+        $current_batch_num = 0;
+        $progress_msg = "";
+        $duplicate_count = 0;
+        $skipped_slash_dir_count = 0;
+        $skipped_total_dir_count = 0;
+
+        try {
+            foreach ($manifest_batches as $batch) {
+                $current_batch_num++;
+                $progress_msg = sprintf("Processing batch %d of %d (downloading %d chunks)...", $current_batch_num, $total_batches, count($batch));
+                echo $progress_msg . "\r";
+
+                // Build the request array for request_multiple
+                $requests_data = [];
+                foreach ($batch as $file_manifest) {
+                    if (is_object($file_manifest) && !empty($file_manifest->url) && !empty($file_manifest->name)) {
+                        $requests_data[$file_manifest->name] = [
+                            'url' => $file_manifest->url
+                        ];
+                    }
+                }
+
+                if (empty($requests_data)) continue;
+                
+                $request_options = [
+                    'verify' => false,
+                    'timeout' => 1800, 
+                    'connect_timeout' => 30,
+                ];
+
+                $responses = \WpOrg\Requests\Requests::request_multiple($requests_data, $request_options);
+
+                foreach ($responses as $name => $response) {
+                    if (is_a($response, '\WpOrg\Requests\Response') && $response->success) {
+                        $files = json_decode($response->body);
+                        if (is_array($files)) {
+                            
+                            foreach ($files as $file) {
+                                if ($debug) {
+                                    $all_remote_files[] = $file; 
+                                }
+                                
+                                $result = self::add_file_to_ncdu_tree($ncdu_tree, $file, $processed_files);
+                                if ($result === 1) {
+                                    $duplicate_count++;
+                                } else if ($result === 2) {
+                                    $skipped_slash_dir_count++;
+                                } else if ($result === 3) {
+                                    $skipped_total_dir_count++;
+                                }
+                            }
+                        }
+                    } else {
+                        $error_msg = is_a($response, '\WpOrg\Requests\Exception') ? $response->getMessage() : "Request failed for $name";
+                        echo "\nWarning: Failed to download chunk '$name'. Error: $error_msg\n";
+                    }
+                }
+            }
+            echo str_pad("", strlen($progress_msg) + 5, " ") . "\r";
+            
+        } catch (\Exception $e) {
+            echo "Error during batch processing: {$e->getMessage()}\n";
+            if (!$session_id) self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            exit(1);
+        }
+        // --- End Batching Logic ---
+
+        if ($skipped_slash_dir_count > 0) {
+            echo "Ignored " . number_format($skipped_slash_dir_count) . " directory (trailing /) entries from manifest.\n";
+        }
+        // Report on skipped directory totals
+        if ($skipped_total_dir_count > 0) {
+            echo "Ignored " . number_format($skipped_total_dir_count) . " conflicting directory-total entries from manifest.\n";
+        }
+        if ($duplicate_count > 0) {
+            echo "Ignored " . number_format($duplicate_count) . " duplicate file entries from manifest.\n";
+        }
+        
+        if ($debug) {
+            $manifest_path = getcwd() . '/.disembark-ncdu-manifest.json';
+            file_put_contents($manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
+            echo "Debug: Saved raw manifest to $manifest_path\n";
+        }
+
+        // 6. Build the ncdu Tree
+        echo "Directory tree build complete.\n";
+        $ncdu_json_array = self::format_ncdu_json_array($ncdu_tree);
+
+        // Wrap in the ncdu shell format
+        $ncdu_output_data = [
+            1, 0, // ncdu JSON format version
+            ["progname" => "disembark-cli", "progver" => self::VERSION],
+            $ncdu_json_array // The actual tree
+        ];
+        $json_string = json_encode($ncdu_output_data);
+
+        if ($debug) {
+            $input_path = getcwd() . '/.disembark-ncdu-input.json';
+            file_put_contents($input_path, $json_string);
+            echo "Debug: Saved final ncdu input to $input_path\n";
+        }
+
+        // 7. Launch ncdu
+        echo "Launching ncdu...\n";
+        $descriptors = [
+            0 => ["pipe", "r"], // stdin
+            1 => STDOUT,        // stdout
+            2 => STDERR         // stderr
+        ];
+        $process = proc_open('ncdu -f -', $descriptors, $pipes);
+        if (is_resource($process)) {
+            fwrite($pipes[0], $json_string);
+            fclose($pipes[0]);
+            proc_close($process);
+        } else {
+            echo "Error: Failed to launch ncdu process.\n";
+        }
+
+        // 8. Final Cleanup
+        if (!$session_id) {
+            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        }
+    }
+
+    /**
+     * Builds an aggregated associative tree from a flat file list for ncdu.
+     */
+    private static function build_ncdu_tree($all_remote_files) {
+        $root = ['name' => '/', 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
+        foreach ($all_remote_files as $file) {
+            if (empty($file->name) || !isset($file->size)) continue;
+            
+            $path = rtrim($file->name, '/'); // Keep this fix
+
+            $parts = explode('/', $path);
+            $filename = array_pop($parts);
+            $file_size = (int)$file->size;
+            
+            $node = &$root;
+            // Add file size all the way up the tree
+            $node['asize'] += $file_size;
+            $node['dsize'] += $file_size;
+            $node['count']++;
+            
+            foreach ($parts as $part) {
+                if (empty($part)) continue;
+                if (!isset($node['children'][$part])) {
+                    // Create dir node if it doesn't exist
+                    $node['children'][$part] = ['name' => $part, 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
+                }
+                $node = &$node['children'][$part];
+                // Add file size to this dir node
+                $node['asize'] += $file_size;
+                $node['dsize'] += $file_size;
+                $node['count']++;
+            }
+            
+            // Use ($filename !== '') instead of !empty() to correctly handle files named "0"
+            if ($filename !== '') {
+                // Add the file node
+                // Check if a directory with this name already exists (conflicting path)
+                if (isset($node['children'][$filename]) && $node['children'][$filename]['isdir']) {
+                    // A directory already exists, this is a conflicting file.
+                    // For ncdu's purpose, we'll log it as a special file inside.
+                    $conflicting_name = $filename . ' (file)';
+                    $node['children'][$conflicting_name] = ['name' => $conflicting_name, 'asize' => $file_size, 'dsize' => $file_size, 'count' => 1, 'isdir' => false];
+                } else {
+                    // This is the normal case: add the file node
+                    $node['children'][$filename] = ['name' => $filename, 'asize' => $file_size, 'dsize' => $file_size, 'count' => 1, 'isdir' => false];
+                }
+            }
+        }
+        return $root;
+    }
+
+    /**
+     * Recursively formats the associative tree into ncdu's expected JSON array format.
+     */
+    private static function format_ncdu_json_array($node) {
+        // 1. Create the node metadata object
+        $ncdu_node = [
+            'name' => $node['name'],
+            'asize' => $node['asize'],
+            'dsize' => $node['dsize'],
+            'count' => $node['count'],
+            'isdir' => $node['isdir']
+        ];
+
+        // 2. If it's a FILE, just return the object.
+        if (!$node['isdir']) {
+            return $ncdu_node;
+        }
+
+        // 3. If it's a DIRECTORY, create an array.
+        $output = [$ncdu_node]; // Start the array with the dir metadata
+
+        // 4. Process children
+        if (!empty($node['children'])) {
+            $children = array_values($node['children']);
+            
+            // Sort children: directories first, then alphabetically
+            usort($children, function ($a, $b) {
+                if ($a['isdir'] !== $b['isdir']) {
+                    return $a['isdir'] ? -1 : 1; // Dirs first
+                }
+                return strcmp($a['name'], $b['name']); // Then by name
+            });
+            
+            // 5. Add recursive results to the output array
+            foreach ($children as $child) {
+                // This will append EITHER an OBJECT (for a file) OR an ARRAY (for a dir)
+                $output[] = self::format_ncdu_json_array($child); 
+            }
+        }
+        
+        // 6. Return the full directory array
+        return $output;
+    }
+
     private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false) {
 
         // Trim trailing slashes from the site URL
@@ -1440,6 +1865,13 @@ class Run {
         echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
         echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 500MB.\n";
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI.\n";
+        echo "\n";
+        echo "  disembark ncdu <site-url> [options]\n";
+        echo "    Browse the remote site's file system interactively using ncdu.\n";
+        echo "\n";
+        echo "    Options for ncdu:\n";
+        echo "      --session-id=<id>                  Reuse a backup session ID from the UI to load its manifest.\n";
+        echo "      --debug                            Save raw manifest and ncdu input files locally for debugging.\n";
         echo "\n";
         echo "Other Commands:\n";
         echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
