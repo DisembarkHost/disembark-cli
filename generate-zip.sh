@@ -96,8 +96,8 @@ run_command() {
     fi
 
     # Unzip files
-    if ls files-*.zip 1> /dev/null 2>&1; then
-      for file in $(ls files-*.zip | sort -V); do
+    if ls *files-*.zip 1> /dev/null 2>&1; then
+      for file in $(ls *files-*.zip | sort -V); do
           echo "Extracting from $file"
           unzip -q $file -d public/
       done
