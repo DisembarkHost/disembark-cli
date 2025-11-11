@@ -1,5 +1,21 @@
 # Changelog
 
+## **v2.4.0** - November 10th, 2025
+
+### Added
+
+* **New `ncdu` Command:** Added a `disembark ncdu <site-url>` command to interactively browse the remote site's file system and disk usage. This command requires the local `ncdu` (NCurses Disk Usage) tool to be installed. It can generate a new file manifest on the fly or reuse an existing session manifest (`--session-id`).
+* **Partial Backup & Sync:** Added `--skip-db` and `--skip-files` options to both the `backup` and `sync` commands to allow for file-only or database-only operations.
+* **Database Batching Controls:** Added `--db-max-size` and `--db-max-rows` arguments to the `backup` and `sync` commands. These allow for customizing the database batching thresholds for the `processDatabaseBackup` function.
+* **Sync Chunking Controls:** Added `--file-chunk-size` and `--file-chunk-max-size` arguments to the `sync` command to provide control over the file chunking logic.
+* **Client-side Backup Filtering:** The `backup` command now supports applying local `-x` exclusion flags when reusing a `--session-id`. The CLI downloads the full manifest, filters the file list locally, and then re-chunks and downloads only the required files using the sync-file zip endpoint.
+
+### Improved
+
+* **Initial Sync Reliability:** The "initial sync" process (syncing to a new folder) is now more robust. If a pre-generated file chunk (`.zip`) fails to download or extract, the tool automatically falls back to downloading that chunk's JSON manifest and streaming each file individually.
+* **Subsequent Sync Chunking:** The file chunking logic for "subsequent sync" operations has been significantly improved. Instead of chunking only by file count, it now intelligently builds chunks based on both file count (`--file-chunk-size`) and total file size (`--file-chunk-max-size`). It can also correctly handle single files that are larger than the maximum chunk size.
+* **Help Text:** Updated the `disembark --help` output to include the new `ncdu` command and all new arguments for the `backup` and `sync` commands.
+
 ## **v2.3.0** - October 28th, 2025
 
 ### Improved
