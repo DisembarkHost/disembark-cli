@@ -142,6 +142,11 @@ class Run {
                         $i++;
                         continue;
                     }
+                    if ($argv[$i] === '--skip-checksums') {
+                        $skip_checksums = true;
+                        $i++;
+                        continue;
+                    }
                     if (strpos($argv[$i], '--session-id=') === 0) {
                         $session_id = substr($argv[$i], strlen('--session-id='));
                         $i++;
@@ -200,7 +205,7 @@ class Run {
                     $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
                 }
 
-                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files, $exclude_paths);
+                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files, $exclude_paths, $skip_checksums);
                 break;
             case 'ncdu':
                 if ($argc < 3) {
@@ -730,7 +735,7 @@ class Run {
    /**
      * Performs a local or remote sync.
      */
-    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false, $exclude_paths = []) {
+    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false, $exclude_paths = [], $skip_checksums = false) {
         // --- 1. Authentication ---
         $siteUrl = rtrim($siteUrl, '/');
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
@@ -840,8 +845,8 @@ class Run {
                 } else {
                     // --- Run generation if no $session_id ---
                     echo "Starting file sync analysis...\n";
-                    // Exclusions passed from argument are now used here
-                    $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
+                    $include_checksums = (!$is_initial_sync && !$skip_checksums);
+                    $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, $include_checksums);
                 }
 
                 if ($is_initial_sync) {
@@ -979,7 +984,7 @@ class Run {
                     }
 
                     echo "Generating local file manifest...\n";
-                    $local_files_map = self::generate_local_manifest($folder);
+                    $local_files_map = self::generate_local_manifest($folder, $skip_checksums);
 
                     if ($debug) {
                         $local_manifest_path = $folder . '/.disembark-local-manifest.json';
@@ -995,11 +1000,25 @@ class Run {
 
                     foreach ($remote_files_map as $path => $remote_file) {
                         $local_file = $local_files_map[$path] ?? null;
-                        if (!$local_file || !isset($remote_file->checksum) || $local_file->checksum !== $remote_file->checksum) {
-                            $files_to_download[] = $remote_file; // Add the file object
+
+                        $should_download = false;
+
+                        if ($skip_checksums) {
+                            // Fast mode: Only download if file is completely missing locally
+                            if (!$local_file) {
+                                $should_download = true;
+                            }
+                        } else {
+                            // Standard mode: Download if missing OR checksums mismatch
+                            if (!$local_file || !isset($remote_file->checksum) || $local_file->checksum !== $remote_file->checksum) {
+                                $should_download = true;
+                            }
+                        }
+
+                        if ($should_download) {
+                            $files_to_download[] = $remote_file;
                         }
                     }
-
                     foreach ($local_files_map as $path => $local_file) {
                         if (!isset($remote_files_map[$path])) {
                             $files_to_delete[] = $path;
@@ -2132,6 +2151,7 @@ class Run {
         echo "      --preview                          Show a summary of files and DB tables to be backed up without running the backup.\n";
         echo "      --skip-db                          Skip the database backup and only process files.\n";
         echo "      --skip-files                       Skip the file backup and only process the database.\n";
+        echo "      --skip-checksums                   Skip file integrity checks. Only downloads files missing from destination.\n";
         echo "      -x <path>                          Exclude a file or directory path (e.g., wp-content/cache). Can be specified multiple times.\n";
         echo "      --exclude-tables=<tables>          Exclude specific database tables (comma-separated, no spaces). Wildcards (*) are supported.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
@@ -2352,9 +2372,9 @@ class Run {
     }
 
     /**
-     * Generates a local manifest of files with checksums.
+     * Generates a local manifest of files.
      */
-    private static function generate_local_manifest($dir) {
+    private static function generate_local_manifest($dir, $skip_checksums = false) {
         $files_map = [];
         $real_root = realpath($dir);
         if ($real_root === false) return [];
@@ -2370,16 +2390,19 @@ class Run {
 
             // Skip sync-specific files
             if ($relative_path === 'database.sql' ||
-                $relative_path === 'db_export.sql' || // Skip this file if it came from remote
+                $relative_path === 'db_export.sql' ||
                 strpos($relative_path, '.disembark-db-parts') === 0 ||
                 strpos($relative_path, '.disembark-manifests') === 0) {
                 continue;
             }
 
+            // Skip expensive MD5 calc if requested
+            $checksum = ($skip_checksums) ? null : md5_file($path);
+
             $files_map[$relative_path] = (object) [
                 'name' => $relative_path,
                 'size' => $file->getSize(),
-                'checksum' => md5_file($path)
+                'checksum' => $checksum
             ];
         }
         return $files_map;
