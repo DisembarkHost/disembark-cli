@@ -113,6 +113,7 @@ class Run {
                     exit(1);
                 }
                 $siteUrl = $argv[2];
+                // Initialize variables
                 $folder = null;
                 $debug = false;
                 $session_id = null;
@@ -122,28 +123,71 @@ class Run {
                 $file_chunk_max_size_str = null;
                 $skip_db = false;
                 $skip_files = false;
+                $exclude_paths = []; // Initialize exclusion array
 
-                $args = array_slice($argv, 3);
-                foreach ($args as $arg) {
-                    if ($arg === '--debug') {
+                $i = 3;
+                while ($i < $argc) {
+                    if ($argv[$i] === '--debug') {
                         $debug = true;
-                    } elseif ($arg === '--skip-db') {
-                        $skip_db = true;
-                    } elseif ($arg === '--skip-files') {
-                        $skip_files = true;
-                    } elseif (strpos($arg, '--session-id=') === 0) {
-                        $session_id = substr($arg, strlen('--session-id='));
-                    } elseif (strpos($arg, '--db-max-size=') === 0) {
-                        $db_max_size_str = substr($arg, strlen('--db-max-size='));
-                    } elseif (strpos($arg, '--db-max-rows=') === 0) {
-                        $db_max_rows_str = substr($arg, strlen('--db-max-rows='));
-                    } elseif (strpos($arg, '--file-chunk-size=') === 0) {
-                        $file_chunk_size_str = substr($arg, strlen('--file-chunk-size='));
-                    } elseif (strpos($arg, '--file-chunk-max-size=') === 0) {
-                        $file_chunk_max_size_str = substr($arg, strlen('--file-chunk-max-size='));
-                    } elseif ($folder === null && strpos($arg, '--') !== 0) {
-                        $folder = $arg;
+                        $i++;
+                        continue;
                     }
+                    if ($argv[$i] === '--skip-db') {
+                        $skip_db = true;
+                        $i++;
+                        continue;
+                    }
+                    if ($argv[$i] === '--skip-files') {
+                        $skip_files = true;
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--session-id=') === 0) {
+                        $session_id = substr($argv[$i], strlen('--session-id='));
+                        $i++;
+                        continue;
+                    }
+                    if ($argv[$i] === '-x') {
+                        if (isset($argv[$i + 1])) {
+                            $exclude_paths[] = rtrim($argv[$i + 1], '/');
+                            $i += 2;
+                            continue;
+                        } else {
+                            echo "Error: Missing value for -x option.\n";
+                            exit(1);
+                        }
+                    }
+                    if (strpos($argv[$i], '--db-max-size=') === 0) {
+                        $db_max_size_str = substr($argv[$i], strlen('--db-max-size='));
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--db-max-rows=') === 0) {
+                        $db_max_rows_str = substr($argv[$i], strlen('--db-max-rows='));
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--file-chunk-size=') === 0) {
+                        $file_chunk_size_str = substr($argv[$i], strlen('--file-chunk-size='));
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--file-chunk-max-size=') === 0) {
+                        $file_chunk_max_size_str = substr($argv[$i], strlen('--file-chunk-max-size='));
+                        $i++;
+                        continue;
+                    }
+                    
+                    // Handle folder argument (checking if it's not a flag)
+                    if ($folder === null && strpos($argv[$i], '--') !== 0) {
+                        $folder = $argv[$i];
+                        $i++;
+                        continue;
+                    }
+
+                    echo "Error: Unknown argument '{$argv[$i]}'\n";
+                    self::showHelp();
+                    exit(1);
                 }
 
                 if ($folder === null) {
@@ -156,7 +200,7 @@ class Run {
                     $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
                 }
 
-                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files);
+                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files, $exclude_paths);
                 break;
             case 'ncdu':
                 if ($argc < 3) {
@@ -686,7 +730,7 @@ class Run {
    /**
      * Performs a local or remote sync.
      */
-    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false) {
+    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false, $exclude_paths = []) {
         // --- 1. Authentication ---
         $siteUrl = rtrim($siteUrl, '/');
         if (!preg_match('/^https?:\/\//', $siteUrl)) {
@@ -796,7 +840,7 @@ class Run {
                 } else {
                     // --- Run generation if no $session_id ---
                     echo "Starting file sync analysis...\n";
-                    $exclude_paths = []; // Syncs don't support exclusions by default
+                    // Exclusions passed from argument are now used here
                     $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, !$is_initial_sync);
                 }
 
@@ -839,7 +883,7 @@ class Run {
                             echo "Attempting single-file download fallback for this chunk...\n";
 
                             // Clean up any partial zip file
-                            if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                            if ($local_zip_chunk_path && file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
                             // Clean up remote zip file if it was created
                             if ($file_name) {
                                 self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
@@ -1048,7 +1092,7 @@ class Run {
 
                                 } catch (\Exception $e) {
                                     echo "\nWarning: Failed to process chunk $chunk_num (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
-                                    if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                                    if ($local_zip_chunk_path && file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
                                     // Also try to clean up remote file if it exists
                                     if ($file_name) {
                                         self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
@@ -1916,7 +1960,7 @@ class Run {
                             echo $progress_message . " - Done.        \n";
                         } catch (\Exception $e) {
                             echo "\nWarning: Failed to process chunk $current_chunk_num: {$e->getMessage()}\n";
-                            if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
+                            if ($local_zip_chunk_path && file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
                             if ($file_name) {
                                 self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
                             }
