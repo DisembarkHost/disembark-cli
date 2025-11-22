@@ -40,6 +40,7 @@ class Run {
                 $exclude_paths = [];
                 $exclude_tables_str = '';
                 $preview = false;
+                $token = null;
                 $session_id = null;
                 $db_max_size_str = null;
                 $db_max_rows_str = null;
@@ -59,6 +60,11 @@ class Run {
                     }
                     if ($argv[$i] === '--skip-files') {
                         $skip_files = true;
+                        $i++;
+                        continue;
+                    }
+                    if (strpos($argv[$i], '--token=') === 0) {
+                        $token = substr($argv[$i], strlen('--token='));
                         $i++;
                         continue;
                     }
@@ -91,7 +97,7 @@ class Run {
                     }
                 }
                 $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
-                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db, $skip_files);
+                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db, $skip_files, $token);
                 break;
             case 'version':
                 if ($argc != 2) {
@@ -1602,7 +1608,7 @@ class Run {
         return $output;
     }
 
-    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false, $skip_files = false) {
+    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false, $skip_files = false, $token = null) {
 
         // Trim trailing slashes from the site URL
         $siteUrl = rtrim($siteUrl, '/');
@@ -1612,43 +1618,48 @@ class Run {
             echo "The site URL must start with http:// or https://. Attempting to use $siteUrl\n";
         }
 
-        $homeDir = getenv('HOME');
-        if (!$homeDir) {
-            echo "Error: Unable to determine the home directory.\n";
-            exit(1);
-        }
+        if ($token === null) {
 
-        $filePath = $homeDir . '/.disembark';
-        $data = [];
-        // Check if the file already exists and read its contents
-        if (file_exists($filePath)) {
-            $jsonContents = file_get_contents($filePath);
-            $data = json_decode($jsonContents);
-            if (!is_array($data)) {
-                if (is_object($data)) {
-                    $data = [$data];
-                } else {
-                    echo "Error: Invalid data in $filePath.\n";
-                    exit(1);
+            $homeDir = getenv('HOME');
+            if (!$homeDir) {
+                echo "Error: Unable to determine the home directory.\n";
+                exit(1);
+            }
+
+            $filePath = $homeDir . '/.disembark';
+            $data = [];
+            // Check if the file already exists and read its contents
+            if (file_exists($filePath)) {
+                $jsonContents = file_get_contents($filePath);
+                $data = json_decode($jsonContents);
+                if (!is_array($data)) {
+                    if (is_object($data)) {
+                        $data = [$data];
+                    } else {
+                        echo "Error: Invalid data in $filePath.\n";
+                        exit(1);
+                    }
+                }
+            } else {
+                echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
+                exit(1);
+            }
+        
+
+            // Find the token for the given siteUrl
+            $token = null;
+            foreach ($data as $entry) {
+                if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                    $token = $entry->token;
+                    break;
                 }
             }
-        } else {
-            echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
-            exit(1);
-        }
 
-        // Find the token for the given siteUrl
-        $token = null;
-        foreach ($data as $entry) {
-            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                $token = $entry->token;
-                break;
+            if (empty($token)) {
+                echo "Error: No token found for $siteUrl.\nRun 'disembark connect $siteUrl <token>' to configure.\n";
+                exit(1);
             }
-        }
 
-        if (empty($token)) {
-            echo "Error: No token found for $siteUrl.\nRun 'disembark connect $siteUrl <token>' to configure.\n";
-            exit(1);
         }
 
         $files = [];
@@ -1992,7 +2003,6 @@ class Run {
             } else {
                 echo "Skipping file backup as requested.\n";
             }
-
 
             // --- Final Local Zipping ---
             echo "Generating final local zip file: $final_zip_name...\n";
