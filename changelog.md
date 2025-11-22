@@ -1,5 +1,19 @@
 # Changelog
 
+## **v2.5.0** - November 21st, 2025
+
+### Added
+
+* **Sync Exclusions:** The `sync` command now supports the `-x` argument, allowing you to exclude specific files or directories from being synchronized (e.g., `disembark sync <url> -x wp-content/cache`).
+* **Sync Checksum Skipping:** Added a `--skip-checksums` flag to the `sync` command. When used, the CLI compares files based on size only, skipping the MD5 checksum calculation to improve performance on large sites.
+* **Stateless Backups:** The `backup` command now accepts a `--token=<token>` argument. This allows you to run a backup without establishing a persistent connection (`disembark connect`) or having a local configuration file.
+
+### Improved
+
+* **Parallel Sync Processing:** The "subsequent sync" process now downloads remote manifest chunks in parallel batches. This significantly reduces the time required to analyze differences on sites with large file counts.
+* **Timeout Handling:** Increased the timeout limit for the `zip-sync-files` endpoint to 30 minutes to prevent timeouts when processing batches of many small files.
+* **Sync Exclusion Logic:** Local filtering has been implemented for "initial syncs," ensuring that files excluded via `-x` are not downloaded even during the first run.
+
 ## **v2.4.0** - November 10th, 2025
 
 ### Added
