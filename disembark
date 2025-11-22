@@ -590,6 +590,108 @@ class Run {
     }
 
     /**
+     * Helper to download large files via public URL.
+     */
+    private static function fetch_large_file_publicly($siteUrl, $file, $local_destination) {
+        $file_size_human = self::humanFilesize($file->size);
+        echo "   > Large file detected ($file_size_human). Attempting public direct download...\n";
+
+        // Construct public URL (handling spaces/special chars)
+        $path_parts = explode('/', $file->name);
+        $encoded_parts = array_map('rawurlencode', $path_parts);
+        $public_url = $siteUrl . '/' . implode('/', $encoded_parts);
+
+        echo "     Downloading: $public_url\n";
+        
+        try {
+            self::download_file_direct($public_url, $local_destination);
+            echo "     - Download complete.\n";
+            return true;
+        } catch (\Exception $e) {
+            echo "     - Public download failed: {$e->getMessage()}. Falling back to stream...\n";
+            return false;
+        }
+    }
+
+    /**
+     * Downloads a large file via the stream API in chunks (e.g., 50MB) to avoid PHP timeouts.
+     */
+    private static function download_file_chunked_stream($siteUrl, $token, $relative_path, $destination, $total_size) {
+        $chunk_size = 50 * 1024 * 1024; // 50 MB chunks
+        $offset = 0;
+        // Open destination for writing (append mode not needed if we start fresh, but we need random access or just append)
+        // We will open in 'w' first to clear it, then append chunks
+        $fp = fopen($destination, 'w');
+        if (!$fp) throw new \Exception("Could not open local file for writing: $destination");
+        fclose($fp);
+
+        $progress_bar_width = 20;
+        while ($offset < $total_size) {
+            $length = min($chunk_size, $total_size - $offset);
+            // Calculate progress
+            $percent = min(100, round(($offset / $total_size) * 100));
+            $downloaded_human = self::humanFilesize($offset);
+            $total_human = self::humanFilesize($total_size);
+            
+            echo str_pad("", 80, " ") . "\r"; // Clear line
+            echo "     - Streaming Chunk: {$downloaded_human} / {$total_human} ({$percent}%)...\r";
+            $attempts = 0;
+            $max_attempts = 5;
+            $chunk_success = false;
+
+            while ($attempts < $max_attempts && !$chunk_success) {
+                $attempts++;
+                try {
+                    $endpoint_url = $siteUrl . '/wp-json/disembark/v1/stream-file';
+                    $payload = json_encode([
+                        'token' => $token, 
+                        'file' => $relative_path,
+                        'offset' => $offset,
+                        'length' => $length
+                    ]);
+                    $headers = ['Content-Type' => 'application/json'];
+                    
+                    $options = [
+                        'verify' => false,
+                        'timeout' => 300, // 5 minutes per 50MB chunk should be plenty
+                        'connect_timeout' => 30,
+                    ];
+                    $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
+
+                    if (!$response->success) {
+                         throw new \Exception("HTTP {$response->status_code}");
+                    }
+                    
+                    // Verify we got the data we asked for
+                    if (strlen($response->body) != $length) {
+                        // Sometimes server might send less if EOF, but we calculated EOF.
+                    }
+
+                    // Append to file
+                    file_put_contents($destination, $response->body, FILE_APPEND);
+                    $chunk_success = true;
+
+                } catch (\Exception $e) {
+                    if ($attempts < $max_attempts) {
+                        // Clear progress bar line to show retry message cleanly
+                        echo str_pad("", 80, " ") . "\r"; 
+                        echo "     - Retry ($attempts/$max_attempts) for offset $offset...\r";
+                        sleep(2); // Wait before retry
+                    } else {
+                        throw new \Exception("Failed to download chunk at offset $offset: " . $e->getMessage());
+                    }
+                }
+            }
+            
+            $offset += $length;
+        }
+        
+        echo str_pad("", 80, " ") . "\r";
+        $total_human = self::humanFilesize($total_size);
+        echo "     - Streaming complete: {$total_human} downloaded.\n";
+    }
+
+    /**
      * Processes the database backup using hybrid batching.
      *
      * @param string $siteUrl
