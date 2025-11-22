@@ -2222,49 +2222,57 @@ class Run {
     }
 
     /**
-     * Downloads a file directly from a URL using WpOrg\Requests.
+     * Downloads a file using native cURL with a progress bar.
      */
     private static function download_file_direct($url, $destination) {
-        $attempts = 0;
-        $max_attempts = 3;
-        $last_error = "";
-
-        while ($attempts < $max_attempts) {
-            $attempts++;
-            try {
-                // Fetch response into memory, DO NOT stream to file
-                $options = [
-                    'verify' => false,
-                    'timeout' => 1800,
-                    'connect_timeout' => 30,
-                ];
-                $response = \WpOrg\Requests\Requests::get($url, [], $options);
-
-                if (!$response->success) {
-                    // Add response body to the error for debugging
-                    throw new \Exception("Request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
-                }
-
-                // Manually write the response body to the file
-                if (file_put_contents($destination, $response->body) === false) {
-                    throw new \Exception("Failed to write downloaded content to $destination.");
-                }
-
-                return; // Success
-
-            } catch (\Exception $e) {
-                echo "\nWarning: Failed to download $url (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
-                $last_error = $e->getMessage();
-                if (file_exists($destination)) unlink($destination);
-                if ($attempts < $max_attempts) {
-                    echo "Retrying in 2 seconds...\n";
-                    sleep(2);
-                }
-            }
+        $fp = fopen($destination, 'w+');
+        if ($fp === false) {
+            throw new \Exception("Could not open $destination for writing");
         }
 
-        // If loop finishes, it failed
-        throw new \Exception("Failed to download $url after $max_attempts attempts. Last error: $last_error");
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_FILE, $fp);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 3600); // 1 hour timeout
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        
+        // Enable Progress Bar
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function(
+            $resource, 
+            $download_size, 
+            $downloaded, 
+            $upload_size, 
+            $uploaded
+        ) {
+            if ($download_size > 0) {
+                $percent = round(($downloaded / $download_size) * 100);
+                $downloaded_human = self::humanFilesize($downloaded);
+                $total_human = self::humanFilesize($download_size);
+                
+                // \r keeps overwriting the same line
+                echo str_pad("", 80, " ") . "\r"; 
+                echo "     - Downloading: $downloaded_human / $total_human ($percent%)...\r";
+            }
+        });
+
+        $data = curl_exec($ch);
+        $error = curl_error($ch);
+        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        
+        curl_close($ch);
+        fclose($fp);
+
+        // Clear the progress line
+        echo str_pad("", 80, " ") . "\r";
+
+        if (!$data) {
+            throw new \Exception("cURL Download Error: $error");
+        }
+
+        if ($statusCode >= 400) {
+            throw new \Exception("HTTP Error $statusCode");
+        }
     }
 
     /**
