@@ -2425,9 +2425,295 @@ class Run {
             throw new \Exception("cURL Download Error: $error");
         }
 
-        if ($statusCode >= 400) {
-            throw new \Exception("HTTP Error $statusCode");
+    /**
+     * Downloads large files using a rolling queue with Multi-line Progress Bars.
+     * Includes size validation and fallback to stream API.
+     */
+    private static function download_files_parallel($files, $folder) {
+        $max_concurrency = 4;
+        $max_retries = 3; // Reduced from 5 to 3
+        $mh = curl_multi_init();
+        
+        // Initialize queue
+        $queue = [];
+        foreach ($files as $f) {
+            $queue[] = ['file' => $f, 'attempts' => 0];
         }
+
+        $active_transfers = []; 
+        $slots = array_fill(0, $max_concurrency, null); 
+        $total_files = count($files);
+        $processed_count = 0;
+        $fallback_queue = []; 
+
+        // Hide Cursor
+        echo "\033[?25l";
+        echo " - Starting threaded download of {$total_files} large files...\n";
+        echo str_repeat("\n", $max_concurrency); // Reserve space
+        echo "\033[{$max_concurrency}A"; // Move cursor up
+
+        do {
+            // 1. REFILL QUEUE
+            while (count($active_transfers) < $max_concurrency && !empty($queue)) {
+                $slot_index = array_search(null, $slots);
+                if ($slot_index === false) break;
+
+                $item = array_shift($queue);
+                $file = $item['file'];
+                $item['attempts']++;
+
+                $local_dest = $folder . '/' . $file->name;
+                $local_dir = dirname($local_dest);
+                if (!is_dir($local_dir)) @mkdir($local_dir, 0755, true);
+                
+                $path_parts = explode('/', $file->name);
+                $encoded_parts = array_map('rawurlencode', $path_parts);
+                $url = self::$siteUrl . '/' . implode('/', $encoded_parts);
+                
+                $fp = fopen($local_dest, 'w+');
+                if (!$fp) {
+                    $line_offset = $slot_index + 1;
+                    echo "\033[{$line_offset}B\033[KError: Could not open $local_dest\r\033[{$line_offset}A";
+                    $processed_count++;
+                    continue;
+                }
+
+                $ch = curl_init($url);
+                curl_setopt($ch, CURLOPT_FILE, $fp);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+                curl_setopt($ch, CURLOPT_NOPROGRESS, true); 
+
+                curl_multi_add_handle($mh, $ch);
+                $active_transfers[(int)$ch] = [
+                    'handle'  => $ch, 
+                    'wrapper' => $item,
+                    'fp'      => $fp,
+                    'slot'    => $slot_index
+                ];
+                $slots[$slot_index] = (int)$ch;
+            }
+
+            // 2. EXECUTE
+            $status = curl_multi_exec($mh, $running);
+            if ($running > 0) {
+                curl_multi_select($mh, 0.1);
+            }
+
+            // 3. UPDATE UI
+            foreach ($active_transfers as $ch_int => $data) {
+                $slot = $data['slot'];
+                $line_offset = $slot + 1;
+                $label_num = $slot + 1;
+
+                // Better filename display: show parent dir to distinguish duplicates
+                $name_parts = explode('/', $data['wrapper']['file']->name);
+                $count = count($name_parts);
+                if ($count > 1) {
+                    $filename = $name_parts[$count-2] . '/' . $name_parts[$count-1];
+                } else {
+                    $filename = $name_parts[0];
+                }
+
+                $downloaded = curl_getinfo($data['handle'], CURLINFO_SIZE_DOWNLOAD);
+                $total = $data['wrapper']['file']->size; 
+                
+                if (strlen($filename) > 40) $filename = '...' . substr($filename, -37);
+                $filename_padded = str_pad($filename, 40);
+                
+                $bar = self::draw_progress_bar($downloaded, $total, 15);
+                $size_str = self::humanFilesize($downloaded);
+                
+                echo "\033[{$line_offset}B\r\033[K {$label_num}: {$filename_padded} {$bar} {$size_str}\033[{$line_offset}A";
+            }
+
+            // 4. CHECK COMPLETION
+            while ($info = curl_multi_info_read($mh)) {
+                $ch = $info['handle'];
+                $ch_id = (int)$ch;
+                
+                if (isset($active_transfers[$ch_id])) {
+                    $transfer = $active_transfers[$ch_id];
+                    $slot = $transfer['slot'];
+                    $wrapper = $transfer['wrapper'];
+                    $file = $wrapper['file'];
+                    
+                    $curl_info = curl_getinfo($ch);
+                    
+                    curl_multi_remove_handle($mh, $ch);
+                    curl_close($ch);
+                    fclose($transfer['fp']);
+                    unset($active_transfers[$ch_id]);
+                    $slots[$slot] = null;
+
+                    // Validation
+                    $local_dest = $folder . '/' . $file->name;
+                    $actual_size = file_exists($local_dest) ? filesize($local_dest) : 0;
+                    $expected_size = (int)$file->size;
+                    
+                    $is_http_error = $curl_info['http_code'] >= 400;
+                    $is_curl_error = $info['result'] !== CURLE_OK;
+                    $is_size_mismatch = $actual_size !== $expected_size;
+
+                    if ($is_http_error || $is_curl_error || $is_size_mismatch) {
+                        
+                        // FAIL FAST: If HTTP 403/404/500, do NOT retry. Go straight to fallback.
+                        if ($is_http_error) {
+                             $fallback_queue[] = $file;
+                             $line_offset = $slot + 1;
+                             echo "\033[{$line_offset}B\r\033[K {$slot}: -> HTTP {$curl_info['http_code']}. Queuing fallback...\033[{$line_offset}A";
+                             $processed_count++;
+                        } 
+                        // Retry only on network issues or partial downloads
+                        else if ($wrapper['attempts'] < $max_retries) {
+                            array_push($queue, $wrapper);
+                        } 
+                        else {
+                            $fallback_queue[] = $file;
+                            $line_offset = $slot + 1;
+                            echo "\033[{$line_offset}B\r\033[K {$slot}: -> Retries exhausted. Queuing fallback...\033[{$line_offset}A";
+                            $processed_count++;
+                        }
+                    } else {
+                        $processed_count++;
+                    }
+                }
+            }
+
+        } while ($running > 0 || !empty($queue));
+
+        echo "\033[{$max_concurrency}B\n\033[?25h";
+
+        // 5. PROCESS FALLBACKS
+        if (!empty($fallback_queue)) {
+            echo " - Processing " . count($fallback_queue) . " failed downloads via stream fallback...\n";
+            foreach ($fallback_queue as $file) {
+                $local_dest = $folder . '/' . $file->name;
+                $human_size = self::humanFilesize($file->size);
+                echo "    > Streaming {$file->name} ($human_size)...\n";
+                
+                try {
+                    self::download_file_chunked_stream($file->name, $local_dest, $file->size);
+                } catch (\Exception $e) {
+                    echo "      Error: " . $e->getMessage() . "\n";
+                }
+            }
+        }
+
+        echo " - All large file downloads processed.\n";
+    }
+
+    /**
+     * Fetches manifest chunks in parallel using a rolling queue.
+     * Returns the aggregated remote files map.
+     */
+    private static function fetch_manifests_parallel($manifest_chunks) {
+        $max_concurrency = 8;
+        $max_retries = 5;
+        $mh = curl_multi_init();
+        $queue = [];
+        
+        // Filter valid chunks and prepare queue
+        foreach ($manifest_chunks as $chunk) {
+            if (isset($chunk->url)) {
+                $queue[] = ['chunk' => $chunk, 'attempts' => 0];
+            }
+        }
+
+        $active_transfers = [];
+        $total_chunks = count($queue);
+        $processed_count = 0;
+        $remote_files_map = [];
+        $all_remote_files = [];
+
+        echo " - Fetching $total_chunks manifest chunks (Concurrency: $max_concurrency)...\n";
+        do {
+            // 1. REFILL
+            while (count($active_transfers) < $max_concurrency && !empty($queue)) {
+                $item = array_shift($queue);
+                $chunk = $item['chunk'];
+                $item['attempts']++;
+
+                $ch = curl_init($chunk->url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 60);
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 20);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                
+                curl_multi_add_handle($mh, $ch);
+                $active_transfers[(int)$ch] = ['wrapper' => $item];
+            }
+
+            // 2. EXECUTE
+            curl_multi_exec($mh, $running);
+            if ($running > 0) curl_multi_select($mh);
+
+            // 3. CHECK COMPLETION
+            while ($info = curl_multi_info_read($mh)) {
+                $ch = $info['handle'];
+                $ch_id = (int)$ch;
+                
+                if (isset($active_transfers[$ch_id])) {
+                    $transfer = $active_transfers[$ch_id];
+                    $chunk_name = $transfer['wrapper']['chunk']->name ?? 'unknown';
+                    
+                    $content = curl_multi_getcontent($ch);
+                    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $error = curl_error($ch);
+
+                    curl_multi_remove_handle($mh, $ch);
+                    curl_close($ch);
+                    unset($active_transfers[$ch_id]);
+
+                    if ($http_code !== 200 || $error || empty($content)) {
+                        // FAILURE
+                        if ($transfer['wrapper']['attempts'] < $max_retries) {
+                            echo ".";
+                            array_push($queue, $transfer['wrapper']);
+                        } else {
+                            echo "\n   - Warning: Failed to download manifest chunk $chunk_name after $max_retries attempts.\n";
+                            $processed_count++;
+                        }
+                    } else {
+                        // SUCCESS - Process JSON immediately
+                        $files = json_decode($content);
+                        if (is_array($files)) {
+                            foreach ($files as $file) {
+                                if (!isset($file->name)) continue;
+                                
+                                // Apply exclusions using static property
+                                $is_excluded = false;
+                                if (!empty(self::$exclude_paths)) {
+                                    foreach (self::$exclude_paths as $exclude_path) {
+                                        if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
+                                            $is_excluded = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                if ($is_excluded) continue;
+                                
+                                $remote_files_map[$file->name] = $file;
+                                // $all_remote_files[] = $file; // Uncomment if needed for debug
+                            }
+                        }
+                        $processed_count++;
+                        
+                        // Progress indicator
+                        if ($processed_count % 10 === 0 || $processed_count === $total_chunks) {
+                            $percent = round(($processed_count / $total_chunks) * 100);
+                            echo "     Progress: $processed_count/$total_chunks ($percent%)\r";
+                        }
+                    }
+                }
+            }
+        } while ($running > 0 || !empty($queue));
+        curl_multi_close($mh);
+        echo "\n - Manifest download complete.\n";
+        
+        return [$remote_files_map, $all_remote_files];
     }
 
     /**
