@@ -27,6 +27,10 @@ class Run {
     private static $skip_files = false;
     private static $skip_checksums = false;
 
+    // Global Progress Tracking
+    private static $global_bytes_total = 0;
+    private static $global_bytes_processed = 0;
+
     /**
      * Parses CLI arguments to populate static class properties.
      * Handles flags, values, and the optional sync folder argument.
@@ -871,7 +875,6 @@ class Run {
             // --- File Sync ---
             if (!self::$skip_files) {
                 $files_manifest_chunks = [];
-
                 if (self::$session_id) {
                     echo "Fetching existing manifest for sync...\n";
                     try {
@@ -879,7 +882,8 @@ class Run {
                         if (!is_array($files_manifest_chunks)) {
                             throw new \Exception("Could not fetch or parse existing manifest.");
                         }
-                        echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
+                        echo "Successfully fetched manifest with " .
+                        count($files_manifest_chunks) . " file chunks.\n";
                     } catch (\Exception $e) {
                         echo "Error fetching manifest: {$e->getMessage()}\n";
                         if (!self::$session_id) self::cleanupTemporaryFiles();
@@ -896,9 +900,16 @@ class Run {
                 if ($is_initial_sync) {
                     echo "Performing initial file download (Optimized)...\n";
                     echo "Fetching remote file manifest...\n";
-                    // Simplified call: excludes are now static properties
+                    
                     list($remote_files_map, $all_files_debug) = self::fetch_manifests_parallel($files_manifest_chunks);
                     
+                    $total_bytes_to_sync = 0;
+                    foreach ($remote_files_map as $f) {
+                        $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
+                    }
+                    self::$global_bytes_total = $total_bytes_to_sync;
+                    self::$global_bytes_processed = 0;
+
                     $large_files_queue = [];
                     $small_files_queue = [];
 
@@ -922,7 +933,6 @@ class Run {
                         $file_chunks = [];
                         $current_chunk = [];
                         $current_chunk_size = 0;
-
                         foreach ($small_files_queue as $file) {
                             $fsize = $file->size ?? 0;
                             if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
@@ -935,17 +945,24 @@ class Run {
                             }
                         }
                         if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
-
                         $total_zip_chunks = count($file_chunks);
+                        
+                        // --- LOOP 1 (Initial Sync) ---
                         foreach ($file_chunks as $i => $chunk) {
                             $chunk_num = $i + 1;
-                            echo " - Processing zip chunk $chunk_num/$total_zip_chunks (" . count($chunk) . " files)...\n";
+                            
+                            // Construct the label
+                            $label = " - Processing zip chunk $chunk_num/$total_zip_chunks (" . count($chunk) . " files)";
+                            
                             try {
                                 $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
                                 if (strpos($url, 'http') === 0) {
                                     $fname = basename($url);
                                     $lpath = $folder . '/' . $fname;
-                                    self::download_file_direct($url, $lpath);
+                                    
+                                    // Pass label as 3rd argument
+                                    self::download_file_direct($url, $lpath, $label);
+                                    
                                     self::unzip_file($lpath, $folder);
                                     unlink($lpath);
                                     self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
@@ -960,15 +977,18 @@ class Run {
                                     if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
                                     try {
                                         self::download_file_via_stream($f->name, $ldest);
+                                        // Update global stats on fallback success
+                                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
                                     } catch (\Exception $fe) {
                                         echo "   - Failed to download: {$f->name}\n";
                                     }
                                 }
                             }
                         }
+                        // --- END LOOP 1 ---
+                
                     }
                     echo "Initial file sync complete.\n";
-
                 } else {
                     // Subsequent Sync (Diff)
                     echo "Fetching remote file manifest...\n";
@@ -978,11 +998,10 @@ class Run {
                     echo "Generating local file manifest...\n";
                     // Pass static property skip_checksums
                     $local_files_map = self::generate_local_manifest($folder, self::$skip_checksums);
-
                     echo "Comparing manifests and syncing changes...\n";
+                    
                     $files_to_download = [];
                     $files_to_delete = [];
-
                     foreach ($remote_files_map as $path => $remote_file) {
                         $local_file = $local_files_map[$path] ?? null;
                         $should_download = false;
@@ -1001,6 +1020,15 @@ class Run {
                         if (!isset($remote_files_map[$path])) $files_to_delete[] = $path;
                     }
 
+                    // --- NEW: Calculate Total Size for Global Progress (Subsequent) ---
+                    $total_bytes_to_sync = 0;
+                    foreach ($files_to_download as $f) {
+                        $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
+                    }
+                    self::$global_bytes_total = $total_bytes_to_sync;
+                    self::$global_bytes_processed = 0;
+                    // ------------------------------------------------------------------
+
                     if (!empty($files_to_download)) {
                         $total_files_to_download = count($files_to_download);
                         echo " - Syncing $total_files_to_download new/changed file(s)...\n";
@@ -1009,7 +1037,6 @@ class Run {
                         $current_chunk = [];
                         $current_chunk_size = 0;
                         $large_files_parallel_queue = [];
-
                         foreach ($files_to_download as $file) {
                             $fsize = $file->size ?? 0;
                             
@@ -1039,28 +1066,41 @@ class Run {
                         }
 
                         $total_chunks = count($file_chunks);
+                        
+                        // --- LOOP 2 (Subsequent Sync) ---
                         foreach ($file_chunks as $i => $chunk) {
                             $chunk_num = $i + 1;
-                            echo " - Processing sync chunk $chunk_num/$total_chunks (" . count($chunk) . " files)...\n";
+
+                            // Construct the label
+                            $label = " - Processing sync chunk $chunk_num/$total_chunks (" . count($chunk) . " files)";
+
                             try {
                                 $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
                                 if (strpos($url, 'http')===0) {
                                     $fname = basename($url);
                                     $lpath = $folder . '/' . $fname;
-                                    self::download_file_direct($url, $lpath);
+                                    
+                                    // Pass label as 3rd argument
+                                    self::download_file_direct($url, $lpath, $label);
+                                    
                                     self::unzip_file($lpath, $folder);
                                     unlink($lpath);
                                     self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
                                 }
                             } catch (\Exception $e) {
+                                echo "\nWarning: Sync chunk $chunk_num failed. Falling back to stream.\n";
                                 foreach ($chunk as $f) {
                                     $ldest = $folder . '/' . $f->name;
                                     $ldir = dirname($ldest);
                                     if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
                                     self::download_file_via_stream($f->name, $ldest);
+                                    // Update global stats on fallback stream
+                                    self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
                                 }
                             }
                         }
+                        // --- END LOOP 2 ---
+
                         echo str_pad("", 80, " ") . "\r";
                         echo " - All sync chunks processed.            \n";
                     } else {
@@ -1473,7 +1513,6 @@ class Run {
                 }
                 
                 self::displayBackupSummary($client_side_filtering ? [] : $files);
-
             } catch (\Exception $e) {
                 echo "Error fetching manifest: {$e->getMessage()}\n";
                 exit(1);
@@ -1482,7 +1521,7 @@ class Run {
             // New Session
             if (!self::$skip_files) {
                 // Pass the static preview flag to runPreview
-                $files = self::runPreview(self::$preview); 
+                $files = self::runPreview(self::$preview);
             } else {
                 self::displayBackupSummary([]);
                 echo "Skipping file analysis as requested.\n";
@@ -1512,16 +1551,16 @@ class Run {
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
             if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create public directory.");
-            
+
+            // --- CALCULATE GLOBAL TOTALS ---
+            $total_db_bytes = 0;
+            $database = [];
+
+            // Pre-fetch DB info to calculate total size
             if (!self::$skip_db) {
-                if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create db directory.");
-                $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
-                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
-                
                 $all_tables = self::make_request('/database', [], 'GET');
                 if (!is_array($all_tables)) $all_tables = [];
 
-                $database = [];
                 if (!empty(self::$exclude_tables)) {
                     foreach ($all_tables as $table) {
                         $is_excluded = false;
@@ -1537,7 +1576,32 @@ class Run {
                     $database = $all_tables;
                 }
 
+                foreach ($database as $tbl) {
+                    $total_db_bytes += (isset($tbl->size) ? (float)$tbl->size : 0);
+                }
+            }
+            
+            $total_file_bytes = 0;
+            if (!self::$skip_files) {
+                if (!empty($filtered_files)) {
+                     foreach ($filtered_files as $f) $total_file_bytes += (isset($f->size) ? (float)$f->size : 0);
+                } elseif (!empty($files)) {
+                    // $files contains manifest chunks with a 'size' property
+                    $total_file_bytes = array_sum(array_column($files, 'size'));
+                }
+            }
+
+            self::$global_bytes_total = $total_db_bytes + $total_file_bytes;
+            self::$global_bytes_processed = 0;
+            // -------------------------------
+
+            if (!self::$skip_db) {
+                if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create db directory.");
+                $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
+                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
+                
                 if (!empty($database)) {
+                    // This calls download_db_file -> download_file_direct, which updates global progress
                     self::processDatabaseBackup($database, $db_export_file, $local_db_path);
                 } else {
                     echo "No database tables to back up.\n";
@@ -1549,7 +1613,6 @@ class Run {
 
             if (!self::$skip_files) {
                 echo "Preparing optimized file backup...\n";
-                
                 $all_files_to_process = $filtered_files;
                 if (empty($all_files_to_process) && !empty($files)) {
                     // Fetch using parallel fetcher (uses static excludes)
@@ -1593,25 +1656,38 @@ class Run {
                         if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
                         
                         $total_chunks = count($file_chunks);
+                        
                         foreach ($file_chunks as $i => $chunk) {
                             $chunk_num = $i + 1;
                             $chunk_count = count($chunk);
                             $chunk_size_str = self::humanFilesize(array_sum(array_column($chunk, 'size')));
                             
-                            echo " - Processing zip chunk $chunk_num/$total_chunks ($chunk_count files, $chunk_size_str)...\n";
+                            // 1. Clear previous footer line if any
+                            echo "\r\033[K";
+                            
+                            // 2. Print Header (NO NEWLINE at the end)
+                            echo " - Processing zip chunk $chunk_num/$total_chunks ($chunk_count files, $chunk_size_str)...";
+
                             try {
                                 $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
                                 if (strpos($url, 'http') === 0) {
                                     $fname = basename($url);
                                     $lpath = $temp_directory . '/' . $fname;
-                                    self::download_file_direct($url, $lpath);
+                                    
+                                    // 3. Call download with QUIET = true
+                                    self::download_file_direct($url, $lpath, true);
+                                    
                                     self::unzip_file($lpath, $local_public_path);
                                     unlink($lpath);
                                     self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
+                                    
+                                    // 4. Print "Done" on the same line
+                                    echo " - Done\n";
                                 } else {
                                      throw new \Exception("Invalid zip URL received.");
                                 }
                             } catch (\Exception $e) {
+                                // Add a newline so the warning doesn't look weird appended to the processing line
                                 echo "\nWarning: Zip failed for chunk $chunk_num. Falling back to stream.\n";
                                 foreach ($chunk as $f) {
                                     $ldest = $local_public_path . '/' . $f->name;
@@ -1619,12 +1695,15 @@ class Run {
                                     if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
                                     try {
                                         self::download_file_via_stream($f->name, $ldest);
+                                        // Update global stats on fallback stream
+                                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
                                     } catch (\Exception $fe) {
                                         echo "   - Failed to download: {$f->name}\n";
                                     }
                                 }
                             }
                         }
+                
                         echo "Small file batches complete.\n";
                     }
                 }
@@ -1906,9 +1985,10 @@ class Run {
     }
 
     /**
-     * Downloads a file using native cURL with a progress bar and retry logic.
+     * Downloads a file using native cURL.
+     * Supports standard verbose output or a custom progress bar label.
      */
-    private static function download_file_direct($url, $destination) {
+    private static function download_file_direct($url, $destination, $progress_label = null) {
         $attempts = 0;
         $max_attempts = 5;
         $last_error = '';
@@ -1917,40 +1997,71 @@ class Run {
             $attempts++;
             $fp = false;
             $ch = false;
+            
+            $previous_downloaded = 0;
+            $has_printed_lines = false;
 
             try {
-                // Open file inside loop to ensure we truncate/overwrite previous failed attempts
                 $fp = fopen($destination, 'w+');
-                if ($fp === false) {
-                    throw new \Exception("Could not open $destination for writing");
-                }
+                if ($fp === false) throw new \Exception("Could not open $destination");
 
                 $ch = curl_init($url);
                 curl_setopt($ch, CURLOPT_FILE, $fp);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 3600); // 1 hour timeout
+                curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
                 
-                // Enable Progress Bar
                 curl_setopt($ch, CURLOPT_NOPROGRESS, false);
                 curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function(
-                    $resource, 
-                    $download_size, 
-                    $downloaded, 
-                    $upload_size, 
-                    $uploaded
-                ) use ($attempts, $max_attempts) {
-                    if ($download_size > 0) {
-                        $percent = round(($downloaded / $download_size) * 100);
-                        $downloaded_human = self::humanFilesize($downloaded);
-                        $total_human = self::humanFilesize($download_size);
-                        
-                        // Show attempt number if retrying
-                        $prefix = ($attempts > 1) ? "[Retry $attempts/$max_attempts] " : "";
-                        
-                        echo str_pad("", 80, " ") . "\r"; 
-                        echo "     - {$prefix}Downloading: $downloaded_human / $total_human ($percent%)...\r";
+                    $resource, $download_size, $downloaded, $upload_size, $uploaded
+                ) use ($attempts, $max_attempts, &$previous_downloaded, &$has_printed_lines, $progress_label) {
+                    
+                    $percent = ($download_size > 0) ? round(($downloaded / $download_size) * 100) : 0;
+                    
+                    // Global Stats Update
+                    if (self::$global_bytes_total > 0) {
+                        $delta = $downloaded - $previous_downloaded;
+                        if ($delta > 0) {
+                            self::$global_bytes_processed += $delta;
+                            $previous_downloaded = $downloaded;
+                        }
                     }
+
+                    // Prepare Global Line (Footer)
+                    $global_line = "";
+                    if (self::$global_bytes_total > 0) {
+                        $g_cur = self::humanFilesize(self::$global_bytes_processed);
+                        $g_tot = self::humanFilesize(self::$global_bytes_total);
+                        $g_perc = (self::$global_bytes_total > 0) ? round((self::$global_bytes_processed / self::$global_bytes_total) * 100) : 0;
+                        $global_line = "$g_cur / $g_tot ($g_perc%)";
+                    }
+
+                    // Prepare File Line (Main Output)
+                    $file_line = "";
+                    if ($progress_label) {
+                        // --- BAR MODE ---
+                        // Pad label to align bars (adjust 60 to fit your preferred width)
+                        $padded_label = str_pad($progress_label, 60);
+                        $bar = self::draw_progress_bar($downloaded, $download_size, 15);
+                        $size_str = self::humanFilesize($downloaded);
+                        $file_line = "\r\033[K{$padded_label} {$bar} {$size_str}";
+                    } else {
+                        // --- STANDARD MODE ---
+                        $d_human = self::humanFilesize($downloaded);
+                        $t_human = ($download_size > 0) ? self::humanFilesize($download_size) : 'Unknown';
+                        $prefix = ($attempts > 1) ? "[Retry $attempts] " : "";
+                        $file_line = "\r\033[K     - {$prefix}Downloading: $d_human / $t_human ($percent%)...";
+                    }
+
+                    // Render
+                    echo $file_line;
+
+                    if ($global_line) {
+                        echo "\n\033[K" . $global_line; 
+                        echo "\033[1A"; 
+                    }
+
+                    $has_printed_lines = true;
                 });
 
                 $data = curl_exec($ch);
@@ -1960,49 +2071,64 @@ class Run {
                 if (is_resource($ch)) curl_close($ch);
                 if (is_resource($fp)) fclose($fp);
 
-                if (!$data) {
-                    throw new \Exception("cURL Download Error: $error");
-                }
+                if (!$data) throw new \Exception("cURL Error: $error");
+                if ($statusCode >= 400) throw new \Exception("HTTP Error $statusCode");
 
-                if ($statusCode >= 400) {
-                    throw new \Exception("HTTP Error $statusCode");
+                // Cleanup Output
+                if ($has_printed_lines) {
+                    if ($progress_label) {
+                        // Bar Mode: Move to next line, clearing the global footer from that line
+                        echo "\n\033[K"; 
+                    } else {
+                        // Standard Mode: Replace progress with "Complete" message
+                        echo "\r\033[K";
+                        echo "     - Download complete.\n";
+                        // Restore global footer logic
+                        if (self::$global_bytes_total > 0) {
+                            $g_cur = self::humanFilesize(self::$global_bytes_processed);
+                            $g_tot = self::humanFilesize(self::$global_bytes_total);
+                            $g_perc = round((self::$global_bytes_processed / self::$global_bytes_total) * 100);
+                            echo "\033[K$g_cur / $g_tot ($g_perc%)\r";
+                        } else {
+                            echo "\r\033[K\033[1A";
+                        }
+                    }
+                } else if ($progress_label) {
+                     echo "\n";
+                } else {
+                    echo "     - Download complete.\n";
                 }
-
-                // Success! Clear the progress line
-                echo str_pad("", 80, " ") . "\r";
-                return; 
+                return;
 
             } catch (\Exception $e) {
-                // Ensure resources are released before retrying
                 if (is_resource($ch)) curl_close($ch);
                 if (is_resource($fp)) fclose($fp);
-
-                $last_error = $e->getMessage();
-                
-                // Clear the progress bar line so the warning is clean
-                echo str_pad("", 80, " ") . "\r"; 
+                if ($has_printed_lines) {
+                    // Cleanup visual artifacts before printing error
+                     if ($progress_label) echo "\n\033[K"; 
+                     else echo "\n\r\033[K\033[1A\r\033[K";
+                }
 
                 if ($attempts < $max_attempts) {
-                    echo "     - Warning: Download failed (Attempt $attempts/$max_attempts): $last_error. Retrying in 3s...\n";
-                    sleep(3);
+                    echo "     - Warning: Download failed: {$e->getMessage()}. Retrying...\n";
+                    sleep(2);
+                } else {
+                    $last_error = $e->getMessage();
                 }
             }
         }
-
-        // If loop finishes, we failed
-        throw new \Exception("Download failed after $max_attempts attempts. Last error: $last_error");
+        throw new \Exception("Download failed: $last_error");
     }
 
     /**
-     * Downloads large files using a rolling queue with Multi-line Progress Bars.
+     * Downloads large files using a rolling queue with Multi-line Progress Bars + Global Footer.
      * Includes size validation and fallback to stream API.
      */
     private static function download_files_parallel($files, $folder) {
         $max_concurrency = 4;
-        $max_retries = 3; // Reduced from 5 to 3
+        $max_retries = 3; 
         $mh = curl_multi_init();
-        
-        // Initialize queue
+
         $queue = [];
         foreach ($files as $f) {
             $queue[] = ['file' => $f, 'attempts' => 0];
@@ -2017,8 +2143,9 @@ class Run {
         // Hide Cursor
         echo "\033[?25l";
         echo " - Starting threaded download of {$total_files} large files...\n";
-        echo str_repeat("\n", $max_concurrency); // Reserve space
-        echo "\033[{$max_concurrency}A"; // Move cursor up
+        // Reserve space: Concurrency lines + 1 extra line for Global Footer
+        echo str_repeat("\n", $max_concurrency + 1);
+        echo "\033[" . ($max_concurrency + 1) . "A"; // Move cursor up
 
         do {
             // 1. REFILL QUEUE
@@ -2054,13 +2181,14 @@ class Run {
                 curl_setopt($ch, CURLOPT_NOPROGRESS, true); 
 
                 curl_multi_add_handle($mh, $ch);
-                $active_transfers[(int)$ch] = [
+                $ch_int = (int)$ch;
+                $active_transfers[$ch_int] = [
                     'handle'  => $ch, 
                     'wrapper' => $item,
                     'fp'      => $fp,
                     'slot'    => $slot_index
                 ];
-                $slots[$slot_index] = (int)$ch;
+                $slots[$slot_index] = $ch_int;
             }
 
             // 2. EXECUTE
@@ -2070,33 +2198,48 @@ class Run {
             }
 
             // 3. UPDATE UI
+            $current_batch_bytes = 0; // Bytes currently downloading in this loop
+
             foreach ($active_transfers as $ch_int => $data) {
                 $slot = $data['slot'];
                 $line_offset = $slot + 1;
                 $label_num = $slot + 1;
 
-                // Better filename display: show parent dir to distinguish duplicates
                 $name_parts = explode('/', $data['wrapper']['file']->name);
                 $count = count($name_parts);
-                if ($count > 1) {
-                    $filename = $name_parts[$count-2] . '/' . $name_parts[$count-1];
-                } else {
-                    $filename = $name_parts[0];
-                }
-
+                $filename = ($count > 1) ? $name_parts[$count-2] . '/' . $name_parts[$count-1] : $name_parts[0];
                 $downloaded = curl_getinfo($data['handle'], CURLINFO_SIZE_DOWNLOAD);
                 $total = $data['wrapper']['file']->size; 
                 
-                if (strlen($filename) > 40) $filename = '...' . substr($filename, -37);
-                $filename_padded = str_pad($filename, 40);
-                
+                // Add to current batch accumulator for the footer
+                $current_batch_bytes += $downloaded;
+                if (strlen($filename) > 56) $filename = '...' . substr($filename, -53);
+                $filename_padded = str_pad($filename, 56);
                 $bar = self::draw_progress_bar($downloaded, $total, 15);
                 $size_str = self::humanFilesize($downloaded);
                 
                 echo "\033[{$line_offset}B\r\033[K {$label_num}: {$filename_padded} {$bar} {$size_str}\033[{$line_offset}A";
             }
 
-            // 4. CHECK COMPLETION
+            // 4. UPDATE GLOBAL FOOTER
+            // Only display if we have a total calculated
+            if (self::$global_bytes_total > 0) {
+                // Total Processed = (Files Finished) + (Active Download Progress)
+                $display_current = self::$global_bytes_processed + $current_batch_bytes;
+                // Cap at total to prevent minor overflows from confusing the user
+                if ($display_current > self::$global_bytes_total) $display_current = self::$global_bytes_total;
+                $human_current = self::humanFilesize($display_current);
+                $human_total = self::humanFilesize(self::$global_bytes_total);
+                
+                // Avoid division by zero
+                $global_percent = (self::$global_bytes_total > 0) ? round(($display_current / self::$global_bytes_total) * 100) : 0;
+                $footer_offset = $max_concurrency + 1;
+                
+                // Print Footer: Flush left, no label
+                echo "\033[{$footer_offset}B\r\033[K{$human_current} / {$human_total} ({$global_percent}%)\033[{$footer_offset}A";
+            }
+
+            // 5. CHECK COMPLETION
             while ($info = curl_multi_info_read($mh)) {
                 $ch = $info['handle'];
                 $ch_id = (int)$ch;
@@ -2127,15 +2270,13 @@ class Run {
                     $is_size_mismatch = $actual_size !== $expected_size;
 
                     if ($is_http_error || $is_curl_error || $is_size_mismatch) {
-                        
-                        // FAIL FAST: If HTTP 403/404/500, do NOT retry. Go straight to fallback.
+                        // Fail Fast or Retry logic
                         if ($is_http_error) {
                              $fallback_queue[] = $file;
                              $line_offset = $slot + 1;
                              echo "\033[{$line_offset}B\r\033[K {$slot}: -> HTTP {$curl_info['http_code']}. Queuing fallback...\033[{$line_offset}A";
                              $processed_count++;
                         } 
-                        // Retry only on network issues or partial downloads
                         else if ($wrapper['attempts'] < $max_retries) {
                             array_push($queue, $wrapper);
                         } 
@@ -2146,6 +2287,8 @@ class Run {
                             $processed_count++;
                         }
                     } else {
+                        // SUCCESS: Permanently add this file's full size to global stats
+                        self::$global_bytes_processed += $expected_size;
                         $processed_count++;
                     }
                 }
@@ -2153,18 +2296,30 @@ class Run {
 
         } while ($running > 0 || !empty($queue));
 
-        echo "\033[{$max_concurrency}B\n\033[?25h";
+        // CLEANUP: 
+        // 1. Move cursor down from Top (where it sits during loop) to the Global Footer line
+        $lines_to_move = $max_concurrency + 1;
+        echo "\033[{$lines_to_move}B";
+        
+        // 2. Clear the Footer line completely so it doesn't get stuck
+        echo "\r\033[K"; 
+        
+        // 3. Show cursor (It is now sitting on the empty line below the file list)
+        echo "\033[?25h";
 
-        // 5. PROCESS FALLBACKS
+        // 6. PROCESS FALLBACKS
         if (!empty($fallback_queue)) {
             echo " - Processing " . count($fallback_queue) . " failed downloads via stream fallback...\n";
             foreach ($fallback_queue as $file) {
                 $local_dest = $folder . '/' . $file->name;
                 $human_size = self::humanFilesize($file->size);
                 echo "    > Streaming {$file->name} ($human_size)...\n";
-                
                 try {
+                    // Note: Stream fallback handles its own progress bar
                     self::download_file_chunked_stream($file->name, $local_dest, $file->size);
+                    
+                    // Success on stream: Add to global stats
+                    self::$global_bytes_processed += (int)$file->size;
                 } catch (\Exception $e) {
                     echo "      Error: " . $e->getMessage() . "\n";
                 }
