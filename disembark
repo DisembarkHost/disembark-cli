@@ -2110,7 +2110,9 @@ class Run {
                     $curl_info = curl_getinfo($ch);
                     
                     curl_multi_remove_handle($mh, $ch);
-                    curl_close($ch);
+                    if (is_resource($ch)) {
+                        curl_close($ch);
+                    }
                     fclose($transfer['fp']);
                     unset($active_transfers[$ch_id]);
                     $slots[$slot] = null;
@@ -2231,7 +2233,9 @@ class Run {
                     $error = curl_error($ch);
 
                     curl_multi_remove_handle($mh, $ch);
-                    curl_close($ch);
+                    if (is_resource($ch)) {
+                        curl_close($ch);
+                    }
                     unset($active_transfers[$ch_id]);
 
                     if ($http_code !== 200 || $error || empty($content)) {
@@ -2278,7 +2282,9 @@ class Run {
                 }
             }
         } while ($running > 0 || !empty($queue));
-        curl_multi_close($mh);
+        if (is_resource($mh)) {
+            curl_multi_close($mh);
+        }
         echo "\n - Manifest download complete.\n";
         
         return [$remote_files_map, $all_remote_files];
