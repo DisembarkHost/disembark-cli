@@ -6,6 +6,122 @@ class Run {
 
     const VERSION = '2.5.0';
 
+    private static $siteUrl;
+    private static $token;
+    private static $backup_token;
+    
+    // Default Thresholds
+    private static $db_max_size = 209715200;       // 200MB
+    private static $db_max_rows = 1000000;         // 1M rows
+    private static $file_chunk_size = 2500;        // 2500 files
+    private static $file_chunk_max_size = 524288000; // 500MB
+    private static $large_file_threshold = 10485760; // 10MB
+    
+    // Options
+    private static $session_id = null;
+    private static $exclude_paths = [];
+    private static $exclude_tables = [];
+    private static $preview = false;
+    private static $debug = false;
+    private static $skip_db = false;
+    private static $skip_files = false;
+    private static $skip_checksums = false;
+
+    /**
+     * Parses CLI arguments to populate static class properties.
+     * Handles flags, values, and the optional sync folder argument.
+     * @return string|null The folder path if found (for sync), otherwise null.
+     */
+    private static function parseArguments($argv, $startIndex = 3) {
+        $folder = null;
+        $argc = count($argv);
+
+        for ($i = $startIndex; $i < $argc; $i++) {
+            $arg = $argv[$i];
+
+            // --- 1. Boolean Flags ---
+            if ($arg === '--preview') {
+                self::$preview = true;
+                continue;
+            }
+            if ($arg === '--debug') {
+                self::$debug = true;
+                continue;
+            }
+            if ($arg === '--skip-db') {
+                self::$skip_db = true;
+                continue;
+            }
+            if ($arg === '--skip-files') {
+                self::$skip_files = true;
+                continue;
+            }
+            if ($arg === '--skip-checksums') {
+                self::$skip_checksums = true;
+                continue;
+            }
+
+            // --- 2. Value Flags ---
+            if (strpos($arg, '--token=') === 0) {
+                self::$token = substr($arg, strlen('--token='));
+                continue;
+            }
+            if (strpos($arg, '--session-id=') === 0) {
+                self::$session_id = substr($arg, strlen('--session-id='));
+                continue;
+            }
+            if (strpos($arg, '--db-max-size=') === 0) {
+                self::$db_max_size = self::convert_to_bytes(substr($arg, strlen('--db-max-size=')));
+                continue;
+            }
+            if (strpos($arg, '--db-max-rows=') === 0) {
+                self::$db_max_rows = (int)substr($arg, strlen('--db-max-rows='));
+                continue;
+            }
+            if (strpos($arg, '--file-chunk-size=') === 0) {
+                self::$file_chunk_size = (int)substr($arg, strlen('--file-chunk-size='));
+                continue;
+            }
+            if (strpos($arg, '--file-chunk-max-size=') === 0) {
+                self::$file_chunk_max_size = self::convert_to_bytes(substr($arg, strlen('--file-chunk-max-size=')));
+                continue;
+            }
+            if (strpos($arg, '--large-file-threshold=') === 0) {
+                self::$large_file_threshold = self::convert_to_bytes(substr($arg, strlen('--large-file-threshold=')));
+                continue;
+            }
+            
+            // --- 3. Exclusions ---
+            if ($arg === '-x') {
+                // Check if next arg exists and is not another flag
+                if (isset($argv[$i + 1]) && strpos($argv[$i + 1], '-') !== 0) {
+                    self::$exclude_paths[] = rtrim($argv[$i + 1], '/');
+                    $i++; // Skip the next argument as we consumed it
+                } else {
+                    echo "Error: Missing value for -x option.\n";
+                    exit(1);
+                }
+                continue;
+            }
+            if (strpos($arg, '--exclude-tables=') === 0) {
+                $val = substr($arg, strlen('--exclude-tables='));
+                self::$exclude_tables = explode(',', $val);
+                continue;
+            }
+
+            // --- 4. Positional Argument (Sync Folder) ---
+            // If it's not a flag (start with -) and we haven't found a folder yet
+            if (strpos($arg, '-') !== 0 && $folder === null) {
+                $folder = $arg;
+            } elseif (strpos($arg, '-') !== 0) {
+                // Determine if this is an unknown argument or extra positional
+                echo "Warning: Ignoring unknown argument '$arg'.\n";
+            }
+        }
+
+        return $folder;
+    }
+
     public static function main($argv, $argc) {
         if ($argc < 2) {
             self::showHelp();
@@ -13,233 +129,73 @@ class Run {
         }
 
         $command = $argv[1];
+
+        // 1. Handle "Standalone" Commands
+        // These do not require a site URL or configuration file to run.
         switch ($command) {
+            case 'version':
+                self::version();
+                exit(0);
+            case 'upgrade':
+                self::upgrade();
+                exit(0);
+            case 'list':
+                self::sites();
+                exit(0);
             case 'connect':
                 if ($argc != 4) {
                     echo "Error: Invalid arguments for connect\n";
                     exit(1);
                 }
-                $siteUrl = $argv[2];
-                $token = $argv[3];
-                self::connect($siteUrl, $token);
-                break;
+                self::connect($argv[2], $argv[3]);
+                exit(0);
+        }
 
-            case 'list':
-                if ($argc != 2) {
-                    echo "Error: Invalid arguments for list\n";
-                    exit(1);
-                }
-                self::sites();
-                break;
+        // 2. Bootstrapping for "Site" Commands (backup, sync, ncdu)
+        // These commands require a <site-url> as the second argument.
+        if ($argc < 3) {
+            echo "Error: Missing <site-url> argument.\n";
+            self::showHelp();
+            exit(1);
+        }
+
+        // A. Set Global Site URL
+        self::$siteUrl = $argv[2]; 
+
+        // B. Load Config from disk
+        // This attempts to find the token for self::$siteUrl in .disembark
+        self::load_config(self::$siteUrl);
+
+        // C. Parse Flags
+        $sync_folder = self::parseArguments($argv, 3);
+
+        // 3. Dispatch Command
+        switch ($command) {
             case 'backup':
-                if ($argc < 3) {
-                    echo "Error: Invalid arguments for backup\nRequires: <site-url> [options]\n";
-                    exit(1);
-                }
-                $siteUrl = $argv[2];
-                $exclude_paths = [];
-                $exclude_tables_str = '';
-                $preview = false;
-                $token = null;
-                $session_id = null;
-                $db_max_size_str = null;
-                $db_max_rows_str = null;
-                $skip_db = false;
-                $skip_files = false;
-                $i = 3;
-                while ($i < $argc) {
-                    if ($argv[$i] === '--preview') {
-                        $preview = true;
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '--skip-db') {
-                        $skip_db = true;
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '--skip-files') {
-                        $skip_files = true;
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--token=') === 0) {
-                        $token = substr($argv[$i], strlen('--token='));
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--session-id=') === 0) {
-                        $session_id = substr($argv[$i], strlen('--session-id='));
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '-x') {
-                        if (isset($argv[$i + 1])) {
-                            $exclude_paths[] = rtrim($argv[$i + 1], '/');
-                            $i += 2;
-                        } else {
-                            echo "Error: Missing value for -x option.\n";
-                            exit(1);
-                        }
-                    } elseif (strpos($argv[$i], '--exclude-tables=') === 0) {
-                        $exclude_tables_str = substr($argv[$i], strlen('--exclude-tables='));
-                        $i++;
-                    } elseif (strpos($argv[$i], '--db-max-size=') === 0) {
-                        $db_max_size_str = substr($argv[$i], strlen('--db-max-size='));
-                        $i++;
-                    } elseif (strpos($argv[$i], '--db-max-rows=') === 0) {
-                        $db_max_rows_str = substr($argv[$i], strlen('--db-max-rows='));
-                        $i++;
-                    } else {
-                        echo "Error: Unknown argument '{$argv[$i]}'\n";
-                        self::showHelp();
-                        exit(1);
-                    }
-                }
-                $exclude_tables = !empty($exclude_tables_str) ? explode(',', $exclude_tables_str) : [];
-                self::backup($siteUrl, $exclude_paths, $exclude_tables, $preview, $session_id, $db_max_size_str, $db_max_rows_str, $skip_db, $skip_files, $token);
+                self::backup();
                 break;
-            case 'version':
-                if ($argc != 2) {
-                    echo "Error: Invalid arguments for version\n";
-                    exit(1);
-                }
-                self::version();
-                break;
-            case 'upgrade':
-                if ($argc != 2) {
-                    echo "Error: Invalid arguments for upgrade\n";
-                    exit(1);
-                }
-                self::upgrade();
-                break;
+
             case 'sync':
-                if ($argc < 3) {
-                    echo "Error: Invalid arguments for sync\nRequires: <site-url> [<folder>] [--debug]\n";
-                    exit(1);
-                }
-                $siteUrl = $argv[2];
-                // Initialize variables
-                $folder = null;
-                $debug = false;
-                $session_id = null;
-                $db_max_size_str = null;
-                $db_max_rows_str = null;
-                $file_chunk_size_str = null;
-                $file_chunk_max_size_str = null;
-                $skip_db = false;
-                $skip_files = false;
-                $exclude_paths = []; // Initialize exclusion array
-                $skip_checksums = false;
-
-                $i = 3;
-                while ($i < $argc) {
-                    if ($argv[$i] === '--debug') {
-                        $debug = true;
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '--skip-db') {
-                        $skip_db = true;
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '--skip-files') {
-                        $skip_files = true;
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '--skip-checksums') {
-                        $skip_checksums = true;
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--session-id=') === 0) {
-                        $session_id = substr($argv[$i], strlen('--session-id='));
-                        $i++;
-                        continue;
-                    }
-                    if ($argv[$i] === '-x') {
-                        if (isset($argv[$i + 1])) {
-                            $exclude_paths[] = rtrim($argv[$i + 1], '/');
-                            $i += 2;
-                            continue;
-                        } else {
-                            echo "Error: Missing value for -x option.\n";
-                            exit(1);
-                        }
-                    }
-                    if (strpos($argv[$i], '--db-max-size=') === 0) {
-                        $db_max_size_str = substr($argv[$i], strlen('--db-max-size='));
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--db-max-rows=') === 0) {
-                        $db_max_rows_str = substr($argv[$i], strlen('--db-max-rows='));
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--file-chunk-size=') === 0) {
-                        $file_chunk_size_str = substr($argv[$i], strlen('--file-chunk-size='));
-                        $i++;
-                        continue;
-                    }
-                    if (strpos($argv[$i], '--file-chunk-max-size=') === 0) {
-                        $file_chunk_max_size_str = substr($argv[$i], strlen('--file-chunk-max-size='));
-                        $i++;
-                        continue;
-                    }
-                    
-                    // Handle folder argument (checking if it's not a flag)
-                    if ($folder === null && strpos($argv[$i], '--') !== 0) {
-                        $folder = $argv[$i];
-                        $i++;
-                        continue;
-                    }
-
-                    echo "Error: Unknown argument '{$argv[$i]}'\n";
-                    self::showHelp();
-                    exit(1);
+                // Logic to determine destination folder
+                if ($sync_folder === null) {
+                    // Default to domain name
+                    $sync_folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim(self::$siteUrl, '/'));
                 }
 
-                if ($folder === null) {
-                    $folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim($siteUrl, '/'));
+                // Resolve to absolute path
+                if (substr($sync_folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($sync_folder) > 1 && substr($sync_folder, 1, 1) === ':')) {
+                    $sync_folder = getcwd() . DIRECTORY_SEPARATOR . $sync_folder;
                 }
-
-                // Resolve $folder to an absolute path to avoid phar ambiguity.
-                // Check if $folder is already absolute (e.g., /var/www or C:\www)
-                if ( substr($folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($folder) > 1 && substr($folder, 1, 1) === ':') ) {
-                    $folder = getcwd() . DIRECTORY_SEPARATOR . $folder;
-                }
-
-                self::sync($siteUrl, $folder, $debug, $session_id, $db_max_size_str, $db_max_rows_str, $file_chunk_size_str, $skip_db, $file_chunk_max_size_str, $skip_files, $exclude_paths, $skip_checksums);
+                
+                self::sync($sync_folder);
                 break;
+
             case 'ncdu':
-                if ($argc < 3) {
-                    echo "Error: Invalid arguments for ncdu\nRequires: <site-url> [--session-id=<id>] [--debug]\n";
-                    exit(1);
-                }
-                $siteUrl = $argv[2];
-                $session_id = null;
-                $debug = false;
-
-                // Parse arguments
-                $args = array_slice($argv, 3);
-                foreach ($args as $arg) {
-                    if (strpos($arg, '--session-id=') === 0) {
-                        $session_id = substr($arg, strlen('--session-id='));
-                    } elseif ($arg === '--debug') {
-                        $debug = true;
-                    } else {
-                        echo "Error: Unknown argument '{$arg}'\n";
-                        self::showHelp();
-                        exit(1);
-                    }
-                }
-                self::ncdu($siteUrl, $session_id, $debug);
+                self::ncdu();
                 break;
+
             default:
-                echo "Error: Unknown command '$command'.\n\n";
+                echo "Error: Unknown command '$command'.\n";
                 self::showHelp();
                 exit(1);
         }
@@ -330,10 +286,10 @@ class Run {
         echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
     }
 
-    private static function make_request($siteUrl, $token, $backup_token, $endpoint, $payload = [], $method = 'POST') {
+    private static function make_request($endpoint, $payload = [], $method = 'POST') {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'];
-        $data = array_merge(['token' => $token, 'backup_token' => $backup_token], $payload);
-        $url = "$siteUrl/wp-json/disembark/v1" . $endpoint;
+        $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
+        $url = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
         $options = ['verify' => false, 'timeout' => 600]; // Standard timeout for most steps
 
         try {
@@ -416,12 +372,11 @@ class Run {
      * Can optionally request file checksums for sync operations.
      * @return array List of manifest chunk file objects.
      */
-    private static function runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, $include_checksums = false) {
-
+    private static function runManifestGeneration($include_checksums = false) {
         $files_manifests = [];
         try {
             echo "Running analysis (this may take a while)...\n";
-            $exclude_files_string = implode("\n", $exclude_paths);
+            $exclude_files_string = implode("\n", self::$exclude_paths);
 
             $payload = [
                 'exclude_files' => $exclude_files_string
@@ -431,14 +386,16 @@ class Run {
             }
 
             // Step 1: Initiate
-            self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'initiate'] + $payload, 'POST');
+            // Simplified make_request signature: (endpoint, payload, method)
+            self::make_request('/regenerate-manifest', ['step' => 'initiate'] + $payload, 'POST');
             echo "Initiated file scan.\n";
 
             // Step 2: Scan Loop
             $scan_complete = false;
             $last_scan_output = "";
             while (!$scan_complete) {
-                $scan_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'scan'] + $payload, 'POST');
+                $scan_response = self::make_request('/regenerate-manifest', ['step' => 'scan'] + $payload, 'POST');
+                
                 if (!is_object($scan_response) || !isset($scan_response->status)) {
                     throw new \Exception("Invalid response received during scan step.");
                 }
@@ -450,29 +407,27 @@ class Run {
                 } else if (isset($scan_response->scanned_dirs) && isset($scan_response->total_dirs)) {
                     $last_scan_output = sprintf("Scanning... (%d / %d directories)", $scan_response->scanned_dirs, $scan_response->total_dirs);
                     echo $last_scan_output . "\r";
-                } else {
-                    echo "\nWarning: Scan step response might be incomplete.\n";
                 }
                 usleep(250000);
             }
 
             // Step 3: Chunkify
             echo "Chunkifying file list...\n";
-            $chunk_response = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'chunkify'] + $payload, 'POST');
+            $chunk_response = self::make_request('/regenerate-manifest', ['step' => 'chunkify'] + $payload, 'POST');
             $total_chunks = $chunk_response->total_chunks ?? 0;
+            
             if ($total_chunks === 0) {
                 echo "No files found to analyze or an error occurred during chunkification.\n";
             } else {
                 echo "File list divided into {$total_chunks} chunks.\n";
             }
 
-
             // Step 4: Process Chunks
             $last_chunk_output = "";
             for ($i = 1; $i <= $total_chunks; $i++) {
                 $last_chunk_output = sprintf("Processing chunk %d of %d...", $i, $total_chunks);
                 echo $last_chunk_output . "\r";
-                self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i] + $payload, 'POST');
+                self::make_request('/regenerate-manifest', ['step' => 'process_chunk', 'chunk' => $i] + $payload, 'POST');
                 usleep(50000);
             }
             if ($total_chunks > 0) {
@@ -480,62 +435,58 @@ class Run {
                 echo "Chunk processing complete.\n";
             }
 
-
             // Step 5: Finalize
-            $files_manifests = self::make_request($siteUrl, $token, $backup_token, '/regenerate-manifest', ['step' => 'finalize'] + $payload, 'POST');
+            $files_manifests = self::make_request('/regenerate-manifest', ['step' => 'finalize'] + $payload, 'POST');
+            
             if (!is_array($files_manifests)) {
                 echo "Warning: Final manifest data is not in the expected format. File stats may be inaccurate.\n";
                 $files_manifests = [];
             }
             echo "Analysis complete.\n";
+
         } catch (\Exception $e) {
             echo "Error during file analysis: {$e->getMessage()}\n";
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token); // Attempt cleanup
+            self::cleanupTemporaryFiles();
             exit(1);
         }
 
-        // Return the generated manifest
         return $files_manifests;
     }
 
-    private static function displayBackupSummary($siteUrl, $token, $files_manifests, $exclude_tables) {
-        // 2. Fetch database info
+    private static function displayBackupSummary($files_manifests) {
+        // 1. Fetch database info (using simplified make_request)
         $all_tables = [];
         try {
-            $response_db = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-            if ($response_db->status_code !== 200) {
-                echo "Error: Failed to fetch database info. HTTP response code: {$response_db->status_code}\n";
-                exit(1);
-            }
-            $all_tables = json_decode($response_db->body);
-            if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                echo "Error: Invalid database info received.\n";
-                $all_tables = [];
-            }
-        } catch (\WpOrg\Requests\Exception $e) {
+            $all_tables = self::make_request('/database', [], 'GET');
+            if (!is_array($all_tables)) $all_tables = [];
+        } catch (\Exception $e) {
             echo "Error: Failed to fetch database info: {$e->getMessage()}\n";
             exit(1);
         }
 
-        // 3. Calculate file stats TO BE BACKED UP
+        // 2. Calculate file stats
         $remainingFiles = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'count'));
         $remainingSize = empty($files_manifests) ? 0 : array_sum(array_column($files_manifests, 'size'));
-        // 4. Calculate database stats
+
+        // 3. Calculate database stats
         $totalTables = count($all_tables);
         $totalDbSize = empty($all_tables) ? 0 : array_sum(array_column($all_tables, 'size'));
         $excludedTables = 0;
         $excludedDbSize = 0;
-
         $included_table_list = [];
+
         foreach ($all_tables as $table) {
             $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
             $is_excluded = false;
-            foreach ($exclude_tables as $pattern) {
+            
+            // Check against self::$exclude_tables
+            foreach (self::$exclude_tables as $pattern) {
                 if (fnmatch($pattern, $table->table)) {
                     $is_excluded = true;
                     break;
                 }
             }
+
             if ($is_excluded) {
                 $excludedTables++;
                 $excludedDbSize += $table_size;
@@ -547,11 +498,11 @@ class Run {
         $remainingTables = $totalTables - $excludedTables;
         $remainingDbSize = empty($included_table_list) ? 0 : array_sum(array_column($included_table_list, 'size'));
 
-
-        // 5. Display results
-        echo "\nBackup Preview: $siteUrl\n";
+        // 4. Display results
+        echo "\nBackup Preview: " . self::$siteUrl . "\n";
         echo "* Exclusions are applied server-side during analysis.\n";
         echo "* The summary below shows only files and tables scheduled for backup.\n\n";
+        
         echo "File Backup Summary\n";
         printf("%-24s %12s %12s\n", "", "Count", "Size");
         printf("%-24s %12s %12s\n", str_repeat('-', 24), str_repeat('-', 12), str_repeat('-', 12));
@@ -566,43 +517,61 @@ class Run {
         echo "\n* This is an estimate. Actual backup size may vary.\n";
     }
 
-    private static function runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables) {
+    private static function runPreview($is_preview_mode) {
 
         // 1. Run the manifest generation
-        $files_manifests = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
+        $files_manifests = self::runManifestGeneration(false);
+
         // 2. Display the summary
-        self::displayBackupSummary($siteUrl, $token, $files_manifests, $exclude_tables);
-        // 3. Return the generated manifest
+        self::displayBackupSummary($files_manifests);
+
+        // 3. Handle Preview Exit
+        if ($is_preview_mode) {
+            self::cleanupTemporaryFiles();
+            exit(0);
+        }
+
+        // 4. Return the generated manifest for the actual backup
         return $files_manifests;
     }
 
-    // Helper function specifically for cleanup after preview or backup failure
-    private static function cleanupTemporaryFiles($siteUrl, $token, $backup_token) {
+    /**
+     * Renders a CLI progress bar string.
+     */
+    private static function draw_progress_bar($done, $total, $width = 20) {
+        if ($total < 1) return str_repeat(' ', $width + 7);
+        $perc = min(100, round(($done / $total) * 100));
+        $bar_filled = round(($width * $perc) / 100);
+        $bar = '[' . str_repeat('=', $bar_filled) . str_repeat(' ', $width - $bar_filled) . ']';
+        return sprintf("%s %3d%%", $bar, $perc);
+    }
+
+    /**
+     * Helper function specifically for cleanup after preview or backup failure
+     */
+    private static function cleanupTemporaryFiles() {
         echo "Cleaning up temporary files on server...\n";
         try {
-            $payload = ['backup_token' => $backup_token];
-            self::make_request($siteUrl, $token, $backup_token, '/cleanup', $payload, 'GET');
+            $payload = ['backup_token' => self::$backup_token];
+            self::make_request('/cleanup', $payload, 'GET');
             echo "Cleanup request sent.\n";
         } catch (\Exception $e) {
             echo "Warning: Cleanup request failed: {$e->getMessage()}\n";
-            // Don't exit here, cleanup failure is not critical for the overall process
         }
     }
 
     /**
      * Helper to download large files via public URL.
      */
-    private static function fetch_large_file_publicly($siteUrl, $file, $local_destination) {
+    private static function fetch_large_file_publicly($file, $local_destination) {
         $file_size_human = self::humanFilesize($file->size);
         echo "   > Large file detected ($file_size_human). Attempting public direct download...\n";
-
-        // Construct public URL (handling spaces/special chars)
+        
         $path_parts = explode('/', $file->name);
         $encoded_parts = array_map('rawurlencode', $path_parts);
-        $public_url = $siteUrl . '/' . implode('/', $encoded_parts);
+        $public_url = self::$siteUrl . '/' . implode('/', $encoded_parts);
 
         echo "     Downloading: $public_url\n";
-        
         try {
             self::download_file_direct($public_url, $local_destination);
             echo "     - Download complete.\n";
@@ -616,11 +585,11 @@ class Run {
     /**
      * Downloads a large file via the stream API in chunks (e.g., 50MB) to avoid PHP timeouts.
      */
-    private static function download_file_chunked_stream($siteUrl, $token, $relative_path, $destination, $total_size) {
+    private static function download_file_chunked_stream($relative_path, $destination, $total_size) {
         $chunk_size = 50 * 1024 * 1024; // 50 MB chunks
         $offset = 0;
-        // Open destination for writing (append mode not needed if we start fresh, but we need random access or just append)
-        // We will open in 'w' first to clear it, then append chunks
+        
+        // Open destination for writing
         $fp = fopen($destination, 'w');
         if (!$fp) throw new \Exception("Could not open local file for writing: $destination");
         fclose($fp);
@@ -628,6 +597,7 @@ class Run {
         $progress_bar_width = 20;
         while ($offset < $total_size) {
             $length = min($chunk_size, $total_size - $offset);
+            
             // Calculate progress
             $percent = min(100, round(($offset / $total_size) * 100));
             $downloaded_human = self::humanFilesize($offset);
@@ -635,6 +605,7 @@ class Run {
             
             echo str_pad("", 80, " ") . "\r"; // Clear line
             echo "     - Streaming Chunk: {$downloaded_human} / {$total_human} ({$percent}%)...\r";
+            
             $attempts = 0;
             $max_attempts = 5;
             $chunk_success = false;
@@ -642,13 +613,17 @@ class Run {
             while ($attempts < $max_attempts && !$chunk_success) {
                 $attempts++;
                 try {
-                    $endpoint_url = $siteUrl . '/wp-json/disembark/v1/stream-file';
+                    // UPDATED: Use self::$siteUrl
+                    $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                    
+                    // UPDATED: Use self::$token
                     $payload = json_encode([
-                        'token' => $token, 
+                        'token' => self::$token, 
                         'file' => $relative_path,
                         'offset' => $offset,
                         'length' => $length
                     ]);
+
                     $headers = ['Content-Type' => 'application/json'];
                     
                     $options = [
@@ -656,13 +631,13 @@ class Run {
                         'timeout' => 300, // 5 minutes per 50MB chunk should be plenty
                         'connect_timeout' => 30,
                     ];
+                    
                     $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
 
                     if (!$response->success) {
                          throw new \Exception("HTTP {$response->status_code}");
                     }
                     
-                    // Verify we got the data we asked for
                     if (strlen($response->body) != $length) {
                         // Sometimes server might send less if EOF, but we calculated EOF.
                     }
@@ -673,10 +648,9 @@ class Run {
 
                 } catch (\Exception $e) {
                     if ($attempts < $max_attempts) {
-                        // Clear progress bar line to show retry message cleanly
                         echo str_pad("", 80, " ") . "\r"; 
                         echo "     - Retry ($attempts/$max_attempts) for offset $offset...\r";
-                        sleep(2); // Wait before retry
+                        sleep(2);
                     } else {
                         throw new \Exception("Failed to download chunk at offset $offset: " . $e->getMessage());
                     }
@@ -694,21 +668,22 @@ class Run {
     /**
      * Processes the database backup using hybrid batching.
      *
-     * @param string $siteUrl
-     * @param string $token
-     * @param string $backup_token
      * @param array $tables_to_backup List of table objects to be backed up.
      * @param string $db_export_file The final, local SQL file path to append to.
      * @param string $local_db_parts_path A temporary directory to store downloaded SQL chunks.
      * @throws \Exception
      */
-    private static function processDatabaseBackup($siteUrl, $token, $backup_token, $tables_to_backup, $db_export_file, $local_db_parts_path, $max_size, $max_rows) {
+    private static function processDatabaseBackup($tables_to_backup, $db_export_file, $local_db_parts_path) {
         
         echo "Backing up database tables...\n";
+        
+        // Use static thresholds
+        $max_size = self::$db_max_size;
+        $max_rows = self::$db_max_rows;
+
         // --- Hybrid Batching Logic ---
         $large_tables = [];
         $small_tables = [];
-
         foreach ($tables_to_backup as $table) {
             $table_size = isset($table->size) && is_numeric($table->size) ? (float)$table->size : 0;
             $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
@@ -751,7 +726,7 @@ class Run {
             $total_db_steps += ($table->parts > 0) ? $table->parts : 1;
         }
         $current_db_step = 0;
-
+        
         // --- Loop 1: Process small table batches ---
         foreach ($small_table_batches as $batch) {
             $current_db_step++;
@@ -760,7 +735,9 @@ class Run {
             $progress_message = sprintf(" - Exporting batch %d/%d (%d tables, %s)", $current_db_step, $total_db_steps, count($batch), self::humanFilesize($batch_size));
             echo $progress_message . "...\r";
 
-            $file_url = self::make_request($siteUrl, $token, $backup_token, "/export-database-batch", ['tables' => $table_names], 'POST');
+            // Simplified make_request
+            $file_url = self::make_request("/export-database-batch", ['tables' => $table_names], 'POST');
+            
             if (strpos($file_url, 'http') !== 0) {
                 throw new \Exception("Export failed for batch, did not receive a valid URL. Got: $file_url");
             }
@@ -769,12 +746,14 @@ class Run {
 
             $parsed_url = parse_url($file_url);
             $relative_path = ltrim($parsed_url['path'], '/');
-            self::download_db_file($siteUrl, $token, $relative_path, $local_file_path);
+            
+            // Simplified download call
+            self::download_db_file($relative_path, $local_file_path);
 
             file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-            unlink($local_file_path); // Delete local SQL part
+            unlink($local_file_path); 
 
-            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+            self::make_request('/cleanup-file', ['file_name' => $file_name], 'POST');
             echo $progress_message . " - Done.\n";
             usleep(50000);
         }
@@ -791,36 +770,29 @@ class Run {
                 $total_table_size = (float)$table->size;
                 $row_count = isset($table->row_count) && is_numeric($table->row_count) ? (int)$table->row_count : 0;
                 
-                // Determine what the size of this part *should* be for logging
                 $current_part_size = 0;
-                
-                // Recalculate parts to see which logic won
                 $parts_by_size = ($max_size > 0) ? ceil($total_table_size / $max_size) : 1;
                 $parts_by_rows = ($max_rows > 0) ? ceil($row_count / $max_rows) : 1;
                 
                 if ($parts_by_rows > $parts_by_size) {
-                    // Row-based split. Estimate size.
                     $current_part_size = $total_table_size / $table->parts;
                 } else {
-                    // Size-based split.
                     $current_part_size = $max_size;
                 }
 
                 if ($part == $table->parts) {
-                    // Last part. Calculate remaining size.
-                    // This is the size of all previous parts.
                     $previous_parts_size = $current_part_size * ($table->parts - 1);
                     $current_part_size = $total_table_size - $previous_parts_size;
                 }
                 
                 $description = sprintf("%s %d/%d", $table->table, $part, $table->parts);
-                // Use max(0, ...) to prevent any weird negative display
                 $size_string = self::humanFilesize(max(0, $current_part_size));
                 $progress_message = sprintf(" - Exporting batch %d/%d (%s, %s)", $current_db_step, $total_db_steps, $description, $size_string);
                 echo $progress_message . "...\r";
                 
                 $part_data = ['parts' => $part, 'rows_per_part' => $table->rows_per_part];
-                $file_url = self::make_request($siteUrl, $token, $backup_token, "/export/database/{$table->table}", $part_data, 'POST');
+                $file_url = self::make_request("/export/database/{$table->table}", $part_data, 'POST');
+                
                 if (strpos($file_url, 'http') !== 0) {
                     throw new \Exception("Export failed, did not receive a valid URL. Got: $file_url");
                 }
@@ -829,11 +801,13 @@ class Run {
 
                 $parsed_url = parse_url($file_url);
                 $relative_path = ltrim($parsed_url['path'], '/');
-                self::download_db_file($siteUrl, $token, $relative_path, $local_file_path);
+                
+                self::download_db_file($relative_path, $local_file_path);
+                
                 file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-                unlink($local_file_path); // Delete local SQL part
+                unlink($local_file_path);
 
-                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
+                self::make_request('/cleanup-file', ['file_name' => $file_name], 'POST');
                 echo $progress_message . " - Done.\n";
                 usleep(50000);
             }
@@ -842,54 +816,23 @@ class Run {
     }
 
    /**
-     * Performs a local or remote sync.
+     * Synchronizes the remote site to a local folder (Remote -> Local).
      */
-    private static function sync($siteUrl, $folder, $debug = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $file_chunk_size_str = null, $skip_db = false, $file_chunk_max_size_str = null, $skip_files = false, $exclude_paths = [], $skip_checksums = false) {
-        // --- 1. Authentication ---
-        $siteUrl = rtrim($siteUrl, '/');
-        if (!preg_match('/^https?:\/\//', $siteUrl)) {
-            $siteUrl = "https://$siteUrl";
-        }
-        $homeDir = getenv('HOME');
-        if (!$homeDir) {
-            echo "Error: Unable to determine the home directory.\n";
-            exit(1);
-        }
-        $filePath = $homeDir . '/.disembark';
-        $data = [];
-        if (file_exists($filePath)) {
-            $data = json_decode(file_get_contents($filePath));
-            if (!is_array($data)) {
-                if (is_object($data)) $data = [$data];
-                else {
-                    echo "Error: Invalid data in $filePath.\n";
-                    exit(1);
-                }
+    private static function sync($folder) {
+
+        // 1. Setup Session / Backup Token
+        if (self::$session_id) {
+            self::$backup_token = self::$session_id;
+            echo "Reusing backup session: " . self::$backup_token . "\n";
+            if (!self::$skip_checksums) {
+                self::$skip_checksums = true;
+                echo " - Forcing --skip-checksums (GUI sessions do not contain checksum data).\n";
             }
         } else {
-            echo "Error: No configuration file found at $filePath.\n";
-            exit(1);
-        }
-        $token = null;
-        foreach ($data as $entry) {
-            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                $token = $entry->token;
-                break;
-            }
-        }
-        if (empty($token)) {
-            echo "Error: No token found for $siteUrl.\n";
-            exit(1);
+            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
         }
 
-        // --- 2. Setup ---
-        $backup_token = "";
-        if ($session_id) {
-            $backup_token = $session_id;
-            echo "Reusing backup session: $backup_token\n";
-        } else {
-            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
-        }
+        // 2. Folder Setup
         $is_initial_sync = !is_dir($folder);
         if ($is_initial_sync) {
             echo "Performing initial sync to new folder: $folder\n";
@@ -901,264 +844,140 @@ class Run {
             echo "Performing subsequent sync to existing folder: $folder\n";
         }
 
-        // Convert DB threshold arguments, using defaults if not provided
-        $db_max_size = $db_max_size_str ? self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
-        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000; // 1M rows default
-        $file_chunk_size = $file_chunk_size_str ? (int)$file_chunk_size_str : 2500; // 2500 files default
-        $file_chunk_max_size = $file_chunk_max_size_str ? self::convert_to_bytes($file_chunk_max_size_str) : 524288000; // 500MB default
-
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
+
         try {
-            if (!$skip_db) {
-                // --- 3. Database Sync (Always run) ---
+            // --- Database Sync ---
+            if (!self::$skip_db) {
                 echo "Starting database sync...\n";
                 if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
                     throw new \Exception("Could not create temp DB directory.");
                 }
-                $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
-                if (file_put_contents($db_export_file, $sql_header) === false) {
+                
+                if (file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
                     throw new \Exception("Could not write to local SQL file.");
                 }
 
-                // Fetch the full database list
-                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-                if ($response->status_code !== 200 || empty($response->body)) throw new \Exception("Could not get list of database tables.");
-                $database = json_decode($response->body);
-                if (json_last_error() !== JSON_ERROR_NONE || !is_array($database)) throw new \Exception("Invalid database list received.");
-                // Sync always backs up all tables, so we pass the full $database list
-                self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_parts_path, $db_max_size, $db_max_rows);
-                self::delete_directory($local_db_parts_path); // Clean up temp dir
+                $database = self::make_request('/database', [], 'GET');
+                if (!is_array($database)) throw new \Exception("Invalid database list received.");
+
+                self::processDatabaseBackup($database, $db_export_file, $local_db_parts_path);
+                self::delete_directory($local_db_parts_path);
             } else {
                 echo "Skipping database sync as requested.\n";
             }
 
-            if (!$skip_files) {
-                // --- 4. File Sync ---
+            // --- File Sync ---
+            if (!self::$skip_files) {
                 $files_manifest_chunks = [];
-                if ($session_id) {
+
+                if (self::$session_id) {
                     echo "Fetching existing manifest for sync...\n";
                     try {
-                        $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+                        $files_manifest_chunks = self::make_request('/manifest', [], 'GET');
                         if (!is_array($files_manifest_chunks)) {
-                            throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid?");
+                            throw new \Exception("Could not fetch or parse existing manifest.");
                         }
                         echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
                     } catch (\Exception $e) {
                         echo "Error fetching manifest: {$e->getMessage()}\n";
-                        if (!$session_id) {
-                            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-                        }
+                        if (!self::$session_id) self::cleanupTemporaryFiles();
                         exit(1);
                     }
                 } else {
-                    // --- Run generation if no $session_id ---
                     echo "Starting file sync analysis...\n";
-                    $include_checksums = (!$is_initial_sync && !$skip_checksums);
-                    $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, $include_checksums);
+                    $include_checksums = (!$is_initial_sync && !self::$skip_checksums);
+                    // Simplified call: excludes are now static properties
+                    $files_manifest_chunks = self::runManifestGeneration($include_checksums);
                 }
 
-                // Initial Sync Logic (Refactored for Speed & Reliability)
+                // Initial Sync Logic
                 if ($is_initial_sync) {
-                    echo "Performing initial file download...\n";
-                    $steps = count($files_manifest_chunks);
-                    $current_step = 1;
-                    $large_file_threshold = 209715200; // 200MB
+                    echo "Performing initial file download (Optimized)...\n";
+                    echo "Fetching remote file manifest...\n";
+                    // Simplified call: excludes are now static properties
+                    list($remote_files_map, $all_files_debug) = self::fetch_manifests_parallel($files_manifest_chunks);
+                    
+                    $large_files_queue = [];
+                    $small_files_queue = [];
 
-                    foreach ($files_manifest_chunks as $file_manifest) {
-                        if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) {
-                            $current_step++;
-                            continue;
+                    foreach ($remote_files_map as $file) {
+                        $fsize = isset($file->size) ? (int)$file->size : 0;
+                        if ($fsize > self::$large_file_threshold) {
+                            $large_files_queue[] = $file;
+                        } else {
+                            $small_files_queue[] = $file;
                         }
-                        $size = self::humanFilesize($file_manifest->size);
-                        // Print initial status
-                        $progress_message = sprintf(" - Processing chunk %d/%d (%s)...", $current_step, $steps, $size);
-                        echo $progress_message . "\r";
+                    }
 
-                        // 1. Download Manifest First (Smart Logic)
-                        $temp_json_path = $folder . '/' . $file_manifest->name;
-                        try {
-                            self::download_file_direct($file_manifest->url, $temp_json_path);
-                            $chunk_files = json_decode(file_get_contents($temp_json_path));
-                            unlink($temp_json_path);
-                        } catch (\Exception $e) {
-                             echo "\nWarning: Could not download manifest for chunk $current_step. Skipping.\n";
-                             $current_step++;
-                             continue;
-                        }
+                    if (!empty($large_files_queue)) {
+                        self::download_files_parallel($large_files_queue, $folder);
+                    }
 
-                        if (!is_array($chunk_files)) {
-                             $current_step++;
-                             continue;
-                        }
+                    if (!empty($small_files_queue)) {
+                        $total_small = count($small_files_queue);
+                        echo " - Processing $total_small small files via zip batches...\n";
+                        
+                        $file_chunks = [];
+                        $current_chunk = [];
+                        $current_chunk_size = 0;
 
-                        // 2. Filter Exclusions Locally
-                        $files_to_process = [];
-                        foreach ($chunk_files as $f) {
-                            $is_excluded = false;
-                            foreach ($exclude_paths as $exclude_path) {
-                                if ($f->name === $exclude_path || strpos($f->name, $exclude_path . '/') === 0) {
-                                    $is_excluded = true;
-                                    break;
-                                }
-                            }
-                            if (!$is_excluded) {
-                                $files_to_process[] = $f;
-                            }
-                        }
-
-                        if (empty($files_to_process)) {
-                            echo $progress_message . " Skipped (All files excluded).\n";
-                            $current_step++;
-                            continue;
-                        }
-
-                        // 3. Split Large vs Small Files
-                        $large_files = [];
-                        $small_files = [];
-                        foreach ($files_to_process as $f) {
-                            if (isset($f->size) && $f->size > $large_file_threshold) {
-                                $large_files[] = $f;
+                        foreach ($small_files_queue as $file) {
+                            $fsize = $file->size ?? 0;
+                            if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
+                                $file_chunks[] = $current_chunk;
+                                $current_chunk = [$file];
+                                $current_chunk_size = $fsize;
                             } else {
-                                $small_files[] = $f;
+                                $current_chunk[] = $file;
+                                $current_chunk_size += $fsize;
                             }
                         }
+                        if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
 
-                        // 4. Download Large Files Directly (Immediately!)
-                        foreach ($large_files as $lf) {
-                            // Clear the progress line to prevent messy overlap
-                            echo str_pad("", 80, " ") . "\r";
-                            
-                            // We rely on fetch_large_file_publicly to print the "Large file detected" message
-                            $local_destination = $folder . '/' . $lf->name;
-                            $local_dir = dirname($local_destination);
-                            if (!is_dir($local_dir)) @mkdir($local_dir, 0755, true);
-                            if (!self::fetch_large_file_publicly($siteUrl, $lf, $local_destination)) {
-                                try {
-                                    self::download_file_chunked_stream($siteUrl, $token, $lf->name, $local_destination, $lf->size);
-                                } catch (\Exception $e) {
-                                    echo "     - Failed to download large file {$lf->name}: {$e->getMessage()}\n";
-                                }
-                            }
-                            // Restore the progress message after the large file is done
-                            echo $progress_message . "\r";
-                        }
-
-                        // 5. Zip remaining small files
-                        if (!empty($small_files)) {
-                            // Update message to indicate server work
-                            echo $progress_message . " (Requesting server-side zip...)\r";
-                            
+                        $total_zip_chunks = count($file_chunks);
+                        foreach ($file_chunks as $i => $chunk) {
+                            $chunk_num = $i + 1;
+                            echo " - Processing zip chunk $chunk_num/$total_zip_chunks (" . count($chunk) . " files)...\n";
                             try {
-                                // Use zip-sync-files to send our filtered list
-                                $zip_payload = ['files' => $small_files];
-                                $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', $zip_payload, 'POST');
-                                
-                                if (strpos($file_url, 'http') === 0) {
-                                    $file_name = basename($file_url);
-                                    $local_zip_chunk_path = $folder . '/' . $file_name;
-                                    self::download_file_direct($file_url, $local_zip_chunk_path);
-                                    self::unzip_file($local_zip_chunk_path, $folder);
-                                    unlink($local_zip_chunk_path);
-                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                                    // Clear line and print Done
-                                    echo str_pad("", 80, " ") . "\r";
-                                    echo $progress_message . " Done.                          \n";
+                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
+                                if (strpos($url, 'http') === 0) {
+                                    $fname = basename($url);
+                                    $lpath = $folder . '/' . $fname;
+                                    self::download_file_direct($url, $lpath);
+                                    self::unzip_file($lpath, $folder);
+                                    unlink($lpath);
+                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
                                 } else {
-                                    throw new \Exception("Invalid zip URL received.");
+                                     throw new \Exception("Invalid zip URL received.");
                                 }
                             } catch (\Exception $e) {
-                                echo "\nWarning: Zip failed for chunk $current_step. Falling back to individual downloads.\n";
-                                // Fallback for small files
-                                foreach ($small_files as $sf) {
-                                     $local_dst = $folder . '/' . $sf->name;
-                                     $local_d = dirname($local_dst);
-                                     if (!is_dir($local_d)) @mkdir($local_d, 0755, true);
-                                     try {
-                                         echo "   - Downloading: {$sf->name}\r";
-                                         self::download_file_via_stream($siteUrl, $token, $sf->name, $local_dst);
-                                     } catch (\Exception $fe) {
-                                         echo "\n   - Failed: {$sf->name}\n";
-                                     }
+                                echo "\nWarning: Zip failed for chunk $chunk_num. Falling back to stream.\n";
+                                foreach ($chunk as $f) {
+                                    $ldest = $folder . '/' . $f->name;
+                                    $ldir = dirname($ldest);
+                                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
+                                    try {
+                                        self::download_file_via_stream($f->name, $ldest);
+                                    } catch (\Exception $fe) {
+                                        echo "   - Failed to download: {$f->name}\n";
+                                    }
                                 }
-                                echo str_pad("", 80, " ") . "\r";
                             }
-                        } else {
-                            // If we only had large files, we are done with this chunk
-                             echo str_pad("", 80, " ") . "\r";
-                             echo $progress_message . " Done.                          \n";
                         }
-
-                        $current_step++;
                     }
                     echo "Initial file sync complete.\n";
+
                 } else {
-                    // --- 4b. Subsequent Sync (Diff) ---
+                    // Subsequent Sync (Diff)
                     echo "Fetching remote file manifest...\n";
-                    $remote_files_map = [];
-                    $all_remote_files = []; 
-
-                    // --- Parallel Manifest Download (Batched) ---
-                    $batch_size = 25; // Download 25 chunks at a time
-                    $manifest_batches = array_chunk($files_manifest_chunks, $batch_size);
-                    $total_batches = count($manifest_batches);
-                    $current_batch = 0;
-
-                    foreach ($manifest_batches as $batch) {
-                        $current_batch++;
-                        echo " - Downloading manifest chunks (Batch $current_batch / $total_batches)...\r";
-                        
-                        $requests_data = [];
-                        foreach ($batch as $file_manifest) {
-                            if (isset($file_manifest->url)) {
-                                $requests_data[$file_manifest->name] = [
-                                    'url' => $file_manifest->url
-                                ];
-                            }
-                        }
-
-                        $request_options = [
-                            'verify' => false,
-                            'timeout' => 300, 
-                            'connect_timeout' => 30,
-                        ];
-
-                        try {
-                            // Execute parallel requests
-                            $responses = \WpOrg\Requests\Requests::request_multiple($requests_data, $request_options);
-
-                            foreach ($responses as $name => $response) {
-                                if ($response->success) {
-                                    $files = json_decode($response->body);
-                                    if (is_array($files)) {
-                                        foreach ($files as $file) {
-                                            if (isset($file->name)) {
-                                                // Filter exclusions
-                                                $is_excluded = false;
-                                                foreach ($exclude_paths as $exclude_path) {
-                                                    if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
-                                                        $is_excluded = true;
-                                                        break;
-                                                    }
-                                                }
-                                                if ($is_excluded) continue;
-                                                $remote_files_map[$file->name] = $file;
-                                                $all_remote_files[] = $file; 
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    echo "\nWarning: Failed to download manifest chunk $name. Status: {$response->status_code}\n";
-                                }
-                            }
-                        } catch (\Exception $e) {
-                             echo "\nWarning: Batch request failed: " . $e->getMessage() . "\n";
-                        }
-                    }
-                    echo str_pad("", 80, " ") . "\r"; // Clear line
+                    list($remote_files_map, $all_remote_files) = self::fetch_manifests_parallel($files_manifest_chunks);
+                    echo str_pad("", 80, " ") . "\r";
 
                     echo "Generating local file manifest...\n";
-                    $local_files_map = self::generate_local_manifest($folder, $skip_checksums);
+                    // Pass static property skip_checksums
+                    $local_files_map = self::generate_local_manifest($folder, self::$skip_checksums);
 
                     echo "Comparing manifests and syncing changes...\n";
                     $files_to_download = [];
@@ -1167,8 +986,7 @@ class Run {
                     foreach ($remote_files_map as $path => $remote_file) {
                         $local_file = $local_files_map[$path] ?? null;
                         $should_download = false;
-                        if ($skip_checksums) {
-                            // --- Smart Checksum (Size Check) ---
+                        if (self::$skip_checksums) {
                             if (!$local_file || (isset($local_file->size) && isset($remote_file->size) && $local_file->size !== $remote_file->size)) {
                                 $should_download = true;
                             }
@@ -1183,7 +1001,6 @@ class Run {
                         if (!isset($remote_files_map[$path])) $files_to_delete[] = $path;
                     }
 
-                    // Download new/changed files
                     if (!empty($files_to_download)) {
                         $total_files_to_download = count($files_to_download);
                         echo " - Syncing $total_files_to_download new/changed file(s)...\n";
@@ -1191,53 +1008,56 @@ class Run {
                         $file_chunks = [];
                         $current_chunk = [];
                         $current_chunk_size = 0;
+                        $large_files_parallel_queue = [];
+
                         foreach ($files_to_download as $file) {
-                             $fsize = $file->size ?? 0;
-                             // Large File Check
-                             if ($fsize > 209715200) {
-                                 if (!empty($current_chunk)) { $file_chunks[] = $current_chunk; $current_chunk = []; $current_chunk_size = 0; }
-                                 // Handle large file immediately
-                                 echo str_pad("", 80, " ") . "\r";
-                                 // Let fetch_large_file_publicly handle the "Large file detected" text
-                                 $local_dest = $folder . '/' . $file->name;
-                                 if (!self::fetch_large_file_publicly($siteUrl, $file, $local_dest)) {
-                                     self::download_file_chunked_stream($siteUrl, $token, $file->name, $local_dest, $fsize);
-                                 }
-                                 continue;
-                             }
-                             
-                             if ( ($current_chunk_size + $fsize > $file_chunk_max_size) || (count($current_chunk) >= $file_chunk_size) ) {
-                                 $file_chunks[] = $current_chunk;
-                                 $current_chunk = [$file];
-                                 $current_chunk_size = $fsize;
-                             } else {
-                                 $current_chunk[] = $file;
-                                 $current_chunk_size += $fsize;
-                             }
+                            $fsize = $file->size ?? 0;
+                            
+                            if ($fsize > self::$large_file_threshold) {
+                                if (!empty($current_chunk)) { 
+                                    $file_chunks[] = $current_chunk;
+                                    $current_chunk = []; 
+                                    $current_chunk_size = 0; 
+                                }
+                                $large_files_parallel_queue[] = $file;
+                                continue;
+                            }
+                            
+                            if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
+                                $file_chunks[] = $current_chunk;
+                                $current_chunk = [$file];
+                                $current_chunk_size = $fsize;
+                            } else {
+                                $current_chunk[] = $file;
+                                $current_chunk_size += $fsize;
+                            }
                         }
                         if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
+
+                        if (!empty($large_files_parallel_queue)) {
+                            self::download_files_parallel($large_files_parallel_queue, $folder);
+                        }
+
                         $total_chunks = count($file_chunks);
                         foreach ($file_chunks as $i => $chunk) {
                             $chunk_num = $i + 1;
-                            // --- FIX: Output Newline (\n) instead of \r ---
                             echo " - Processing sync chunk $chunk_num/$total_chunks (" . count($chunk) . " files)...\n";
                             try {
-                                $url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
+                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
                                 if (strpos($url, 'http')===0) {
                                     $fname = basename($url);
                                     $lpath = $folder . '/' . $fname;
                                     self::download_file_direct($url, $lpath);
                                     self::unzip_file($lpath, $folder);
                                     unlink($lpath);
-                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $fname], 'POST');
+                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
                                 }
                             } catch (\Exception $e) {
-                                // Fallback
                                 foreach ($chunk as $f) {
                                     $ldest = $folder . '/' . $f->name;
                                     $ldir = dirname($ldest);
                                     if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
-                                    self::download_file_via_stream($siteUrl, $token, $f->name, $ldest);
+                                    self::download_file_via_stream($f->name, $ldest);
                                 }
                             }
                         }
@@ -1247,7 +1067,6 @@ class Run {
                         echo " - No new or changed files to download.\n";
                     }
 
-                    // Delete files
                     if (!empty($files_to_delete)) {
                         foreach ($files_to_delete as $path) {
                             echo " - Removing: $path\n";
@@ -1265,15 +1084,14 @@ class Run {
             }
         } catch (\Exception $e) {
             echo "\nSync failed: {$e->getMessage()}\n";
-            if (!$session_id) {
-                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            if (!self::$session_id) {
+                self::cleanupTemporaryFiles();
             }
             exit(1);
         }
 
-        // --- 5. Final Cleanup ---
-        if (!$session_id) {
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        if (!self::$session_id) {
+            self::cleanupTemporaryFiles();
         } else {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
@@ -1291,12 +1109,14 @@ class Run {
         
         if (empty($file->name) || !isset($file->size)) return 0;
         
+        // Skip explicitly defined directories (trailing slash)
         if (substr($file->name, -1) === '/') {
-            return 2; 
+            return 2;
         }
 
+        // Deduplication
         if (isset($processed_files[$file->name])) {
-            return 1; 
+            return 1;
         }
         $processed_files[$file->name] = true; 
 
@@ -1306,75 +1126,78 @@ class Run {
         $file_size = (int)$file->size; 
         
         $node = &$root;
-        
         $node['count']++;
         
         $current_parts_path = [];
         
+        // Process directories in path
         foreach ($parts as $part) { 
             if (empty($part)) continue;
+
             if (!isset($node['children'][$part])) { 
-                
-                $node['children'][$part] = ['name' => $part, 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
+                // Create directory node
+                $node['children'][$part] = [
+                    'name' => $part, 
+                    'isdir' => true, 
+                    'children' => [], 
+                    'asize' => 0, 
+                    'dsize' => 0, 
+                    'count' => 0
+                ];
             } else if ($node['children'][$part]['isdir'] === false) {
-                
-                
-                
+                // Conflict: A file exists where a directory is needed.
+                // Backtrack counts for the path we just walked.
                 $root['count']--;
-                
-                
                 $temp_node = &$root;
                 foreach ($current_parts_path as $parent_part) {
                     if (isset($temp_node['children'][$parent_part])) {
                         $temp_node = &$temp_node['children'][$parent_part];
-                        
                         $temp_node['count']--;
                     }
                 }
-                
-                return 0; 
+                return 0;
             }
 
+            // Descend
             $node = &$node['children'][$part];
-            
-            
             $node['count']++;
-            $current_parts_path[] = $part; 
+            $current_parts_path[] = $part;
         }
         
+        // Process the final file
         if ($filename !== '') { 
-            
-            
             if (isset($node['children'][$filename]) && $node['children'][$filename]['isdir']) { 
-                
-                
-                
-                
+                // Conflict: A directory exists where a file is needed.
+                // Backtrack counts.
+                $root['count']--;
                 $temp_node = &$root;
-                $temp_node['count']--;
                 foreach ($parts as $part) {
                     if (isset($temp_node['children'][$part])) { 
                         $temp_node = &$temp_node['children'][$part];
-                        
                         $temp_node['count']--;
                     }
                 }
-                
-                return 3; 
+                return 3;
             } else {
-                
+                // Add file node
                 if (!isset($node['children'][$filename])) {
-                    $node['children'][$filename] = ['name' => $filename, 'asize' => $file_size, 'dsize' => $file_size, 'count' => 1, 'isdir' => false];
+                    $node['children'][$filename] = [
+                        'name' => $filename, 
+                        'asize' => $file_size, 
+                        'dsize' => $file_size, 
+                        'count' => 1, 
+                        'isdir' => false
+                    ];
                 }
             }
         }
-        return 0; 
+        return 0;
     }
 
     /**
      * Browses a remote site's file system using ncdu.
      */
-    private static function ncdu($siteUrl, $session_id = null, $debug = false) {
+    private static function ncdu() {
         // 1. Check for ncdu dependency
         $ncdu_path = trim((string) shell_exec('command -v ncdu'));
         if (empty($ncdu_path)) {
@@ -1383,170 +1206,72 @@ class Run {
             exit(1);
         }
 
-        // 2. Authentication and Token Setup
-        $siteUrl = rtrim($siteUrl, '/');
-        if (!preg_match('/^https?:\/\//', $siteUrl)) {
-            $siteUrl = "https://$siteUrl";
-        }
-        $homeDir = getenv('HOME');
-        if (!$homeDir) {
-            echo "Error: Unable to determine the home directory.\n";
-            exit(1);
-        }
-        $filePath = $homeDir . '/.disembark';
-        if (!file_exists($filePath)) {
-            echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
-            exit(1);
-        }
-        $data = json_decode(file_get_contents($filePath));
-        if (!is_array($data)) {
-            if (is_object($data)) $data = [$data];
-            else {
-                echo "Error: Invalid data in $filePath.\n";
-                exit(1);
-            }
-        }
-        $token = null;
-        foreach ($data as $entry) {
-            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                $token = $entry->token;
-                break;
-            }
-        }
-        if (empty($token)) {
-            echo "Error: No token found for $siteUrl.\n";
-            exit(1);
-        }
+        // Note: self::load_config() is already run by main()
 
-        // 3. Backup Token Setup
-        $backup_token = "";
-        if ($session_id) {
-            $backup_token = $session_id;
-            echo "Reusing backup session: $backup_token\n";
+        // 2. Backup Token Setup
+        if (self::$session_id) {
+            self::$backup_token = self::$session_id;
+            echo "Reusing backup session: " . self::$backup_token . "\n";
         } else {
-            $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
         }
 
-        // 4. Fetch Manifest
+        // 3. Fetch Manifest
         $files_manifest_chunks = [];
         try {
-            if ($session_id) {
+            if (self::$session_id) {
                 echo "Fetching existing manifest...\n";
-                $files_manifest_chunks = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
+                $files_manifest_chunks = self::make_request('/manifest', [], 'GET');
             } else {
                 echo "Generating new file manifest (this may take a while)...\n";
-                $exclude_paths = [];
-                $files_manifest_chunks = self::runManifestGeneration($siteUrl, $token, $backup_token, $exclude_paths, false);
+                // runManifestGeneration uses self::$exclude_paths automatically
+                $files_manifests = self::runManifestGeneration(false);
+                $files_manifest_chunks = $files_manifests;
             }
+            
             if (!is_array($files_manifest_chunks)) {
                 throw new \Exception("Could not fetch or parse manifest. Is the session ID valid?");
             }
         } catch (\Exception $e) {
             echo "Error: {$e->getMessage()}\n";
-            if (!$session_id) self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+            if (!self::$session_id) self::cleanupTemporaryFiles();
             exit(1);
         }
 
-        // 5. Download, Process, and Build Tree
+        // 4. Download, Process, and Build Tree
         echo "Processing remote file manifest and building tree...\n";
-        
         $ncdu_tree = ['name' => '/', 'isdir' => true, 'children' => [], 'asize' => 0, 'dsize' => 0, 'count' => 0];
-        $all_remote_files = []; // Only for debug
-        $processed_files = []; // For de-duplication
+        $processed_files = [];
 
-        if ($debug) {
+        if (self::$debug) {
             echo "Debug mode enabled, will aggregate files in memory for manifest export.\n";
         }
 
-        // --- Batching Logic ---
-        $batch_size = 25;
-        $manifest_batches = array_chunk($files_manifest_chunks, $batch_size);
-        $total_batches = count($manifest_batches);
-        $current_batch_num = 0;
-        $progress_msg = "";
+        // Fetch Parallel - fetch_manifests_parallel uses self::$exclude_paths internally
+        list($remote_files_map, $all_remote_files_debug) = self::fetch_manifests_parallel($files_manifest_chunks);
+        
         $duplicate_count = 0;
         $skipped_slash_dir_count = 0;
         $skipped_total_dir_count = 0;
 
-        try {
-            foreach ($manifest_batches as $batch) {
-                $current_batch_num++;
-                $progress_msg = sprintf("Processing batch %d of %d (downloading %d chunks)...", $current_batch_num, $total_batches, count($batch));
-                echo $progress_msg . "\r";
-
-                // Build the request array for request_multiple
-                $requests_data = [];
-                foreach ($batch as $file_manifest) {
-                    if (is_object($file_manifest) && !empty($file_manifest->url) && !empty($file_manifest->name)) {
-                        $requests_data[$file_manifest->name] = [
-                            'url' => $file_manifest->url
-                        ];
-                    }
-                }
-
-                if (empty($requests_data)) continue;
-                
-                $request_options = [
-                    'verify' => false,
-                    'timeout' => 1800, 
-                    'connect_timeout' => 30,
-                ];
-
-                $responses = \WpOrg\Requests\Requests::request_multiple($requests_data, $request_options);
-
-                foreach ($responses as $name => $response) {
-                    if (is_a($response, '\WpOrg\Requests\Response') && $response->success) {
-                        $files = json_decode($response->body);
-                        if (is_array($files)) {
-                            
-                            foreach ($files as $file) {
-                                if ($debug) {
-                                    $all_remote_files[] = $file; 
-                                }
-                                
-                                $result = self::add_file_to_ncdu_tree($ncdu_tree, $file, $processed_files);
-                                if ($result === 1) {
-                                    $duplicate_count++;
-                                } else if ($result === 2) {
-                                    $skipped_slash_dir_count++;
-                                } else if ($result === 3) {
-                                    $skipped_total_dir_count++;
-                                }
-                            }
-                        }
-                    } else {
-                        $error_msg = is_a($response, '\WpOrg\Requests\Exception') ? $response->getMessage() : "Request failed for $name";
-                        echo "\nWarning: Failed to download chunk '$name'. Error: $error_msg\n";
-                    }
-                }
-            }
-            echo str_pad("", strlen($progress_msg) + 5, " ") . "\r";
-            
-        } catch (\Exception $e) {
-            echo "Error during batch processing: {$e->getMessage()}\n";
-            if (!$session_id) self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-            exit(1);
+        foreach ($remote_files_map as $file) {
+             $result = self::add_file_to_ncdu_tree($ncdu_tree, $file, $processed_files);
+             if ($result === 1) $duplicate_count++;
+             else if ($result === 2) $skipped_slash_dir_count++;
+             else if ($result === 3) $skipped_total_dir_count++;
         }
-        // --- End Batching Logic ---
 
-        if ($skipped_slash_dir_count > 0) {
-            echo "Ignored " . number_format($skipped_slash_dir_count) . " directory (trailing /) entries from manifest.\n";
-        }
-        // Report on skipped directory totals
-        if ($skipped_total_dir_count > 0) {
-            echo "Ignored " . number_format($skipped_total_dir_count) . " conflicting directory-total entries from manifest.\n";
-        }
-        if ($duplicate_count > 0) {
-            echo "Ignored " . number_format($duplicate_count) . " duplicate file entries from manifest.\n";
-        }
+        if ($skipped_slash_dir_count > 0) echo "Ignored " . number_format($skipped_slash_dir_count) . " directory (trailing /) entries.\n";
+        if ($skipped_total_dir_count > 0) echo "Ignored " . number_format($skipped_total_dir_count) . " conflicting directory-total entries.\n";
+        if ($duplicate_count > 0) echo "Ignored " . number_format($duplicate_count) . " duplicate file entries.\n";
         
-        if ($debug) {
+        if (self::$debug) {
             $manifest_path = getcwd() . '/.disembark-ncdu-manifest.json';
-            file_put_contents($manifest_path, json_encode($all_remote_files, JSON_PRETTY_PRINT));
+            file_put_contents($manifest_path, json_encode($all_remote_files_debug, JSON_PRETTY_PRINT));
             echo "Debug: Saved raw manifest to $manifest_path\n";
         }
 
-        // 6. Build the ncdu Tree
+        // 5. Build the ncdu Tree
         echo "Directory tree build complete.\n";
         $ncdu_json_array = self::format_ncdu_json_array($ncdu_tree);
 
@@ -1558,13 +1283,13 @@ class Run {
         ];
         $json_string = json_encode($ncdu_output_data);
 
-        if ($debug) {
+        if (self::$debug) {
             $input_path = getcwd() . '/.disembark-ncdu-input.json';
             file_put_contents($input_path, $json_string);
             echo "Debug: Saved final ncdu input to $input_path\n";
         }
 
-        // 7. Launch ncdu
+        // 6. Launch ncdu
         echo "Launching ncdu...\n";
         $descriptors = [
             0 => ["pipe", "r"], // stdin
@@ -1580,9 +1305,9 @@ class Run {
             echo "Error: Failed to launch ncdu process.\n";
         }
 
-        // 8. Final Cleanup
-        if (!$session_id) {
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        // 7. Final Cleanup
+        if (!self::$session_id) {
+            self::cleanupTemporaryFiles();
         }
     }
 
@@ -1681,98 +1406,47 @@ class Run {
         return $output;
     }
 
-    private static function backup($siteUrl, $exclude_paths = [], $exclude_tables = [], $preview = false, $session_id = null, $db_max_size_str = null, $db_max_rows_str = null, $skip_db = false, $skip_files = false, $token = null) {
+    /**
+     * Initiates a full backup of the connected site.
+     */
+    private static function backup() {
 
-        // Trim trailing slashes from the site URL
-        $siteUrl = rtrim($siteUrl, '/');
-        // Verify the site URL starts with http:// or https://
-        if (!preg_match('/^https?:\/\//', $siteUrl)) {
-            $siteUrl = "https://$siteUrl";
-            echo "The site URL must start with http:// or https://. Attempting to use $siteUrl\n";
-        }
-
-        if ($token === null) {
-
-            $homeDir = getenv('HOME');
-            if (!$homeDir) {
-                echo "Error: Unable to determine the home directory.\n";
-                exit(1);
-            }
-
-            $filePath = $homeDir . '/.disembark';
-            $data = [];
-            // Check if the file already exists and read its contents
-            if (file_exists($filePath)) {
-                $jsonContents = file_get_contents($filePath);
-                $data = json_decode($jsonContents);
-                if (!is_array($data)) {
-                    if (is_object($data)) {
-                        $data = [$data];
-                    } else {
-                        echo "Error: Invalid data in $filePath.\n";
-                        exit(1);
-                    }
-                }
-            } else {
-                echo "Error: No configuration file found at $filePath.\nPlease run 'disembark connect <site-url> <token>' first.\n";
-                exit(1);
-            }
-        
-
-            // Find the token for the given siteUrl
-            $token = null;
-            foreach ($data as $entry) {
-                if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                    $token = $entry->token;
-                    break;
-                }
-            }
-
-            if (empty($token)) {
-                echo "Error: No token found for $siteUrl.\nRun 'disembark connect $siteUrl <token>' to configure.\n";
-                exit(1);
-            }
-
+        // 1. Setup Session / Backup Token
+        if (self::$session_id) {
+            self::$backup_token = self::$session_id;
+            echo "Reusing backup session: " . self::$backup_token . "\n";
+        } else {
+            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
         }
 
         $files = [];
-        $client_side_filtering = false;
         $filtered_files = [];
+        $client_side_filtering = false;
 
-        if ($session_id) {
-            $backup_token = $session_id;
-            $all_remote_files = [];
-
-            echo "Reusing backup session: $backup_token\n";
-
+        // 2. Manifest Logic
+        if (self::$session_id) {
             try {
                 echo "Fetching existing manifest...\n";
-                // Use the new /manifest GET endpoint
-                $files = self::make_request($siteUrl, $token, $backup_token, '/manifest', [], 'GET');
-                if (!is_array($files)) {
-                    throw new \Exception("Could not fetch or parse existing manifest. Is the backup ID valid or is the manifest still generating?");
-                }
-                echo "Successfully fetched manifest with " . count($files) . " file chunks.\n";
+                $files = self::make_request('/manifest', [], 'GET');
 
-                if (!empty($exclude_paths)) {
-                    // We only apply client-side filtering if exclusions are *actually* passed with a session-id
+                if (!is_array($files)) {
+                    throw new \Exception("Could not fetch or parse existing manifest.");
+                }
+
+                // Handle Client-side filtering if exclusions exist on a reused session
+                if (!empty(self::$exclude_paths)) {
                     $client_side_filtering = true;
                     echo "Applying client-side exclusions to session manifest...\n";
-
-                    // 1. Download all manifest JSONs
-                    $temp_manifest_dir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-manifests-' . $backup_token;
+                    
+                    $temp_manifest_dir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-manifests-' . self::$backup_token;
                     if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) {
                         throw new \Exception("Could not create temp manifest dir for filtering.");
                     }
 
-                    $total_chunks_to_fetch = count($files);
-                    $fetched_chunks = 0;
+                    $all_remote_files = [];
                     foreach ($files as $file_manifest) {
-                        $fetched_chunks++;
-                        echo sprintf(" - Downloading manifest chunk %d/%d...\r", $fetched_chunks, $total_chunks_to_fetch);
-                        $chunk_url = $file_manifest->url;
                         $local_chunk_path = $temp_manifest_dir . '/' . $file_manifest->name;
-                        self::download_file_direct($chunk_url, $local_chunk_path);
+                        self::download_file_direct($file_manifest->url, $local_chunk_path);
                         $chunk_json = file_get_contents($local_chunk_path);
                         unlink($local_chunk_path);
                         $chunk_files = json_decode($chunk_json);
@@ -1781,13 +1455,11 @@ class Run {
                         }
                     }
                     self::delete_directory($temp_manifest_dir);
-                    echo str_pad("", 80, " ") . "\r"; // Clear line
 
-                    // 2. Filter the aggregated file list
                     foreach ($all_remote_files as $file) {
                         if (!is_object($file) || empty($file->name)) continue;
                         $is_excluded = false;
-                        foreach ($exclude_paths as $exclude_path) {
+                        foreach (self::$exclude_paths as $exclude_path) {
                             if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
                                 $is_excluded = true;
                                 break;
@@ -1799,367 +1471,188 @@ class Run {
                         }
                     }
                 }
+                
+                self::displayBackupSummary($client_side_filtering ? [] : $files);
 
-                // 3. Display correct summary
-                self::displayBackupSummary($siteUrl, $token, $client_side_filtering ? [] : $files, $exclude_tables);
-                // Pass empty files manifest if we filtered, as we'll override
-                if ($client_side_filtering) {
-                    echo "\n--- Client-side File Filter Summary ---\n";
-                    printf("%-24s %12s %12s\n", "Original Session Files:", number_format(count($all_remote_files)), self::humanFilesize(array_sum(array_column($all_remote_files, 'size'))));
-                    printf("%-24s %12s %12s\n", "Files after Exclusions:", number_format(count($filtered_files)), self::humanFilesize(array_sum(array_column($filtered_files, 'size'))));
-                    echo "-----------------------------------------\n";
-                } elseif (!empty($exclude_tables)) {
-                    echo "* Database exclusion summary reflects the pre-generated manifest; local --exclude-tables flag is ignored.\n";
-                }
             } catch (\Exception $e) {
                 echo "Error fetching manifest: {$e->getMessage()}\n";
-                // Do NOT clean up, it's not our session
                 exit(1);
             }
         } else {
-            if (!$skip_files) {
-                // Generate unique token for this backup session
-                $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
-                $client_side_filtering = false;
-                // Run preview, which now also generates the manifest for the actual backup
-                $files = self::runPreview($siteUrl, $token, $backup_token, $exclude_paths, $exclude_tables);
+            // New Session
+            if (!self::$skip_files) {
+                // Pass the static preview flag to runPreview
+                $files = self::runPreview(self::$preview); 
             } else {
-                // Still need a token for the DB summary
-                $backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
-                $client_side_filtering = false;
-                $files = []; // Empty files
-                self::displayBackupSummary($siteUrl, $token, $files, $exclude_tables);
+                self::displayBackupSummary([]);
                 echo "Skipping file analysis as requested.\n";
             }
         }
 
-        if (!empty($exclude_paths)) {
+        if (!empty(self::$exclude_paths)) {
             echo "Excluding the following paths during backup:\n";
-            foreach ($exclude_paths as $path) {
-                echo " - $path\n";
-            }
+            foreach (self::$exclude_paths as $path) echo " - $path\n";
         }
-        if (!empty($exclude_tables)) {
+        if (!empty(self::$exclude_tables)) {
             echo "Excluding database tables matching:\n";
-            foreach ($exclude_tables as $pattern) {
-                echo " - $pattern\n";
-            }
+            foreach (self::$exclude_tables as $pattern) echo " - $pattern\n";
         }
 
-        // --- Setup Local Backup Environment ---
-        // Convert DB threshold arguments, using defaults if not provided
-        $db_max_size = $db_max_size_str ? self::convert_to_bytes($db_max_size_str) : 209715200; // 200MB default
-        $db_max_rows = $db_max_rows_str ? (int)$db_max_rows_str : 1000000; // 1M rows default
-
-        echo "Starting backup for $siteUrl using backup token $backup_token\n";
+        echo "Starting backup for " . self::$siteUrl . " using backup token " . self::$backup_token . "\n";
         
-        // Create the directory name
         $temp_directory_name = "snapshot-" . time();
-        // Use getcwd() to create a full, absolute path
         $temp_directory = getcwd() . DIRECTORY_SEPARATOR . $temp_directory_name;
-
         $local_db_path = $temp_directory . '/database';
         $local_public_path = $temp_directory . '/public';
-        $domain = preg_replace('/^https?:\/\/(www\.)?/', '', $siteUrl);
-        $domain = preg_replace('/\//', '_', $domain);
-        $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
-        $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
         
+        $domain = preg_replace('/^https?:\/\/(www\.)?/', '', self::$siteUrl);
+        $domain = preg_replace('/\//', '_', $domain);
+        $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
+
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
-            if (!$skip_db) {
-                if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create temp directory $local_db_path.");
-            }
-            if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create temp directory $local_public_path.");
+            if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create public directory.");
             
-            if (!$skip_db) {
-                // Write SQL headers
-                $sql_header = "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n";
-                if (file_put_contents($db_export_file, $sql_header) === false) {
-                    throw new \Exception("Could not write to local SQL file $db_export_file.");
-                }
-            }
-            echo "Created local temporary directory at $temp_directory\n";
-            // --- END Local Setup ---
+            if (!self::$skip_db) {
+                if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create db directory.");
+                $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
+                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
+                
+                $all_tables = self::make_request('/database', [], 'GET');
+                if (!is_array($all_tables)) $all_tables = [];
 
-            if (!$skip_db) {
-                // --- Database Backup ---
                 $database = [];
-                try {
-                    // Fetch full table list
-                    $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 600]);
-                    if ($response->status_code !== 200 || empty($response->body)) {
-                        throw new \Exception("Could not get list of database tables. Status: " . $response->status_code);
-                    }
-                    $all_tables = json_decode($response->body);
-                    if (json_last_error() !== JSON_ERROR_NONE || !is_array($all_tables)) {
-                        throw new \Exception("Invalid database list received during backup.");
-                    }
-
-                    // Filter tables based on exclusions
-                    if (!empty($exclude_tables)) {
-                        foreach ($all_tables as $table) {
-                            $is_excluded = false;
-                            foreach ($exclude_tables as $pattern) {
-                                if (fnmatch($pattern, $table->table)) {
-                                    $is_excluded = true;
-                                    break;
-                                }
-                            }
-                            if (!$is_excluded) {
-                                $database[] = $table;
+                if (!empty(self::$exclude_tables)) {
+                    foreach ($all_tables as $table) {
+                        $is_excluded = false;
+                        foreach (self::$exclude_tables as $pattern) {
+                            if (fnmatch($pattern, $table->table)) {
+                                $is_excluded = true;
+                                break;
                             }
                         }
-                    } else {
-                         $database = $all_tables; // No exclusions, use all tables
+                        if (!$is_excluded) $database[] = $table;
                     }
-                } catch (\Exception $e) {
-                    echo "Error during database preparation: {$e->getMessage()}\n";
-                    throw $e; 
+                } else {
+                    $database = $all_tables;
                 }
 
                 if (!empty($database)) {
-                    // Call the new helper function with the *filtered* list
-                    self::processDatabaseBackup($siteUrl, $token, $backup_token, $database, $db_export_file, $local_db_path, $db_max_size, $db_max_rows);
+                    self::processDatabaseBackup($database, $db_export_file, $local_db_path);
                 } else {
-                    echo "No database tables to back up (all were excluded or list is empty).\n";
+                    echo "No database tables to back up.\n";
                 }
-
-                rmdir($local_db_path); // Remove empty database temp dir
+                rmdir($local_db_path);
             } else {
                 echo "Skipping database backup as requested.\n";
             }
-            
-            if (!$skip_files) {
-                // --- File Zipping (Refactored for Large Files) ---
+
+            if (!self::$skip_files) {
+                echo "Preparing optimized file backup...\n";
                 
-                $file_chunk_max_size = 524288000; // 500MB
-                $file_chunk_size = 2500;
-                $large_file_threshold = 209715200; // 200MB
+                $all_files_to_process = $filtered_files;
+                if (empty($all_files_to_process) && !empty($files)) {
+                    // Fetch using parallel fetcher (uses static excludes)
+                    list($remote_files_map, $debug) = self::fetch_manifests_parallel($files);
+                    $all_files_to_process = array_values($remote_files_map);
+                }
 
-                if (!$client_side_filtering) {
-                    // --- PATH A: Server-generated Manifest Chunks ---
-                    if (!empty($files)) {
-                        $steps = count($files);
-                        $current_step = 1;
-                        $total_file_count = array_sum(array_column($files, 'count'));
-                        $total_file_size = self::humanFilesize(array_sum(array_column($files, 'size')));
+                if (!empty($all_files_to_process)) {
+                    $large_files_queue = [];
+                    $small_files_queue = [];
+
+                    foreach ($all_files_to_process as $file) {
+                        $fsize = isset($file->size) ? (int)$file->size : 0;
+                        if ($fsize > self::$large_file_threshold) {
+                            $large_files_queue[] = $file;
+                        } else {
+                            $small_files_queue[] = $file;
+                        }
+                    }
+
+                    if (!empty($large_files_queue)) {
+                         self::download_files_parallel($large_files_queue, $local_public_path);
+                    }
+
+                    if (!empty($small_files_queue)) {
+                        $file_chunks = [];
+                        $current_chunk = [];
+                        $current_chunk_size = 0;
+
+                        foreach ($small_files_queue as $file) {
+                            $fsize = $file->size ?? 0;
+                            if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
+                                $file_chunks[] = $current_chunk;
+                                $current_chunk = [$file];
+                                $current_chunk_size = $fsize;
+                            } else {
+                                $current_chunk[] = $file;
+                                $current_chunk_size += $fsize;
+                            }
+                        }
+                        if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
                         
-                        echo "Preparing to backup " . number_format($total_file_count) . " files totaling " . $total_file_size . "\n";
-
-                        foreach ($files as $file_manifest) {
-                            if (!is_object($file_manifest) || !isset($file_manifest->name) || !isset($file_manifest->url)) {
-                                echo "Warning: Skipping invalid manifest chunk data.\n";
-                                $current_step++;
-                                continue;
-                            }
-
-                            // 1. Download the manifest JSON to inspect files
-                            $temp_json_path = $temp_directory . '/chunk_' . $file_manifest->name;
-                            self::download_file_direct($file_manifest->url, $temp_json_path);
-                            $chunk_files = json_decode(file_get_contents($temp_json_path));
-                            unlink($temp_json_path);
-
-                            if (!is_array($chunk_files)) {
-                                echo "Error reading manifest chunk. Skipping.\n";
-                                $current_step++;
-                                continue;
-                            }
-
-                            $files_to_zip = [];
-                            $large_files = [];
-
-                            // 2. Separate Large Files
-                            foreach ($chunk_files as $f) {
-                                if (isset($f->size) && $f->size > $large_file_threshold) {
-                                    $large_files[] = $f;
+                        $total_chunks = count($file_chunks);
+                        foreach ($file_chunks as $i => $chunk) {
+                            $chunk_num = $i + 1;
+                            $chunk_count = count($chunk);
+                            $chunk_size_str = self::humanFilesize(array_sum(array_column($chunk, 'size')));
+                            
+                            echo " - Processing zip chunk $chunk_num/$total_chunks ($chunk_count files, $chunk_size_str)...\n";
+                            try {
+                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
+                                if (strpos($url, 'http') === 0) {
+                                    $fname = basename($url);
+                                    $lpath = $temp_directory . '/' . $fname;
+                                    self::download_file_direct($url, $lpath);
+                                    self::unzip_file($lpath, $local_public_path);
+                                    unlink($lpath);
+                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
                                 } else {
-                                    $files_to_zip[] = $f;
+                                     throw new \Exception("Invalid zip URL received.");
                                 }
-                            }
-
-                            $size_str = self::humanFilesize($file_manifest->size);
-                            $progress_message = sprintf(" - Processing chunk %d/%d (%s files, %s)", $current_step, $steps, number_format($file_manifest->count), $size_str);
-                            echo $progress_message . "...\n";
-
-                            // 3. Handle Standard Files (Zip via API)
-                            if (!empty($files_to_zip)) {
-                                $zip_payload = [
-                                    "token" => $token,
-                                    "backup_token" => $backup_token,
-                                    "files" => $files_to_zip // Use /zip-sync-files logic
-                                ];
-                                
-                                echo "   - Zipping " . count($files_to_zip) . " standard files...\r";
-                                // Note: We use zip-sync-files here because it accepts a raw list, whereas zip-files takes a server-side filename
-                                $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', $zip_payload, 'POST');
-                                
-                                if (strpos($file_url, 'http') === 0) {
-                                    $file_name = basename($file_url);
-                                    $local_zip_path = $temp_directory . '/' . $file_name;
-                                    self::download_file_direct($file_url, $local_zip_path);
-                                    self::unzip_file($local_zip_path, $local_public_path);
-                                    unlink($local_zip_path);
-                                    self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                                    echo "   - Zipped files downloaded and extracted.    \n";
-                                } else {
-                                    echo "\nWarning: Zip generation failed for batch in chunk $current_step.\n";
-                                }
-                            }
-
-                            // 4. Handle Large Files (Direct Download)
-                            if (!empty($large_files)) {
-                                foreach ($large_files as $lf) {
-                                    $local_dest = $local_public_path . '/' . $lf->name;
-                                    $local_dir = dirname($local_dest);
-                                    if (!is_dir($local_dir)) mkdir($local_dir, 0755, true);
-                                    
-                                    // Attempt public fetch
-                                    if (!self::fetch_large_file_publicly($siteUrl, $lf, $local_dest)) {
-                                         // Fallback stream
-                                         try {
-                                            echo "     - Falling back to chunked stream API...\n";
-                                            self::download_file_chunked_stream(
-                                                $siteUrl, 
-                                                $token, 
-                                                $lf->name, 
-                                                $local_dest, 
-                                                $lf->size
-                                            );
-                                         } catch (\Exception $e) {
-                                             echo "     - Failed: {$e->getMessage()}\n";
-                                         }
+                            } catch (\Exception $e) {
+                                echo "\nWarning: Zip failed for chunk $chunk_num. Falling back to stream.\n";
+                                foreach ($chunk as $f) {
+                                    $ldest = $local_public_path . '/' . $f->name;
+                                    $ldir = dirname($ldest);
+                                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
+                                    try {
+                                        self::download_file_via_stream($f->name, $ldest);
+                                    } catch (\Exception $fe) {
+                                        echo "   - Failed to download: {$f->name}\n";
                                     }
                                 }
                             }
-
-                            $current_step++;
                         }
-                        echo "File backup processing complete.\n";
-                    } else {
-                        echo "Skipping file backup as no files were included in the manifest.\n";
+                        echo "Small file batches complete.\n";
                     }
-                } else {
-                    // --- PATH B: Client-side Filtered File List ---
-                    echo "Starting client-side filtered file backup...\n";
-                    
-                    // Chunk logic with large file separation
-                    $file_chunks = [];
-                    $current_chunk = [];
-                    $current_chunk_size = 0;
-                    
-                    // We also handle large files immediately or queue them?
-                    // Let's process large files immediately to keep queue simple.
-                    
-                    foreach ($filtered_files as $file) {
-                        $file_size = isset($file->size) && is_numeric($file->size) ? (int)$file->size : 0;
-                        
-                        // Case 0: Large File
-                        if ($file_size > $large_file_threshold) {
-                             // Flush current chunk if needed
-                             if (!empty($current_chunk)) {
-                                 $file_chunks[] = $current_chunk;
-                                 $current_chunk = [];
-                                 $current_chunk_size = 0;
-                             }
-                             
-                             // Download Large File Immediately
-                             $local_dest = $local_public_path . '/' . $file->name;
-                             $local_dir = dirname($local_dest);
-                             if (!is_dir($local_dir)) mkdir($local_dir, 0755, true);
-                             self::fetch_large_file_publicly($siteUrl, $file, $local_dest);
-                             continue;
-                        }
-
-                        // Standard Chunking Logic
-                        if (
-                            (!empty($current_chunk) && $current_chunk_size + $file_size > $file_chunk_max_size) ||
-                            (count($current_chunk) >= $file_chunk_size)
-                        ) {
-                            $file_chunks[] = $current_chunk;
-                            $current_chunk = [$file];
-                            $current_chunk_size = $file_size;
-                        } else {
-                            $current_chunk[] = $file;
-                            $current_chunk_size += $file_size;
-                        }
-                    }
-                    if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
-
-                    // Process remaining small chunks
-                    $total_chunks = count($file_chunks);
-                    $current_chunk_num = 0;
-                    foreach ($file_chunks as $chunk) {
-                        $current_chunk_num++;
-                        $chunk_file_count = count($chunk);
-                        $chunk_total_size = self::humanFilesize(array_sum(array_column($chunk, 'size')));
-                        $progress_message = sprintf(" - Zipping and downloading filtered chunk %d/%d (%d files, %s)", $current_chunk_num, $total_chunks, $chunk_file_count, $chunk_total_size);
-                        echo $progress_message . "...\r";
-
-                        $file_url = null;
-                        $file_name = null;
-                        $local_zip_chunk_path = null;
-                        try {
-                            // Call /zip-sync-files
-                            $file_url = self::make_request($siteUrl, $token, $backup_token, '/zip-sync-files', ['files' => $chunk], 'POST');
-                            if (strpos($file_url, 'http') !== 0) {
-                                throw new \Exception("Sync zip for chunk $current_chunk_num failed. Got: $file_url");
-                            }
-
-                            $file_name = basename($file_url);
-                            $local_zip_chunk_path = $temp_directory . '/' . $file_name;
-
-                            self::download_file_direct($file_url, $local_zip_chunk_path);
-                            self::unzip_file($local_zip_chunk_path, $local_public_path);
-                            unlink($local_zip_chunk_path);
-
-                            self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                            echo $progress_message . " - Done.        \n";
-                        } catch (\Exception $e) {
-                            echo "\nWarning: Failed to process chunk $current_chunk_num: {$e->getMessage()}\n";
-                            if (file_exists($local_zip_chunk_path)) unlink($local_zip_chunk_path);
-                            if ($file_name) {
-                                self::make_request($siteUrl, $token, $backup_token, '/cleanup-file', ['file_name' => $file_name], 'POST');
-                            }
-                            // We'll just skip this chunk and continue
-                        }
-                    }
-                    echo "Filtered file zipping and download complete.\n";
                 }
-                // --- End File Zipping ---
             } else {
                 echo "Skipping file backup as requested.\n";
             }
 
-            // --- Final Local Zipping ---
             echo "Generating final local zip file: $final_zip_name...\n";
             self::zip_directory($local_public_path, $final_zip_name);
             echo "Successfully created $final_zip_name\n";
+
         } catch (\Exception $e) {
-            // Catch any exception thrown during the backup process
             echo "\nBackup failed: {$e->getMessage()}\n";
             echo "Partial files may be left in {$temp_directory}\n";
-            // Attempt remote cleanup even if backup failed, but only if it's not a reused session
-            if (!$session_id) {
-                self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
-            }
-            exit(1); // Exit with error status
+            if (!self::$session_id) self::cleanupTemporaryFiles();
+            exit(1);
         }
 
-        // --- Final Cleanup ---
         try {
-            echo "Cleaning up local temporary files...\n";
             self::delete_directory($temp_directory);
-        } catch (\Exception $e) {
-            echo "\nWarning: Failed to clean up local directory {$temp_directory}: {$e->getMessage()}\n";
-        }
+        } catch (\Exception $e) { }
 
-        // Final remote cleanup, only if it's not a reused session
-        if (!$session_id) {
-            self::cleanupTemporaryFiles($siteUrl, $token, $backup_token);
+        if (!self::$session_id) {
+            self::cleanupTemporaryFiles();
         } else {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
+
         echo "\nBackup complete: $final_zip_name is ready.\n";
     }
 
@@ -2292,6 +1785,7 @@ class Run {
         echo "      --exclude-tables=<tables>          Exclude specific database tables (comma-separated, no spaces). Wildcards (*) are supported.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
         echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
+        echo "      --large-file-threshold=<size>      Set size threshold for individual file downloads (e.g., 100MB). Default: 200MB.\n";
         echo "      --session-id=<id>                  Reuse a specific backup session ID (backup token) generated by the plugin UI.\n";
         echo "\n";
         echo "  disembark sync <site-url> [<folder>] [options]\n";
@@ -2305,6 +1799,7 @@ class Run {
         echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
         echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
         echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 500MB.\n";
+        echo "      --large-file-threshold=<size>      Set size threshold for individual file downloads (e.g., 100MB). Default: 200MB.\n";
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI.\n";
         echo "\n";
         echo "  disembark ncdu <site-url> [options]\n";
@@ -2324,6 +1819,40 @@ class Run {
         echo "  disembark backup https://example.com --preview -x wp-content/uploads/large-dir --exclude-tables=wp_options,wp_logs\n";
         echo "  disembark backup https://example.com --session-id=a1b2c3d4e5f6\n";
         echo "  disembark sync https://example.com --session-id=a1b2c3d4e5f6 --skip-db\n";
+    }
+
+    private static function load_config($url) {
+        // Standardize URL
+        self::$siteUrl = rtrim($url, '/');
+        if (!preg_match('/^https?:\/\//', self::$siteUrl)) {
+            self::$siteUrl = "https://" . self::$siteUrl;
+        }
+
+        // Find Token
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+
+        $filePath = $homeDir . '/.disembark';
+        if (!file_exists($filePath)) {
+            echo "Error: No configuration file found at $filePath.\n";
+            exit(1);
+        }
+
+        $data = json_decode(file_get_contents($filePath));
+        if (!is_array($data)) $data = is_object($data) ? [$data] : [];
+
+        foreach ($data as $entry) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === self::$siteUrl) {
+                self::$token = $entry->token;
+                return;
+            }
+        }
+
+        echo "Error: No token found for " . self::$siteUrl . ".\n";
+        exit(1);
     }
 
     private static function convert_to_bytes($size_str) {
@@ -2377,53 +1906,92 @@ class Run {
     }
 
     /**
-     * Downloads a file using native cURL with a progress bar.
+     * Downloads a file using native cURL with a progress bar and retry logic.
      */
     private static function download_file_direct($url, $destination) {
-        $fp = fopen($destination, 'w+');
-        if ($fp === false) {
-            throw new \Exception("Could not open $destination for writing");
-        }
+        $attempts = 0;
+        $max_attempts = 5;
+        $last_error = '';
 
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_FILE, $fp);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 3600); // 1 hour timeout
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        
-        // Enable Progress Bar
-        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
-        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function(
-            $resource, 
-            $download_size, 
-            $downloaded, 
-            $upload_size, 
-            $uploaded
-        ) {
-            if ($download_size > 0) {
-                $percent = round(($downloaded / $download_size) * 100);
-                $downloaded_human = self::humanFilesize($downloaded);
-                $total_human = self::humanFilesize($download_size);
+        while ($attempts < $max_attempts) {
+            $attempts++;
+            $fp = false;
+            $ch = false;
+
+            try {
+                // Open file inside loop to ensure we truncate/overwrite previous failed attempts
+                $fp = fopen($destination, 'w+');
+                if ($fp === false) {
+                    throw new \Exception("Could not open $destination for writing");
+                }
+
+                $ch = curl_init($url);
+                curl_setopt($ch, CURLOPT_FILE, $fp);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 3600); // 1 hour timeout
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
                 
-                // \r keeps overwriting the same line
+                // Enable Progress Bar
+                curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+                curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function(
+                    $resource, 
+                    $download_size, 
+                    $downloaded, 
+                    $upload_size, 
+                    $uploaded
+                ) use ($attempts, $max_attempts) {
+                    if ($download_size > 0) {
+                        $percent = round(($downloaded / $download_size) * 100);
+                        $downloaded_human = self::humanFilesize($downloaded);
+                        $total_human = self::humanFilesize($download_size);
+                        
+                        // Show attempt number if retrying
+                        $prefix = ($attempts > 1) ? "[Retry $attempts/$max_attempts] " : "";
+                        
+                        echo str_pad("", 80, " ") . "\r"; 
+                        echo "     - {$prefix}Downloading: $downloaded_human / $total_human ($percent%)...\r";
+                    }
+                });
+
+                $data = curl_exec($ch);
+                $error = curl_error($ch);
+                $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                
+                if (is_resource($ch)) curl_close($ch);
+                if (is_resource($fp)) fclose($fp);
+
+                if (!$data) {
+                    throw new \Exception("cURL Download Error: $error");
+                }
+
+                if ($statusCode >= 400) {
+                    throw new \Exception("HTTP Error $statusCode");
+                }
+
+                // Success! Clear the progress line
+                echo str_pad("", 80, " ") . "\r";
+                return; 
+
+            } catch (\Exception $e) {
+                // Ensure resources are released before retrying
+                if (is_resource($ch)) curl_close($ch);
+                if (is_resource($fp)) fclose($fp);
+
+                $last_error = $e->getMessage();
+                
+                // Clear the progress bar line so the warning is clean
                 echo str_pad("", 80, " ") . "\r"; 
-                echo "     - Downloading: $downloaded_human / $total_human ($percent%)...\r";
+
+                if ($attempts < $max_attempts) {
+                    echo "     - Warning: Download failed (Attempt $attempts/$max_attempts): $last_error. Retrying in 3s...\n";
+                    sleep(3);
+                }
             }
-        });
-
-        $data = curl_exec($ch);
-        $error = curl_error($ch);
-        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        
-        curl_close($ch);
-        fclose($fp);
-
-        // Clear the progress line
-        echo str_pad("", 80, " ") . "\r";
-
-        if (!$data) {
-            throw new \Exception("cURL Download Error: $error");
         }
+
+        // If loop finishes, we failed
+        throw new \Exception("Download failed after $max_attempts attempts. Last error: $last_error");
+    }
 
     /**
      * Downloads large files using a rolling queue with Multi-line Progress Bars.
@@ -2719,7 +2287,7 @@ class Run {
     /**
      * Downloads a file from the /stream-file endpoint using WpOrg\Requests.
      */
-    private static function download_file_via_stream($siteUrl, $token, $relative_path, $destination) {
+    private static function download_file_via_stream($relative_path, $destination) {
         $attempts = 0;
         $max_attempts = 3;
         $last_error = "";
@@ -2727,31 +2295,28 @@ class Run {
         while ($attempts < $max_attempts) {
             $attempts++;
             try {
-                $endpoint_url = $siteUrl . '/wp-json/disembark/v1/stream-file';
-                $payload = json_encode(['token' => $token, 'file' => $relative_path]);
+                // Use self::$siteUrl and self::$token
+                $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
                 $headers = ['Content-Type' => 'application/json'];
-                // Fetch response into memory, DO NOT stream to file
                 $options = [
                     'verify' => false,
                     'timeout' => 1800,
                     'connect_timeout' => 30,
-                ];
+                 ];
                 $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
+
                 if (!$response->success) {
-                    // Add response body to the error for debugging
                     if ($response->status_code == 404 || $response->status_code == 403) {
                         throw new \Exception("Stream API failed: HTTP {$response->status_code}. Body: " . substr($response->body, 0, 200));
                     }
                     throw new \Exception("Stream API request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
 
-                // Manually write the response body to the file
                 if (file_put_contents($destination, $response->body) === false) {
                     throw new \Exception("Failed to write downloaded stream content to $destination.");
                 }
-
                 return;
-                // Success
 
             } catch (\Exception $e) {
                 echo "\nWarning: Failed to stream $relative_path (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
@@ -2763,39 +2328,30 @@ class Run {
                 }
             }
         }
-
-        // If loop finishes, streaming failed.
         throw new \Exception("Stream failed after $max_attempts attempts. Last error: $last_error");
     }
 
     /**
      * Downloads a database export file, trying direct download first and falling back to stream.
      */
-    private static function download_db_file($siteUrl, $token, $relative_path, $destination) {
-        // --- 1. Construct Direct URL ---
-        // The relative path is already the full path from the WP root, e.g., wp-content/uploads/disembark/token/file.sql.txt
-        // We need to URL-encode the components
+    private static function download_db_file($relative_path, $destination) {
         $path_parts = explode('/', $relative_path);
         $encoded_parts = array_map('rawurlencode', $path_parts);
         $encoded_relative_path = implode('/', $encoded_parts);
-        $direct_url = $siteUrl . '/' . $encoded_relative_path;
+        $direct_url = self::$siteUrl . '/' . $encoded_relative_path;
 
-        // --- 2. Try Direct Download First ---
         try {
             self::download_file_direct($direct_url, $destination);
-            // If it succeeds, just return.
             return;
         } catch (\Exception $e) {
             echo "\nWarning: Direct download failed for '$relative_path': {$e->getMessage()}\n";
             echo "Attempting to download via stream API as fallback...\n";
         }
 
-        // --- 3. Fallback to Stream API ---
         try {
-            self::download_file_via_stream($siteUrl, $token, $relative_path, $destination);
+            self::download_file_via_stream($relative_path, $destination);
             echo "Stream API download successful for: $relative_path\n";
         } catch (\Exception $e) {
-            // Both methods failed. This is a fatal error for this file.
             echo "\nStream API fallback also failed: {$e->getMessage()}\n";
             throw new \Exception("Failed to download '$relative_path' using both direct and stream methods.");
         }
