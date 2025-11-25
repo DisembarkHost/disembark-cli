@@ -153,6 +153,13 @@ class Run {
                 }
                 self::connect($argv[2], $argv[3]);
                 exit(0);
+            case 'remove':
+                if ($argc < 3) {
+                    echo "Error: Missing <site-url> argument.\n";
+                    exit(1);
+                }
+                self::remove($argv[2]);
+                exit(0);
         }
 
         // 2. Bootstrapping for "Site" Commands (backup, sync, ncdu)
@@ -288,6 +295,58 @@ class Run {
         }
 
         echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
+    }
+
+    private static function remove($siteUrl) {
+        // Normalize the URL to ensure it matches how it's stored
+        $siteUrl = rtrim($siteUrl, '/');
+        if (!preg_match('/^https?:\/\//', $siteUrl)) {
+            $siteUrl = "https://$siteUrl";
+        }
+
+        $homeDir = getenv('HOME');
+        if (!$homeDir) {
+            echo "Error: Unable to determine the home directory.\n";
+            exit(1);
+        }
+
+        $filePath = $homeDir . '/.disembark';
+        
+        if (!file_exists($filePath)) {
+            echo "Error: No configuration file found at $filePath.\n";
+            exit(1);
+        }
+
+        $jsonContents = file_get_contents($filePath);
+        $data = json_decode($jsonContents);
+        
+        // Handle legacy single-object format or invalid data
+        if (!is_array($data)) {
+            $data = is_object($data) ? [$data] : [];
+        }
+
+        $originalCount = count($data);
+        $newData = [];
+        $found = false;
+
+        foreach ($data as $entry) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $found = true;
+                continue; // Skip this entry to remove it
+            }
+            $newData[] = $entry;
+        }
+
+        if ($found) {
+            $jsonData = json_encode($newData, JSON_PRETTY_PRINT);
+            if (file_put_contents($filePath, $jsonData) === false) {
+                echo "Error: Unable to write to $filePath.\n";
+                exit(1);
+            }
+            echo "Successfully removed credentials for $siteUrl\n";
+        } else {
+            echo "No credentials found for $siteUrl\n";
+        }
     }
 
     private static function make_request($endpoint, $payload = [], $method = 'POST') {
@@ -1890,6 +1949,7 @@ class Run {
         echo "\n";
         echo "Other Commands:\n";
         echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
+        echo "  disembark remove <site-url>            Remove a connected site and its credentials.\n";
         echo "  disembark list                         List all sites currently connected.\n";
         echo "  disembark upgrade                      Upgrade the Disembark CLI tool to the latest version.\n";
         echo "  disembark version                      Show the current version of the Disembark CLI tool.\n";
