@@ -1,5 +1,30 @@
 # Changelog
 
+## **v2.6.0** - November 25th, 2025
+
+### Added
+
+* **New `info` Command:** Added `disembark info <site-url>` to display connection status, storage usage, last scan timestamp, and database statistics (tables/rows).
+* **New `remove` Command:** Added `disembark remove <site-url>` to delete a site's credentials from the local configuration file.
+* **Parallel File Synchronization:** The `sync` process has been completely re-architected to use a concurrent state machine. It now processes multiple chunks simultaneously across three states: Zipping (server-side), Downloading, and Unzipping.
+* **Background Extraction:** Zip extraction is now offloaded to a detached background process (using `php -r`), allowing the CLI to continue downloading the next chunk without waiting for file IO operations to complete.
+* **Multi-threaded Large File Downloads:** Added `download_files_parallel`, allowing large files to be downloaded concurrently with visual progress bars for each active transfer.
+* **Global Progress Footer:** Introduced a "Global Footer" in the CLI UI that stays pinned to the bottom of the output, showing the total bytes processed versus total bytes expected across all concurrent threads.
+* **New `--large-file-threshold` Flag:** Added a configurable threshold (default 10MB) to determine which files are downloaded individually vs. zipped in batches.
+* **New `--cleanup` Flag:** Added to the `info` command to force a purge of temporary files on the remote server.
+
+### Improved
+
+* **CLI User Interface:** The CLI now utilizes ANSI escape codes to render multiple dynamic progress bars simultaneously (one for each active thread) plus a global summary line.
+* **Argument Parsing:** Refactored argument handling into a centralized `parseArguments` method, replacing the previous manual loop implementation in the main execution block.
+* **Configuration Loading:** Introduced a `load_config` helper to standardize how credentials are retrieved from the `.disembark` file.
+* **Code Structure:** Major refactoring of the `Run` class to use static properties for state management (e.g., site URL, token, exclusion paths) instead of passing variables through every function call.
+
+### Changed
+
+* **Default Thresholds:** The default `file_chunk_max_size` remains 500MB, but a specific `large_file_threshold` of 10MB was introduced to optimize the parallel downloading queue.
+* **Sync Logic:** The `sync` command now explicitly waits for background extraction processes to finish before declaring the sync complete, ensuring data integrity.
+
 ## **v2.5.0** - November 21st, 2025
 
 ### Added

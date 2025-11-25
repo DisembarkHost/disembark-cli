@@ -4,7 +4,7 @@ namespace Disembark;
 
 class Run {
 
-    const VERSION = '2.5.0';
+    const VERSION = '2.6.0';
 
     private static $siteUrl;
     private static $token;
