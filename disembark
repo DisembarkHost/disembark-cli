@@ -1023,48 +1023,11 @@ class Run {
                             }
                         }
                         if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
-                        $total_zip_chunks = count($file_chunks);
                         
-                        // --- LOOP 1 (Initial Sync) ---
-                        foreach ($file_chunks as $i => $chunk) {
-                            $chunk_num = $i + 1;
-                            
-                            // Construct the label
-                            $label = " - Processing zip chunk $chunk_num/$total_zip_chunks (" . count($chunk) . " files)";
-                            
-                            try {
-                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
-                                if (strpos($url, 'http') === 0) {
-                                    $fname = basename($url);
-                                    $lpath = $folder . '/' . $fname;
-                                    
-                                    // Pass label as 3rd argument
-                                    self::download_file_direct($url, $lpath, $label);
-                                    
-                                    self::unzip_file($lpath, $folder);
-                                    unlink($lpath);
-                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
-                                } else {
-                                     throw new \Exception("Invalid zip URL received.");
-                                }
-                            } catch (\Exception $e) {
-                                echo "\nWarning: Zip failed for chunk $chunk_num. Falling back to stream.\n";
-                                foreach ($chunk as $f) {
-                                    $ldest = $folder . '/' . $f->name;
-                                    $ldir = dirname($ldest);
-                                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
-                                    try {
-                                        self::download_file_via_stream($f->name, $ldest);
-                                        // Update global stats on fallback success
-                                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
-                                    } catch (\Exception $fe) {
-                                        echo "   - Failed to download: {$f->name}\n";
-                                    }
-                                }
-                            }
+                        // Use the new Parallel State Machine
+                        if (!empty($file_chunks)) {
+                            self::sync_chunks_parallel($file_chunks, $folder);
                         }
-                        // --- END LOOP 1 ---
-                
                     }
                     echo "Initial file sync complete.\n";
                 } else {
@@ -1144,44 +1107,12 @@ class Run {
                             self::download_files_parallel($large_files_parallel_queue, $folder);
                         }
 
-                        $total_chunks = count($file_chunks);
-                        
-                        // --- LOOP 2 (Subsequent Sync) ---
-                        foreach ($file_chunks as $i => $chunk) {
-                            $chunk_num = $i + 1;
-
-                            // Construct the label
-                            $label = " - Processing sync chunk $chunk_num/$total_chunks (" . count($chunk) . " files)";
-
-                            try {
-                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
-                                if (strpos($url, 'http')===0) {
-                                    $fname = basename($url);
-                                    $lpath = $folder . '/' . $fname;
-                                    
-                                    // Pass label as 3rd argument
-                                    self::download_file_direct($url, $lpath, $label);
-                                    
-                                    self::unzip_file($lpath, $folder);
-                                    unlink($lpath);
-                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
-                                }
-                            } catch (\Exception $e) {
-                                echo "\nWarning: Sync chunk $chunk_num failed. Falling back to stream.\n";
-                                foreach ($chunk as $f) {
-                                    $ldest = $folder . '/' . $f->name;
-                                    $ldir = dirname($ldest);
-                                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
-                                    self::download_file_via_stream($f->name, $ldest);
-                                    // Update global stats on fallback stream
-                                    self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
-                                }
-                            }
+                        // Use the new Parallel State Machine
+                        if (!empty($file_chunks)) {
+                            self::sync_chunks_parallel($file_chunks, $folder);
                         }
-                        // --- END LOOP 2 ---
 
-                        echo str_pad("", 80, " ") . "\r";
-                        echo " - All sync chunks processed.            \n";
+                        echo " - All sync chunks processed.\n";
                     } else {
                         echo " - No new or changed files to download.\n";
                     }
@@ -1202,6 +1133,7 @@ class Run {
                 echo "Skipping file sync as requested.\n";
             }
         } catch (\Exception $e) {
+            echo "\033[?25h"; 
             echo "\nSync failed: {$e->getMessage()}\n";
             if (!self::$session_id) {
                 self::cleanupTemporaryFiles();
@@ -1214,7 +1146,340 @@ class Run {
         } else {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
-        echo "\nSync complete: $folder is up to date.\n";
+        
+        // Wait for background extractions
+        $wait_ticks = 0;
+        // The background logic in sync_chunks_parallel creates zips.
+        // We verify that they are gone before finishing.
+        while (count(glob($folder . '/sync-files-*.zip')) > 0 || count(glob($folder . '/files-*.zip')) > 0) {
+            if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
+            echo ".";
+            sleep(1);
+            $wait_ticks++;
+            if ($wait_ticks > 60) {
+                 echo "\nWarning: Background extraction taking too long. Some zip files may remain in $folder.\n";
+                 break;
+            }
+        }
+        if ($wait_ticks > 0) echo " Done.\n";
+
+        // Final Output with Stats
+        $stats_str = self::humanFilesize($transferred_bytes);
+        $files_str = number_format($transferred_files);
+        echo "\nSync Completed Successfully\n";
+        echo "-----------------------------\n";
+        printf("%-15s %s\n", "Destination:", $folder);
+        printf("%-15s %s\n", "Transferred:", self::humanFilesize($transferred_bytes));
+        printf("%-15s %s\n", "Items:", number_format($transferred_files));
+        echo "\n";
+    }
+
+    /**
+     * Processes zip chunks in parallel using a state machine (Zip -> Download -> Background Unzip).
+     * Concurrency: 2 (Keeps pressure on server without overloading).
+     */
+    private static function sync_chunks_parallel($chunks, $folder) {
+        // Increase concurrency since unzip is now non-blocking
+        $max_concurrency = 2;
+        $max_retries = 3;
+        $mh = curl_multi_init();
+        
+        // 1. Prepare Queue
+        $queue = [];
+        $chunk_values = array_values($chunks);
+        foreach ($chunk_values as $i => $files) {
+            $queue[] = [
+                'files' => $files,
+                'attempts' => 0,
+                'id' => $i + 1 // Stable ID for UI
+            ];
+        }
+        
+        $total_chunks = count($queue);
+        $fallback_chunks = [];
+        $active_transfers = [];
+        $slots = array_fill(0, $max_concurrency, null); 
+
+        echo "\033[?25l";
+        echo " - Starting parallel sync (Concurrency: $max_concurrency, Retries: $max_retries)...\n";
+        echo str_repeat("\n", $max_concurrency);
+        echo "\033[{$max_concurrency}A";
+
+        do {
+            // 2. REFILL SLOTS
+            while (count($active_transfers) < $max_concurrency && !empty($queue)) {
+                $slot_idx = array_search(null, $slots);
+                if ($slot_idx === false) $slot_idx = count($active_transfers);
+                
+                // Get Job
+                $job = array_shift($queue);
+                $job['attempts']++;
+                
+                // Start STAGE_ZIP
+                $url = self::$siteUrl . "/wp-json/disembark/v1/zip-sync-files";
+                $payload = json_encode([
+                    'token' => self::$token, 
+                    'backup_token' => self::$backup_token, 
+                    'files' => $job['files']
+                ]);
+
+                $ch = curl_init($url);
+                
+                if ($ch === false) {
+                    $fallback_chunks[] = $job['files'];
+                    continue;
+                }
+
+                curl_setopt($ch, CURLOPT_POST, 1);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 1800); 
+                
+                curl_multi_add_handle($mh, $ch);
+                $ch_id = is_object($ch) ? spl_object_id($ch) : (int)$ch;
+                
+                $active_transfers[$ch_id] = [
+                    'state' => 'ZIP',
+                    'chunk_idx' => $job['id'],
+                    'slot' => $slot_idx,
+                    'job' => $job, 
+                    'file_count' => count($job['files'])
+                ];
+                $slots[$slot_idx] = $ch_id;
+            }
+
+            // 3. EXECUTE
+            curl_multi_exec($mh, $running);
+            if ($running > 0 && curl_multi_select($mh, 0.1) === -1) {
+                usleep(100);
+            }
+
+            // 4. UPDATE UI
+            foreach ($active_transfers as $data) {
+                $slot = $data['slot'];
+                $line = $slot + 1;
+                $idx = $data['chunk_idx'];
+                $count = $data['file_count'];
+                $attempt = $data['job']['attempts'];
+                $retry_label = ($attempt > 1) ? "[Retry] " : "";
+                $label_num = $slot + 1;
+
+                // --- UI ALIGNMENT LOGIC ---
+                $status_text = "";
+                $bar_output = "";
+                $size_output = "";
+
+                if ($data['state'] === 'ZIP') {
+                    $status_text = "Chunk $idx/$total_chunks ($count files): {$retry_label}Requesting Zip...";
+                } elseif ($data['state'] === 'DL') {
+                    $d = curl_getinfo($data['handle'], CURLINFO_SIZE_DOWNLOAD);
+                    $t = curl_getinfo($data['handle'], CURLINFO_CONTENT_LENGTH_DOWNLOAD);
+                    
+                    $status_text = "Chunk $idx/$total_chunks: {$retry_label}Downloading...";
+                    $bar_output = ($t > 0) ? self::draw_progress_bar($d, $t, 15) : '';
+                    $size_output = self::humanFilesize($d);
+                } elseif ($data['state'] === 'UNZIP') {
+                    $status_text = "Chunk $idx/$total_chunks: Background Extracting...";
+                }
+
+                if (strlen($status_text) > 56) $status_text = '...' . substr($status_text, -53);
+                $status_padded = str_pad($status_text, 56);
+                
+                echo "\033[{$line}B\r\033[K {$label_num}: {$status_padded} {$bar_output} {$size_output}\033[{$line}A";
+            }
+
+            // 5. PROCESS SYNCHRONOUS TASKS (UNZIP)
+            foreach ($active_transfers as $id => $data) {
+                if ($data['state'] === 'UNZIP') {
+                    
+                    $slot = $data['slot'];
+                    $line = $slot + 1;
+                    $label_num = $slot + 1;
+
+                    try {
+                        // --- NON-BLOCKING BACKGROUND EXTRACTION ---
+                        // We use php -r to spawn a detached process that handles ZipArchive and unlink.
+                        $zip_path = $data['file_path'];
+                        $dest_path = $folder;
+
+                        // Escape for shell safety
+                        $safe_zip = escapeshellarg($zip_path);
+                        $safe_dest = escapeshellarg($dest_path);
+
+                        // PHP One-Liner: Open, Extract, Close, Delete.
+                        $php_code = sprintf(
+                            '$z = new ZipArchive; if ($z->open(%s) === TRUE) { $z->extractTo(%s); $z->close(); unlink(%s); }',
+                            $safe_zip,
+                            $safe_dest,
+                            $safe_zip
+                        );
+                        
+                        // Execute in background (> /dev/null 2>&1 &)
+                        $cmd = sprintf('php -r %s > /dev/null 2>&1 &', escapeshellarg($php_code));
+                        exec($cmd);
+
+                        // Update global stats immediately (based on zip size)
+                        // Note: Uncompressed size would be more accurate but requires reading the zip, which blocks.
+                        self::$global_bytes_processed += filesize($zip_path);
+
+                        $msg_text = "Chunk {$data['chunk_idx']} backgrounded.";
+                        $msg_padded = str_pad($msg_text, 56);
+                        echo "\033[{$line}B\r\033[K {$label_num}: {$msg_padded}\033[{$line}A";
+
+                        // Cleanup remote file immediately
+                        try {
+                            self::make_request('/cleanup-file', ['file_name' => $data['file_name']], 'POST');
+                        } catch (\Exception $e) { }
+                        
+                    } catch (\Exception $e) {
+                         // Should rarely happen with exec, but handle logic errors
+                         $fallback_chunks[] = $data['job']['files'];
+                         echo "\033[{$line}B\r\033[K {$label_num}: Background Launch Failed.\033[{$line}A";
+                    }
+
+                    // Done with this job immediately - DO NOT WAIT for unzip
+                    $slots[$slot] = null;
+                    unset($active_transfers[$id]);
+                }
+            }
+
+            // 6. CHECK ASYNC COMPLETION (cURL)
+            while ($info = curl_multi_info_read($mh)) {
+                $ch = $info['handle'];
+                $ch_id = is_object($ch) ? spl_object_id($ch) : (int)$ch;
+                
+                if (!isset($active_transfers[$ch_id])) continue;
+                
+                $data = $active_transfers[$ch_id];
+                $slot = $data['slot'];
+                $line = $slot + 1;
+                $label_num = $slot + 1;
+                
+                curl_multi_remove_handle($mh, $ch);
+                if ($data['state'] === 'ZIP') {
+                    // ZIP FINISHED logic...
+                    $raw_response = curl_multi_getcontent($ch);
+                    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    
+                    if (is_resource($ch)) curl_close($ch);
+                    
+                    $zip_url = null;
+                    $decoded = json_decode($raw_response);
+                    if (json_last_error() === JSON_ERROR_NONE && is_string($decoded)) {
+                        $zip_url = $decoded;
+                    } elseif (strpos($raw_response, 'http') === 0) {
+                        $zip_url = trim($raw_response);
+                    }
+
+                    if ($http_code === 200 && !empty($zip_url) && strpos($zip_url, 'http') === 0) {
+                        // SUCCESS -> TRANSITION TO DOWNLOAD
+                        $fname = basename($zip_url);
+                        $lpath = $folder . '/' . $fname;
+                        
+                        $fp = fopen($lpath, 'w+');
+                        $ch_dl = curl_init($zip_url);
+                        if ($fp === false || $ch_dl === false) {
+                            if ($fp) fclose($fp);
+                            if ($ch_dl) curl_close($ch_dl);
+                            $slots[$slot] = null;
+                            unset($active_transfers[$ch_id]);
+                            $fallback_chunks[] = $data['job']['files'];
+                            echo "\033[{$line}B\r\033[K {$label_num}: Local IO Error. Added to fallback.\033[{$line}A";
+                        } else {
+                            curl_setopt($ch_dl, CURLOPT_FILE, $fp);
+                            curl_setopt($ch_dl, CURLOPT_SSL_VERIFYPEER, false);
+                            curl_setopt($ch_dl, CURLOPT_FOLLOWLOCATION, true);
+                            curl_setopt($ch_dl, CURLOPT_TIMEOUT, 3600);
+                            
+                            curl_multi_add_handle($mh, $ch_dl);
+                            
+                            unset($active_transfers[$ch_id]);
+                            $new_id = is_object($ch_dl) ? spl_object_id($ch_dl) : (int)$ch_dl;
+                            $active_transfers[$new_id] = $data;
+                            $active_transfers[$new_id]['state'] = 'DL';
+                            $active_transfers[$new_id]['file_path'] = $lpath;
+                            $active_transfers[$new_id]['file_name'] = $fname;
+                            $active_transfers[$new_id]['fp'] = $fp;
+                            $active_transfers[$new_id]['handle'] = $ch_dl;
+                            $slots[$slot] = $new_id;
+                        }
+
+                    } else {
+                        // ZIP FAILED
+                        $slots[$slot] = null;
+                        unset($active_transfers[$ch_id]);
+                        if ($data['job']['attempts'] <= $max_retries) {
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed. Retrying...\033[{$line}A";
+                            array_unshift($queue, $data['job']);
+                            sleep(1);
+                        } else {
+                            $fallback_chunks[] = $data['job']['files'];
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed. Added to fallback.\033[{$line}A";
+                        }
+                    }
+                    
+                } elseif ($data['state'] === 'DL') {
+                    // DOWNLOAD FINISHED
+                    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curl_error = curl_error($ch);
+                    $download_size = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
+                    $expected_size = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
+
+                    fflush($data['fp']);
+                    fclose($data['fp']);
+                    usleep(100000);
+                    if (is_resource($ch)) curl_close($ch);
+                    
+                    $file_exists = file_exists($data['file_path']);
+                    $file_size = $file_exists ? filesize($data['file_path']) : 0;
+                    
+                    if ($http_code >= 200 && $http_code < 300 && empty($curl_error) && $file_size > 0 && ($expected_size == -1 || $download_size == $expected_size)) {
+                        // SUCCESS -> TRANSITION TO UNZIP
+                        $active_transfers[$ch_id]['state'] = 'UNZIP';
+                    } else {
+                        // FAILURE
+                        $slots[$slot] = null;
+                        unset($active_transfers[$ch_id]);
+                        if ($file_exists) unlink($data['file_path']);
+                        
+                        if ($data['job']['attempts'] <= $max_retries) {
+                            $err_msg = empty($curl_error) ? "HTTP $http_code" : "Net Error";
+                            echo "\033[{$line}B\r\033[K {$label_num}: DL Failed ($err_msg). Retrying...\033[{$line}A";
+                            array_unshift($queue, $data['job']);
+                        } else {
+                            $fallback_chunks[] = $data['job']['files'];
+                            echo "\033[{$line}B\r\033[K {$label_num}: DL Failed. Added to fallback.\033[{$line}A";
+                        }
+                        sleep(1);
+                    }
+                }
+            }
+
+        } while ($running > 0 || !empty($queue) || !empty($active_transfers));
+
+        echo "\033[{$max_concurrency}B"; 
+        echo "\033[?25h"; 
+        if (is_resource($mh)) curl_multi_close($mh);
+
+        if (!empty($fallback_chunks)) {
+            echo "\nProcessing failed chunks via stream fallback...\n";
+            foreach ($fallback_chunks as $chunk) {
+                foreach ($chunk as $f) {
+                    $ldest = $folder . '/' . $f->name;
+                    $ldir = dirname($ldest);
+                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
+                    try {
+                        echo "   - Streaming: {$f->name}\n";
+                        self::download_file_via_stream($f->name, $ldest);
+                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
+                    } catch (\Exception $fe) {
+                        echo "   - Failed to download: {$f->name}\n";
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -1466,11 +1731,25 @@ class Run {
                     $stats = $size_response->scan_stats;
                     $scan_size = self::humanFilesize($stats->total_size);
                     $scan_count = number_format($stats->total_files);
-                    
-                    // Format the epoch timestamp using the LOCAL CLI timezone
-                    // 'T' adds the timezone abbreviation (e.g., EST, UTC)
-                    $scan_time = date('M j, Y g:i A T', $stats->timestamp);
+                    $scan_time = "";
+                    $format = "'+%b %e, %Y %l:%M %p %Z'"; // e.g. Nov 25, 2025 1:18 AM EST
 
+                    // 1. Try macOS / BSD Style
+                    if (PHP_OS === 'Darwin') {
+                        $cmd = "date -r {$stats->timestamp} $format";
+                        $scan_time = trim((string)shell_exec($cmd));
+                    } 
+                    // 2. Try Linux / GNU Style
+                    elseif (strtoupper(substr(PHP_OS, 0, 3)) === 'LIN') {
+                        $cmd = "date -d @{$stats->timestamp} $format";
+                        $scan_time = trim((string)shell_exec($cmd));
+                    }
+
+                    // 3. Fallback to PHP (likely UTC) if shell failed or OS is Windows
+                    if (empty($scan_time)) {
+                        $scan_time = date('M j, Y g:i A T', $stats->timestamp);
+                    }
+                    
                     // Calculate relative time
                     $time_diff = time() - $stats->timestamp;
                     $age_str = ($time_diff < 60) ? "Just now" :
@@ -1502,7 +1781,7 @@ class Run {
             } elseif (strpos($msg, '404') !== false) {
                  $status_label = "Plugin not found or API disabled (404)";
             } else {
-                $status_label = "Connection Failed: " . $msg;
+                $status_label = "Failed";
             }
         }
 
@@ -1773,8 +2052,7 @@ class Run {
             if (!self::$skip_db) {
                 if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create db directory.");
                 $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
-                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
-                
+                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
                 if (!empty($database)) {
                     // This calls download_db_file -> download_file_direct, which updates global progress
                     self::processDatabaseBackup($database, $db_export_file, $local_db_path);
@@ -1833,55 +2111,23 @@ class Run {
                         }
                         if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
                         
-                        $total_chunks = count($file_chunks);
-                        
-                        foreach ($file_chunks as $i => $chunk) {
-                            $chunk_num = $i + 1;
-                            $chunk_count = count($chunk);
-                            $chunk_size_str = self::humanFilesize(array_sum(array_column($chunk, 'size')));
-                            
-                            // 1. Clear previous footer line if any
-                            echo "\r\033[K";
-                            
-                            // 2. Print Header (NO NEWLINE at the end)
-                            echo " - Processing zip chunk $chunk_num/$total_chunks ($chunk_count files, $chunk_size_str)...";
+                        if (!empty($file_chunks)) {
+                            self::sync_chunks_parallel($file_chunks, $local_public_path);
+                        }
 
-                            try {
-                                $url = self::make_request('/zip-sync-files', ['files' => $chunk], 'POST');
-                                if (strpos($url, 'http') === 0) {
-                                    $fname = basename($url);
-                                    $lpath = $temp_directory . '/' . $fname;
-                                    
-                                    // 3. Call download with QUIET = true
-                                    self::download_file_direct($url, $lpath, true);
-                                    
-                                    self::unzip_file($lpath, $local_public_path);
-                                    unlink($lpath);
-                                    self::make_request('/cleanup-file', ['file_name' => $fname], 'POST');
-                                    
-                                    // 4. Print "Done" on the same line
-                                    echo " - Done\n";
-                                } else {
-                                     throw new \Exception("Invalid zip URL received.");
-                                }
-                            } catch (\Exception $e) {
-                                // Add a newline so the warning doesn't look weird appended to the processing line
-                                echo "\nWarning: Zip failed for chunk $chunk_num. Falling back to stream.\n";
-                                foreach ($chunk as $f) {
-                                    $ldest = $local_public_path . '/' . $f->name;
-                                    $ldir = dirname($ldest);
-                                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
-                                    try {
-                                        self::download_file_via_stream($f->name, $ldest);
-                                        // Update global stats on fallback stream
-                                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
-                                    } catch (\Exception $fe) {
-                                        echo "   - Failed to download: {$f->name}\n";
-                                    }
-                                }
+                        $wait_ticks = 0;
+                        while (count(glob($local_public_path . '/sync-files-*.zip')) > 0 || count(glob($local_public_path . '/files-*.zip')) > 0) {
+                            if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
+                            echo ".";
+                            sleep(1);
+                            $wait_ticks++;
+                            if ($wait_ticks > 120) { 
+                                 echo "\nWarning: Background extraction taking too long. Some zip files may be left in the backup.\n";
+                                 break;
                             }
                         }
-                
+                        if ($wait_ticks > 0) echo " Done.\n";
+                        echo "\n";
                         echo "Small file batches complete.\n";
                     }
                 }
@@ -1891,7 +2137,6 @@ class Run {
 
             echo "Generating final local zip file: $final_zip_name...\n";
             self::zip_directory($local_public_path, $final_zip_name);
-            echo "Successfully created $final_zip_name\n";
 
         } catch (\Exception $e) {
             echo "\nBackup failed: {$e->getMessage()}\n";
@@ -2267,8 +2512,8 @@ class Run {
                 // Cleanup Output
                 if ($has_printed_lines) {
                     if ($progress_label) {
-                        // Bar Mode: Move to next line, clearing the global footer from that line
-                        echo "\n\033[K"; 
+                        // Bar Mode: Move to next line (footer line).
+                        echo "\n";
                     } else {
                         // Standard Mode: Replace progress with "Complete" message
                         echo "\r\033[K";
@@ -2763,19 +3008,21 @@ class Run {
      */
     private static function unzip_file($file, $destination) {
         if (!class_exists('ZipArchive')) {
-            echo "\nError: ZipArchive PHP extension is required to unpack files locally. Backup failed.\n";
-            throw new \Exception('ZipArchive not found.');
+            throw new \Exception('ZipArchive PHP extension is required to unpack files.');
         }
+        
         $zip = new \ZipArchive;
-        if ($zip->open($file) === TRUE) {
+        $res = $zip->open($file);
+        
+        if ($res === TRUE) {
             if ($zip->extractTo($destination) === FALSE) {
                 $zip->close();
                 throw new \Exception("Failed to extract $file to $destination.");
             }
             $zip->close();
         } else {
-            echo "\nError: Failed to open local zip archive $file. Backup failed.\n";
-            throw new \Exception("Failed to open $file.");
+            // $res contains the error code (e.g. ZipArchive::ER_NOZIP)
+            throw new \Exception("Failed to open zip archive $file. Error code: $res");
         }
     }
 
