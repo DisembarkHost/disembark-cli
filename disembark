@@ -626,7 +626,6 @@ class Run {
         try {
             $payload = ['backup_token' => self::$backup_token];
             self::make_request('/cleanup', $payload, 'GET');
-            echo "Cleanup request sent.\n";
         } catch (\Exception $e) {
             echo "Warning: Cleanup request failed: {$e->getMessage()}\n";
         }
@@ -950,8 +949,7 @@ class Run {
                         if (!is_array($files_manifest_chunks)) {
                             throw new \Exception("Could not fetch or parse existing manifest.");
                         }
-                        echo "Successfully fetched manifest with " .
-                        count($files_manifest_chunks) . " file chunks.\n";
+                        echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
                     } catch (\Exception $e) {
                         echo "Error fetching manifest: {$e->getMessage()}\n";
                         if (!self::$session_id) self::cleanupTemporaryFiles();
@@ -960,7 +958,6 @@ class Run {
                 } else {
                     echo "Starting file sync analysis...\n";
                     $include_checksums = (!$is_initial_sync && !self::$skip_checksums);
-                    // Simplified call: excludes are now static properties
                     $files_manifest_chunks = self::runManifestGeneration($include_checksums);
                 }
 
@@ -996,7 +993,6 @@ class Run {
 
                     if (!empty($small_files_queue)) {
                         $total_small = count($small_files_queue);
-                        echo " - Processing $total_small small files via zip batches...\n";
                         
                         $file_chunks = [];
                         $current_chunk = [];
@@ -1088,7 +1084,7 @@ class Run {
                         if (!isset($remote_files_map[$path])) $files_to_delete[] = $path;
                     }
 
-                    // --- NEW: Calculate Total Size for Global Progress (Subsequent) ---
+                    // Stats
                     $total_bytes_to_sync = 0;
                     foreach ($files_to_download as $f) {
                         $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
@@ -1441,7 +1437,6 @@ class Run {
                 $status_label = "Connected (Valid Credentials)";
                 $temp_usage = self::humanFilesize($size_response->size);
 
-                // Check for cleanup flag
                 if (self::$cleanup) {
                     try {
                         self::make_request('/cleanup', [], 'GET');
@@ -1622,13 +1617,11 @@ class Run {
         $files = [];
         $filtered_files = [];
         $client_side_filtering = false;
-
         // 2. Manifest Logic
         if (self::$session_id) {
             try {
                 echo "Fetching existing manifest...\n";
                 $files = self::make_request('/manifest', [], 'GET');
-
                 if (!is_array($files)) {
                     throw new \Exception("Could not fetch or parse existing manifest.");
                 }
@@ -1655,7 +1648,6 @@ class Run {
                         }
                     }
                     self::delete_directory($temp_manifest_dir);
-
                     foreach ($all_remote_files as $file) {
                         if (!is_object($file) || empty($file->name)) continue;
                         $is_excluded = false;
