@@ -917,6 +917,10 @@ class Run {
 
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
+        
+        // Initialize Stats
+        $transferred_bytes = 0;
+        $transferred_files = 0;
 
         try {
             // --- Database Sync ---
@@ -932,6 +936,11 @@ class Run {
 
                 $database = self::make_request('/database', [], 'GET');
                 if (!is_array($database)) throw new \Exception("Invalid database list received.");
+
+                // Tally Database Stats
+                foreach ($database as $tbl) {
+                    $transferred_bytes += (isset($tbl->size) ? (float)$tbl->size : 0);
+                }
 
                 self::processDatabaseBackup($database, $db_export_file, $local_db_parts_path);
                 self::delete_directory($local_db_parts_path);
@@ -968,12 +977,17 @@ class Run {
                     
                     list($remote_files_map, $all_files_debug) = self::fetch_manifests_parallel($files_manifest_chunks);
                     
+                    // Calculate Total Size for Global Progress
                     $total_bytes_to_sync = 0;
                     foreach ($remote_files_map as $f) {
                         $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
                     }
                     self::$global_bytes_total = $total_bytes_to_sync;
                     self::$global_bytes_processed = 0;
+                    
+                    // Add to Transferred Stats
+                    $transferred_bytes += $total_bytes_to_sync;
+                    $transferred_files += count($remote_files_map);
 
                     $large_files_queue = [];
                     $small_files_queue = [];
@@ -1060,7 +1074,6 @@ class Run {
                     echo str_pad("", 80, " ") . "\r";
 
                     echo "Generating local file manifest...\n";
-                    // Pass static property skip_checksums
                     $local_files_map = self::generate_local_manifest($folder, self::$skip_checksums);
                     echo "Comparing manifests and syncing changes...\n";
                     
@@ -1091,7 +1104,9 @@ class Run {
                     }
                     self::$global_bytes_total = $total_bytes_to_sync;
                     self::$global_bytes_processed = 0;
-                    // ------------------------------------------------------------------
+
+                    $transferred_bytes += $total_bytes_to_sync;
+                    $transferred_files += count($files_to_download);
 
                     if (!empty($files_to_download)) {
                         $total_files_to_download = count($files_to_download);
@@ -1700,10 +1715,12 @@ class Run {
         $domain = preg_replace('/\//', '_', $domain);
         $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
 
+        // STATS COUNTERS
+        $total_items_processed = 0;
+
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
             if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create public directory.");
-
             // --- CALCULATE GLOBAL TOTALS ---
             $total_db_bytes = 0;
             $database = [];
@@ -1736,10 +1753,16 @@ class Run {
             $total_file_bytes = 0;
             if (!self::$skip_files) {
                 if (!empty($filtered_files)) {
-                     foreach ($filtered_files as $f) $total_file_bytes += (isset($f->size) ? (float)$f->size : 0);
+                     foreach ($filtered_files as $f) {
+                         $total_file_bytes += (isset($f->size) ? (float)$f->size : 0);
+                         $total_items_processed++;
+                     }
                 } elseif (!empty($files)) {
                     // $files contains manifest chunks with a 'size' property
-                    $total_file_bytes = array_sum(array_column($files, 'size'));
+                    foreach ($files as $chunk) {
+                        $total_file_bytes += isset($chunk->size) ? (float)$chunk->size : 0;
+                        $total_items_processed += isset($chunk->count) ? (int)$chunk->count : 0;
+                    }
                 }
             }
 
@@ -1755,6 +1778,7 @@ class Run {
                 if (!empty($database)) {
                     // This calls download_db_file -> download_file_direct, which updates global progress
                     self::processDatabaseBackup($database, $db_export_file, $local_db_path);
+                    $total_items_processed += count($database); // Add tables to item count
                 } else {
                     echo "No database tables to back up.\n";
                 }
@@ -1770,6 +1794,8 @@ class Run {
                     // Fetch using parallel fetcher (uses static excludes)
                     list($remote_files_map, $debug) = self::fetch_manifests_parallel($files);
                     $all_files_to_process = array_values($remote_files_map);
+                    // Update exact count from fetch
+                    $total_items_processed = count($remote_files_map) + (!self::$skip_db ? count($database) : 0);
                 }
 
                 if (!empty($all_files_to_process)) {
@@ -1884,7 +1910,15 @@ class Run {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
 
-        echo "\nBackup complete: $final_zip_name is ready.\n";
+        // FINAL SUMMARY
+        $final_size = file_exists($final_zip_name) ? filesize($final_zip_name) : 0;
+        
+        echo "\nBackup Completed Successfully\n";
+        echo "-----------------------------\n";
+        printf("%-15s %s\n", "File Name:", $final_zip_name);
+        printf("%-15s %s\n", "Total Size:", self::humanFilesize($final_size));
+        printf("%-15s %s\n", "Items:", number_format($total_items_processed));
+        echo "\n";
     }
 
     private static function sites() {
