@@ -26,6 +26,7 @@ class Run {
     private static $skip_db = false;
     private static $skip_files = false;
     private static $skip_checksums = false;
+    private static $cleanup = false;
 
     // Global Progress Tracking
     private static $global_bytes_total = 0;
@@ -62,6 +63,10 @@ class Run {
             }
             if ($arg === '--skip-checksums') {
                 self::$skip_checksums = true;
+                continue;
+            }
+            if ($arg === '--cleanup') {
+                self::$cleanup = true;
                 continue;
             }
 
@@ -203,6 +208,10 @@ class Run {
 
             case 'ncdu':
                 self::ncdu();
+                break;
+
+            case 'info':
+                self::info();
                 break;
 
             default:
@@ -1411,6 +1420,98 @@ class Run {
     }
 
     /**
+     * Displays information about the connected site.
+     */
+    private static function info() {
+        echo "Fetching site information for " . self::$siteUrl . "...\n";
+
+        // Default states
+        $status_label = "Unknown";
+        $temp_usage = "N/A";
+        $db_stats = "N/A";
+        $row_stats = "N/A";
+        $token_display = self::$token;
+        $scan_info = "No recent scan found";
+
+        try {
+            // 1. Check Connection & Temp Storage via /backup-size
+            $size_response = self::make_request('/backup-size', [], 'GET');
+            
+            if (isset($size_response->size)) {
+                $status_label = "Connected (Valid Credentials)";
+                $temp_usage = self::humanFilesize($size_response->size);
+
+                // Check for cleanup flag
+                if (self::$cleanup) {
+                    try {
+                        self::make_request('/cleanup', [], 'GET');
+                        $temp_usage .= " (purged)";
+                    } catch (\Exception $e) {
+                        $temp_usage .= " (purge failed)";
+                    }
+                }
+
+                // Process Cached Scan Stats
+                if (isset($size_response->scan_stats) && is_object($size_response->scan_stats)) {
+                    $stats = $size_response->scan_stats;
+                    $scan_size = self::humanFilesize($stats->total_size);
+                    $scan_count = number_format($stats->total_files);
+                    
+                    // Format the epoch timestamp using the LOCAL CLI timezone
+                    // 'T' adds the timezone abbreviation (e.g., EST, UTC)
+                    $scan_time = date('M j, Y g:i A T', $stats->timestamp);
+
+                    // Calculate relative time
+                    $time_diff = time() - $stats->timestamp;
+                    $age_str = ($time_diff < 60) ? "Just now" :
+                               (($time_diff < 3600) ? floor($time_diff/60) . "m ago" : 
+                               (($time_diff < 86400) ? floor($time_diff/3600) . "h ago" : floor($time_diff/86400) . "d ago"));
+
+                    $scan_info = "$scan_count files ($scan_size)\n";
+                    $scan_info .= sprintf("%-20s %s (%s)", "", "scanned $scan_time", $age_str);
+                }
+            } else {
+                $status_label = "Connected (Unexpected Response)";
+            }
+
+            // 2. Fetch Database Stats
+            $db_response = self::make_request('/database', [], 'GET');
+            if (is_array($db_response)) {
+                 $table_count = count($db_response);
+                 $total_bytes = array_sum(array_column($db_response, 'size'));
+                 $total_rows = array_sum(array_column($db_response, 'row_count'));
+                 
+                 $db_stats = number_format($table_count) . " tables (" . self::humanFilesize($total_bytes) . ")";
+                 $row_stats = number_format($total_rows) . " rows";
+            }
+
+        } catch (\Exception $e) {
+            $msg = $e->getMessage();
+            if (strpos($msg, '403') !== false) {
+                $status_label = "Invalid Credentials (403 Forbidden)";
+            } elseif (strpos($msg, '404') !== false) {
+                 $status_label = "Plugin not found or API disabled (404)";
+            } else {
+                $status_label = "Connection Failed: " . $msg;
+            }
+        }
+
+        // Display Output
+        echo "\nSite Information\n";
+        echo "----------------\n";
+        printf("%-20s %s\n", "Site URL:", self::$siteUrl);
+        printf("%-20s %s\n", "Token:", $token_display);
+        printf("%-20s %s\n", "Connection Status:", $status_label);
+        echo "\nStats\n";
+        echo "----------------\n";
+        printf("%-20s %s\n", "Temp Storage Used:", $temp_usage);
+        printf("%-20s %s\n", "File System:", $scan_info);
+        printf("%-20s %s\n", "Database Size:", $db_stats);
+        printf("%-20s %s\n", "Total Rows:", $row_stats);
+        echo "\n";
+    }
+
+    /**
      * Builds an aggregated associative tree from a flat file list for ncdu.
      */
     private static function build_ncdu_tree($all_remote_files) {
@@ -1946,6 +2047,9 @@ class Run {
         echo "    Options for ncdu:\n";
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI to load its manifest.\n";
         echo "      --debug                            Save raw manifest and ncdu input files locally for debugging.\n";
+        echo "\n";
+        echo "  disembark info <site-url>\n";
+        echo "    Display connection status, token, and storage usage for a site.\n";
         echo "\n";
         echo "Other Commands:\n";
         echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
