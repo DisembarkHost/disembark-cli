@@ -926,7 +926,7 @@ class Run {
                     throw new \Exception("Could not create temp DB directory.");
                 }
                 
-                if (file_put_contents($db_export_file, "/*!40101 SET NAMES utf8 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
+                if (file_put_contents($db_export_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
                     throw new \Exception("Could not write to local SQL file.");
                 }
 
