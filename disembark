@@ -5,6 +5,7 @@ namespace Disembark;
 class Run {
 
     const VERSION = '2.6.0';
+    const USER_AGENT = 'Disembark/' . self::VERSION;
 
     private static $siteUrl;
     private static $token;
@@ -27,6 +28,7 @@ class Run {
     private static $skip_files = false;
     private static $skip_checksums = false;
     private static $cleanup = false;
+    private static $user_agent = self::USER_AGENT;
 
     // Global Progress Tracking
     private static $global_bytes_total = 0;
@@ -97,6 +99,10 @@ class Run {
             }
             if (strpos($arg, '--large-file-threshold=') === 0) {
                 self::$large_file_threshold = self::convert_to_bytes(substr($arg, strlen('--large-file-threshold=')));
+                continue;
+            }
+            if (strpos($arg, '--user-agent=') === 0) {
+                self::$user_agent = substr($arg, strlen('--user-agent='));
                 continue;
             }
             
@@ -1235,8 +1241,8 @@ class Run {
                 curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 1800); 
-                
+                curl_setopt($ch, CURLOPT_TIMEOUT, 1800);
+                curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_multi_add_handle($mh, $ch);
                 $ch_id = is_object($ch) ? spl_object_id($ch) : (int)$ch;
                 
@@ -1392,7 +1398,7 @@ class Run {
                             curl_setopt($ch_dl, CURLOPT_SSL_VERIFYPEER, false);
                             curl_setopt($ch_dl, CURLOPT_FOLLOWLOCATION, true);
                             curl_setopt($ch_dl, CURLOPT_TIMEOUT, 3600);
-                            
+                            curl_setopt($ch_dl, CURLOPT_USERAGENT, self::$user_agent);
                             curl_multi_add_handle($mh, $ch_dl);
                             
                             unset($active_transfers[$ch_id]);
@@ -2445,7 +2451,7 @@ class Run {
                 curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-                
+                curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_setopt($ch, CURLOPT_NOPROGRESS, false);
                 curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function(
                     $resource, $download_size, $downloaded, $upload_size, $uploaded
@@ -2613,7 +2619,8 @@ class Run {
                 curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-                curl_setopt($ch, CURLOPT_NOPROGRESS, true); 
+                curl_setopt($ch, CURLOPT_NOPROGRESS, true);
+                curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
 
                 curl_multi_add_handle($mh, $ch);
                 $ch_int = (int)$ch;
@@ -2800,7 +2807,7 @@ class Run {
                 curl_setopt($ch, CURLOPT_TIMEOUT, 60);
                 curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 20);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-                
+                curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_multi_add_handle($mh, $ch);
                 $active_transfers[(int)$ch] = ['wrapper' => $item];
             }
@@ -2843,7 +2850,6 @@ class Run {
                         if (is_array($files)) {
                             foreach ($files as $file) {
                                 if (!isset($file->name)) continue;
-                                
                                 // Apply exclusions using static property
                                 $is_excluded = false;
                                 if (!empty(self::$exclude_paths)) {
@@ -2854,15 +2860,13 @@ class Run {
                                         }
                                     }
                                 }
-                                
+                               
                                 if ($is_excluded) continue;
-                                
                                 $remote_files_map[$file->name] = $file;
                                 // $all_remote_files[] = $file; // Uncomment if needed for debug
                             }
                         }
                         $processed_count++;
-                        
                         // Progress indicator
                         if ($processed_count % 10 === 0 || $processed_count === $total_chunks) {
                             $percent = round(($processed_count / $total_chunks) * 100);
@@ -2872,6 +2876,7 @@ class Run {
                 }
             }
         } while ($running > 0 || !empty($queue));
+
         if (is_resource($mh)) {
             curl_multi_close($mh);
         }
