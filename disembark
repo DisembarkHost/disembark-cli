@@ -2793,6 +2793,7 @@ class Run {
         $processed_count = 0;
         $remote_files_map = [];
         $all_remote_files = [];
+        $failed_chunks = [];
 
         echo " - Fetching $total_chunks manifest chunks (Concurrency: $max_concurrency)...\n";
         do {
@@ -2880,8 +2881,58 @@ class Run {
         if (is_resource($mh)) {
             curl_multi_close($mh);
         }
+
+        if (!empty($failed_chunks)) {
+            echo "\n - Attempting fallback stream download for " .
+            count($failed_chunks) . " failed chunks...\n";
+            
+            foreach ($failed_chunks as $chunk) {
+                // Determine temp path for this chunk
+                $temp_manifest_path = sys_get_temp_dir() .
+                '/' . basename($chunk->path);
+                
+                try {
+                    echo "   > Streaming manifest: {$chunk->path}\n";
+                    // Reuse existing robust stream downloader
+                    self::download_file_via_stream($chunk->path, $temp_manifest_path);
+                    if (file_exists($temp_manifest_path)) {
+                        $content = file_get_contents($temp_manifest_path);
+                        $files = json_decode($content);
+                        
+                        if (is_array($files)) {
+                            $added_count = 0;
+                            foreach ($files as $file) {
+                                if (!isset($file->name)) continue;
+                                // Apply exclusions
+                                $is_excluded = false;
+                                if (!empty(self::$exclude_paths)) {
+                                    foreach (self::$exclude_paths as $exclude_path) {
+                                        if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
+                                            $is_excluded = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                               
+                                if ($is_excluded) continue;
+                                
+                                $remote_files_map[$file->name] = $file;
+                                $added_count++;
+                            }
+                            echo "     - Recovered $added_count files from stream.\n";
+                        } else {
+                            echo "     - Failed to decode JSON from stream.\n";
+                        }
+                        
+                        unlink($temp_manifest_path);
+                    }
+                } catch (\Exception $e) {
+                    echo "     - Critical: Fallback failed for {$chunk->name}. {$e->getMessage()}\n";
+                }
+            }
+        }
+
         echo "\n - Manifest download complete.\n";
-        
         return [$remote_files_map, $all_remote_files];
     }
 
