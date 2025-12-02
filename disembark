@@ -1714,6 +1714,7 @@ class Run {
         $row_stats = "N/A";
         $token_display = self::$token;
         $scan_info = "No recent scan found";
+        $session_output = "";
 
         try {
             // 1. Check Connection & Temp Storage via /backup-size
@@ -1737,26 +1738,23 @@ class Run {
                     $stats = $size_response->scan_stats;
                     $scan_size = self::humanFilesize($stats->total_size);
                     $scan_count = number_format($stats->total_files);
+                    
+                    // Format timestamp (try to use system date for consistent timezone)
+                    $format = "'+%b %e, %Y %l:%M %p %Z'"; 
                     $scan_time = "";
-                    $format = "'+%b %e, %Y %l:%M %p %Z'"; // e.g. Nov 25, 2025 1:18 AM EST
-
-                    // 1. Try macOS / BSD Style
+                    
                     if (PHP_OS === 'Darwin') {
                         $cmd = "date -r {$stats->timestamp} $format";
                         $scan_time = trim((string)shell_exec($cmd));
-                    } 
-                    // 2. Try Linux / GNU Style
-                    elseif (strtoupper(substr(PHP_OS, 0, 3)) === 'LIN') {
+                    } elseif (strtoupper(substr(PHP_OS, 0, 3)) === 'LIN') {
                         $cmd = "date -d @{$stats->timestamp} $format";
                         $scan_time = trim((string)shell_exec($cmd));
                     }
 
-                    // 3. Fallback to PHP (likely UTC) if shell failed or OS is Windows
                     if (empty($scan_time)) {
                         $scan_time = date('M j, Y g:i A T', $stats->timestamp);
                     }
                     
-                    // Calculate relative time
                     $time_diff = time() - $stats->timestamp;
                     $age_str = ($time_diff < 60) ? "Just now" :
                                (($time_diff < 3600) ? floor($time_diff/60) . "m ago" : 
@@ -1765,6 +1763,21 @@ class Run {
                     $scan_info = "$scan_count files ($scan_size)\n";
                     $scan_info .= sprintf("%-20s %s (%s)", "", "scanned $scan_time", $age_str);
                 }
+
+                if (isset($size_response->sessions) && is_array($size_response->sessions) && !empty($size_response->sessions)) {
+                    $session_output .= "\nPrevious Sessions (Resume via --session-id)\n";
+                    $session_output .= "----------------------------------------\n";
+                    
+                    foreach ($size_response->sessions as $session) {
+                        // Use PHP date for list speed
+                        $date_str = date('M j, Y g:i A', $session->timestamp); 
+                        $id_short = $session->token;
+                        $chunks   = $session->count;
+                        
+                        $session_output .= sprintf("%-20s %-16s (%d chunks)\n", $date_str, $id_short, $chunks);
+                    }
+                }
+
             } else {
                 $status_label = "Connected (Unexpected Response)";
             }
@@ -1803,6 +1816,11 @@ class Run {
         printf("%-20s %s\n", "File System:", $scan_info);
         printf("%-20s %s\n", "Database Size:", $db_stats);
         printf("%-20s %s\n", "Total Rows:", $row_stats);
+        
+        if (!empty($session_output)) {
+            echo $session_output;
+        }
+        
         echo "\n";
     }
 
