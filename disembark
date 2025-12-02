@@ -2843,6 +2843,19 @@ class Run {
                             array_push($queue, $transfer['wrapper']);
                         } else {
                             echo "\n   - Warning: Failed to download manifest chunk $chunk_name after $max_retries attempts.\n";
+                            
+                            if (self::$debug) {
+                                $url = $transfer['wrapper']['chunk']->url ?? 'Unknown URL';
+                                echo "     [DEBUG] URL: $url\n";
+                                echo "     [DEBUG] HTTP Code: $http_code\n";
+                                echo "     [DEBUG] cURL Error: " . ($error ?: 'None') . "\n";
+                                if ($http_code !== 200 && !empty($content)) {
+                                     // Show a snippet of the body in case it contains a server error message
+                                     echo "     [DEBUG] Body Preview: " . substr(strip_tags($content), 0, 200) . "\n";
+                                }
+                            }
+
+                            $failed_chunks[] = $transfer['wrapper']['chunk']; // Queue for fallback
                             $processed_count++;
                         }
                     } else {
