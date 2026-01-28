@@ -1,5 +1,19 @@
 # Changelog
 
+## **v2.7.0** - January 28th, 2026
+
+### Added
+
+* **Cookies Argument:** Added support for a `--cookies` argument to pass custom cookies with API requests.
+* **User Agent:** Added a custom User-Agent header to all outgoing requests for better server compatibility and logging.
+* **Manifest Fetch Fallback:** Implemented a fallback mechanism for manifest fetching to improve reliability when the primary method fails.
+
+### Improved
+
+* **Info Command:** Enhanced the `info` command output with additional details.
+* **Debug Argument:** Improved the `--debug` argument functionality for better troubleshooting.
+* **Composer Update:** Updated project dependencies via Composer.
+
 ## **v2.6.0** - November 25th, 2025
 
 ### Added
