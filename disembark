@@ -29,6 +29,7 @@ class Run {
     private static $skip_checksums = false;
     private static $cleanup = false;
     private static $user_agent = self::USER_AGENT;
+    private static $cookie = null;
 
     // Global Progress Tracking
     private static $global_bytes_total = 0;
@@ -103,6 +104,10 @@ class Run {
             }
             if (strpos($arg, '--user-agent=') === 0) {
                 self::$user_agent = substr($arg, strlen('--user-agent='));
+                continue;
+            }
+            if (strpos($arg, '--cookie=') === 0) {
+                self::$cookie = substr($arg, strlen('--cookie='));
                 continue;
             }
             
@@ -368,7 +373,21 @@ class Run {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'];
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
         $url = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
-        $options = ['verify' => false, 'timeout' => 600]; // Standard timeout for most steps
+        if (self::$cookie) {
+            $headers['Cookie'] = self::$cookie;
+            
+            // Critical: Cloudflare often blocks requests without a valid Referer matching the cookie's domain
+            $headers['Referer'] = self::$siteUrl . '/'; 
+            
+            // Critical: Missing these standard headers flags the request as a bot
+            $headers['Accept-Language'] = 'en-US,en;q=0.9';
+            $headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8';
+        }
+        $options = [
+            'verify'    => false,
+            'timeout'   => 600,
+            'useragent' => self::$user_agent
+        ];
 
         try {
             switch (strtoupper($method)) {
@@ -389,7 +408,7 @@ class Run {
                     }
                     // For GET, build query params correctly
                     $query_params = http_build_query($data);
-                    $response = \WpOrg\Requests\Requests::get($url . '?' . $query_params, [], $options); // Pass empty headers array for GET
+                    $response = \WpOrg\Requests\Requests::get($url . '?' . $query_params, $headers, $options);
                     break;
             }
 
@@ -1239,6 +1258,9 @@ class Run {
                 curl_setopt($ch, CURLOPT_POST, 1);
                 curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
                 curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+                if (self::$cookie) {
+                    curl_setopt($ch, CURLOPT_COOKIE, self::$cookie);
+                }
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_TIMEOUT, 1800);
@@ -2468,6 +2490,9 @@ class Run {
                 curl_setopt($ch, CURLOPT_FILE, $fp);
                 curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                if (self::$cookie) {
+                    curl_setopt($ch, CURLOPT_COOKIE, self::$cookie);
+                }
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_setopt($ch, CURLOPT_NOPROGRESS, false);
@@ -2635,6 +2660,9 @@ class Run {
                 $ch = curl_init($url);
                 curl_setopt($ch, CURLOPT_FILE, $fp);
                 curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
+                if (self::$cookie) {
+                    curl_setopt($ch, CURLOPT_COOKIE, self::$cookie);
+                }
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
                 curl_setopt($ch, CURLOPT_NOPROGRESS, true);
@@ -2826,6 +2854,9 @@ class Run {
                 curl_setopt($ch, CURLOPT_TIMEOUT, 60);
                 curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 20);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                if (self::$cookie) {
+                    curl_setopt($ch, CURLOPT_COOKIE, self::$cookie);
+                }
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_multi_add_handle($mh, $ch);
                 $active_transfers[(int)$ch] = ['wrapper' => $item];
@@ -2982,10 +3013,14 @@ class Run {
                 $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
                 $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
                 $headers = ['Content-Type' => 'application/json'];
+                if (self::$cookie) {
+                    $headers['Cookie'] = self::$cookie;
+                }
                 $options = [
                     'verify' => false,
                     'timeout' => 1800,
                     'connect_timeout' => 30,
+                    'useragent' => self::$user_agent
                  ];
                 $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
 
