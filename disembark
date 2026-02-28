@@ -3053,6 +3053,14 @@ class Run {
      * Downloads a database export file, trying direct download first and falling back to stream.
      */
     private static function download_db_file($relative_path, $destination) {
+        // Strip site URL path prefix for subdirectory installs to avoid doubled paths
+        // e.g. "subdir/wp-content/uploads/..." -> "wp-content/uploads/..."
+        $site_parsed = parse_url(self::$siteUrl);
+        $site_path_prefix = isset($site_parsed['path']) ? ltrim($site_parsed['path'], '/') : '';
+        if (!empty($site_path_prefix) && strpos($relative_path, $site_path_prefix . '/') === 0) {
+            $relative_path = substr($relative_path, strlen($site_path_prefix) + 1);
+        }
+
         $path_parts = explode('/', $relative_path);
         $encoded_parts = array_map('rawurlencode', $path_parts);
         $encoded_relative_path = implode('/', $encoded_parts);
