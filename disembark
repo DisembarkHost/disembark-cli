@@ -2467,7 +2467,7 @@ class Run {
             $rel_files = [];
             self::zip_directory_collect($public_dir, $zip_tmp, $sql_file, $rel_files);
             echo "Uploading " . count($rel_files) . " files (" . self::humanFilesize(filesize($zip_tmp)) . ")...\n";
-            self::upload_zip_multipart('/import/upload-zip', $zip_tmp, $import_id);
+            self::upload_zip_to_staging($zip_tmp, $import_id);
             @unlink($zip_tmp);
             echo "Deploying files...\n";
             $deployed = 0;
@@ -2572,21 +2572,72 @@ class Run {
      * server's is_uploaded_file() check passes), carrying import_id and, for
      * token-auth sites, the token field. App-password auth rides the header.
      */
-    private static function upload_zip_multipart($endpoint, $zip_path, $import_id) {
+    /**
+     * Uploads a zip to staging. Small zips go in one POST; larger ones are sent
+     * in chunks (so a multi-GB site never needs a single huge request or the
+     * whole file in memory) and reassembled + extracted server-side.
+     */
+    private static function upload_zip_to_staging($zip_path, $import_id) {
+        $size            = filesize($zip_path);
+        $chunk_threshold = 40 * 1024 * 1024; // 40MB
+
+        if ($size <= $chunk_threshold) {
+            self::post_multipart('/import/upload-zip', self::upload_fields($import_id), 'restore.zip', file_get_contents($zip_path));
+            return;
+        }
+
+        // Chunked: stream the zip in pieces to /import/upload-chunk, then extract.
+        $chunk_bytes  = 20 * 1024 * 1024; // 20MB per chunk
+        $total_chunks = max(1, (int) ceil($size / $chunk_bytes));
+        $fh = fopen($zip_path, 'rb');
+        if (!$fh) {
+            throw new \Exception("Could not open zip for chunked upload.");
+        }
+        for ($i = 0; $i < $total_chunks; $i++) {
+            $data = fread($fh, $chunk_bytes);
+            self::post_multipart(
+                '/import/upload-chunk',
+                self::upload_fields($import_id, ['file_path' => 'restore.zip', 'chunk_index' => $i, 'total_chunks' => $total_chunks]),
+                'restore.zip',
+                $data
+            );
+            echo "\r  Uploaded chunk " . ($i + 1) . "/$total_chunks";
+        }
+        fclose($fh);
+        echo "\n";
+        self::make_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'POST');
+    }
+
+    /**
+     * Common multipart fields for upload requests: import_id, plus the token for
+     * token-auth sites (app-password auth rides the Authorization header).
+     */
+    private static function upload_fields($import_id, $extra = []) {
+        $fields = ['import_id' => $import_id];
+        if (!empty(self::$token)) {
+            $fields['token'] = self::$token;
+        }
+        return array_merge($fields, $extra);
+    }
+
+    /**
+     * POSTs multipart/form-data with a set of text fields plus one file part
+     * (so PHP populates $_FILES and the server's is_uploaded_file() passes).
+     */
+    private static function post_multipart($endpoint, $fields, $filename, $file_bytes) {
         $url      = self::rest_url($endpoint);
         $boundary = '----disembark' . bin2hex(random_bytes(8));
         $eol      = "\r\n";
 
-        $body  = "--$boundary$eol";
-        $body .= "Content-Disposition: form-data; name=\"import_id\"$eol$eol$import_id$eol";
-        if (!empty(self::$token)) {
+        $body = '';
+        foreach ($fields as $name => $value) {
             $body .= "--$boundary$eol";
-            $body .= "Content-Disposition: form-data; name=\"token\"$eol$eol" . self::$token . $eol;
+            $body .= "Content-Disposition: form-data; name=\"$name\"$eol$eol$value$eol";
         }
         $body .= "--$boundary$eol";
-        $body .= "Content-Disposition: form-data; name=\"file\"; filename=\"restore.zip\"$eol";
-        $body .= "Content-Type: application/zip$eol$eol";
-        $body .= file_get_contents($zip_path);
+        $body .= "Content-Disposition: form-data; name=\"file\"; filename=\"$filename\"$eol";
+        $body .= "Content-Type: application/octet-stream$eol$eol";
+        $body .= $file_bytes;
         $body .= "$eol--$boundary--$eol";
 
         $headers = ['Content-Type' => "multipart/form-data; boundary=$boundary"];
