@@ -4,12 +4,20 @@ namespace Disembark;
 
 class Run {
 
-    const VERSION = '2.7.0';
+    const VERSION = '2.8.0';
     const USER_AGENT = 'Disembark/' . self::VERSION;
 
     private static $siteUrl;
     private static $token;
     private static $backup_token;
+    // Application-password credentials (preferred auth). When set, requests
+    // send HTTP Basic Auth and the server authorizes via current_user_can.
+    private static $username;
+    private static $password;
+    // REST routing style for the site: 'pretty' (/wp-json/...) or 'rest_route'
+    // (/?rest_route=/...), the latter for sites with plain permalinks where the
+    // pretty path has no rewrite rule.
+    private static $rest_style = 'pretty';
     
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
@@ -30,6 +38,12 @@ class Run {
     private static $cleanup = false;
     private static $user_agent = self::USER_AGENT;
     private static $cookie = null;
+
+    // Restore options
+    private static $source_url = null;
+    private static $source_prefix = null;
+    private static $rollback_id = null;
+    private static $assume_yes = false;
 
     // Global Progress Tracking
     private static $global_bytes_total = 0;
@@ -70,6 +84,22 @@ class Run {
             }
             if ($arg === '--cleanup') {
                 self::$cleanup = true;
+                continue;
+            }
+            if ($arg === '--yes' || $arg === '-y') {
+                self::$assume_yes = true;
+                continue;
+            }
+            if (strpos($arg, '--source-url=') === 0) {
+                self::$source_url = rtrim(substr($arg, strlen('--source-url=')), '/');
+                continue;
+            }
+            if (strpos($arg, '--source-prefix=') === 0) {
+                self::$source_prefix = substr($arg, strlen('--source-prefix='));
+                continue;
+            }
+            if (strpos($arg, '--rollback=') === 0) {
+                self::$rollback_id = substr($arg, strlen('--rollback='));
                 continue;
             }
 
@@ -221,6 +251,23 @@ class Run {
                 self::ncdu();
                 break;
 
+            case 'restore':
+                // Roll back a prior import instead of restoring, when asked.
+                if (self::$rollback_id !== null) {
+                    self::restore_rollback(self::$rollback_id);
+                    break;
+                }
+                if ($sync_folder === null) {
+                    echo "Error: restore requires a <folder> (a snapshot produced by 'disembark backup').\n";
+                    exit(1);
+                }
+                // Resolve the folder to an absolute path (same rule as sync).
+                if (substr($sync_folder, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($sync_folder) > 1 && substr($sync_folder, 1, 1) === ':')) {
+                    $sync_folder = getcwd() . DIRECTORY_SEPARATOR . $sync_folder;
+                }
+                self::restore($sync_folder);
+                break;
+
             case 'info':
                 self::info();
                 break;
@@ -248,26 +295,54 @@ class Run {
         }
 
         if (empty($siteUrl) || empty($token)) {
-            echo "Error: Required arguments <site-url> and <token>.\n";
-            exit(1);
-        }
-        try {
-            // Test connection by fetching database info
-            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 60]);
-        } catch (\WpOrg\Requests\Exception $e) {
-            // Handle the exception
-            echo "Error: Request failed with error: {$e->getMessage()}\n";
+            echo "Error: Required arguments <site-url> and <token-or-credential>.\n";
             exit(1);
         }
 
-        if ($response->status_code != 200) {
-            echo "Error: Failed to connect to $siteUrl. Status code: {$response->status_code}. Please check your URL, token, and ensure the Disembark plugin is active.\n";
-            exit(1);
+        // A credential containing a colon is treated as an application password
+        // in "username:application password" form (the preferred, capability-
+        // gated auth). Anything else is the legacy per-site token.
+        $username    = null;
+        $app_password = null;
+        if (strpos($token, ':') !== false) {
+            list($username, $app_password) = explode(':', $token, 2);
+            // WordPress ignores the display spaces in application passwords.
+            $app_password = str_replace(' ', '', $app_password);
         }
 
-        $tables = json_decode($response->body);
-        if (empty($tables)) {
-            echo "Error: Connected to $siteUrl, but failed to retrieve database information. Please check plugin functionality.\n";
+        // Probe the pretty route first, then the plain-permalink form. Whichever
+        // returns the table list is stored so later commands use it directly.
+        $rest_style = null;
+        $last_status = null;
+        foreach (['pretty', 'rest_route'] as $style) {
+            $probe_url = ($style === 'rest_route')
+                ? "$siteUrl/?rest_route=/disembark/v1/database"
+                : "$siteUrl/wp-json/disembark/v1/database";
+            $headers = [];
+            if ($username !== null) {
+                $headers['Authorization'] = 'Basic ' . base64_encode("$username:$app_password");
+            } else {
+                $sep = (strpos($probe_url, '?') !== false) ? '&' : '?';
+                $probe_url .= $sep . 'token=' . urlencode($token);
+            }
+            try {
+                $response = \WpOrg\Requests\Requests::get($probe_url, $headers, ['verify' => false, 'timeout' => 60]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+            $last_status = $response->status_code;
+            if ($response->status_code === 200) {
+                $tables = json_decode($response->body);
+                if (!empty($tables)) {
+                    $rest_style = $style;
+                    break;
+                }
+            }
+        }
+
+        if ($rest_style === null) {
+            echo "Error: Failed to connect to $siteUrl (last status: $last_status). Check your URL, credentials, and that the Disembark plugin is active.\n";
             exit(1);
         }
 
@@ -289,23 +364,36 @@ class Run {
             }
         }
 
-        // Check if the siteUrl already exists and update it, otherwise add new
+        // Build the entry for this site: either app-password credentials or a
+        // legacy token.
+        if ($username !== null) {
+            $entry_data = (object) [
+                'siteUrl'    => $siteUrl,
+                'username'   => $username,
+                'password'   => $app_password,
+                'rest_style' => $rest_style,
+            ];
+        } else {
+            $entry_data = (object) [
+                'siteUrl'    => $siteUrl,
+                'token'      => $token,
+                'rest_style' => $rest_style,
+            ];
+        }
+
+        // Check if the siteUrl already exists and replace it, otherwise add new
         $found = false;
         foreach ($data as $key => $entry) {
             // Ensure entry is an object before accessing properties
             if (is_object($entry) && !empty($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                $data[$key]->token = $token; // Update token directly on the object within the array
+                $data[$key] = $entry_data; // Replace so stale auth fields don't linger
                 $found = true;
                 break;
             }
         }
 
         if (!$found) {
-            // Add new entry as an object
-            $data[] = (object) [
-                'siteUrl' => $siteUrl,
-                'token' => $token
-            ];
+            $data[] = $entry_data;
         }
 
         $jsonData = json_encode($data, JSON_PRETTY_PRINT);
@@ -313,8 +401,46 @@ class Run {
             echo "Error: Unable to write to $filePath.\n";
             exit(1);
         }
+        @chmod($filePath, 0600); // holds tokens / app passwords in plain text
 
-        echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
+        $auth_kind = $username !== null ? "application password for user '$username'" : "token";
+        echo "Successfully connected to $siteUrl using $auth_kind. Saved credentials to $filePath\n";
+    }
+
+    /**
+     * Persists (or updates) the stored token for a connected site, keeping any
+     * app-password fields. Used by restore to pin the destination's preserved
+     * token so a later --rollback still authenticates: the database import
+     * wipes application passwords, leaving the preserved site token as the
+     * only credential that survives a restore.
+     */
+    private static function save_site_token($siteUrl, $token) {
+        $homeDir = getenv('HOME');
+        if (!$homeDir || empty($token)) {
+            return;
+        }
+        $filePath = $homeDir . '/.disembark';
+        $data = [];
+        if (file_exists($filePath)) {
+            $data = json_decode(file_get_contents($filePath));
+            if (!is_array($data)) {
+                $data = is_object($data) ? [$data] : [];
+            }
+        }
+        $found = false;
+        foreach ($data as $entry) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $entry->token = $token;
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            $data[] = (object) ['siteUrl' => $siteUrl, 'token' => $token, 'rest_style' => self::$rest_style];
+        }
+        if (file_put_contents($filePath, json_encode($data, JSON_PRETTY_PRINT)) !== false) {
+            @chmod($filePath, 0600);
+        }
     }
 
     private static function remove($siteUrl) {
@@ -369,10 +495,38 @@ class Run {
         }
     }
 
-    private static function make_request($endpoint, $payload = [], $method = 'POST') {
+    /**
+     * Builds a REST URL for an endpoint honoring the site's routing style.
+     * $endpoint is like '/database' or '/import/sql'.
+     */
+    private static function rest_url($endpoint) {
+        if (self::$rest_style === 'rest_route') {
+            return self::$siteUrl . '/?rest_route=/disembark/v1' . $endpoint;
+        }
+        return self::$siteUrl . '/wp-json/disembark/v1' . $endpoint;
+    }
+
+    /**
+     * Returns the HTTP Basic Auth header value when application-password
+     * credentials are configured, otherwise null.
+     */
+    private static function auth_header() {
+        if (!empty(self::$username) && !empty(self::$password)) {
+            return 'Basic ' . base64_encode(self::$username . ':' . self::$password);
+        }
+        return null;
+    }
+
+    private static function make_request($endpoint, $payload = [], $method = 'POST', $quiet = false) {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'];
+        // Preferred: application-password Basic Auth. Fall back to the token,
+        // which make_request still sends in the body/query for token-only sites.
+        $auth = self::auth_header();
+        if ($auth) {
+            $headers['Authorization'] = $auth;
+        }
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
-        $url = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
+        $url = self::rest_url($endpoint);
         if (self::$cookie) {
             $headers['Cookie'] = self::$cookie;
             
@@ -393,7 +547,7 @@ class Run {
             switch (strtoupper($method)) {
                 case 'POST':
                     // Increase timeout specifically for zip operations which can take longer
-                    if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files') {
+                    if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files' || $endpoint === '/import/import-staged-sql') {
                         $options['timeout'] = 1800; // 30 minutes
                     } elseif (strpos($endpoint, '/export/database/') === 0 && isset($payload['parts'])) {
                         $options['timeout'] = 1200; // 20 minutes for large table parts
@@ -406,9 +560,11 @@ class Run {
                     if ($endpoint === '/cleanup') {
                         $options['timeout'] = 120;
                     }
-                    // For GET, build query params correctly
+                    // For GET, build query params correctly. rest_route URLs
+                    // already contain '?', so pick the separator accordingly.
                     $query_params = http_build_query($data);
-                    $response = \WpOrg\Requests\Requests::get($url . '?' . $query_params, $headers, $options);
+                    $sep = (strpos($url, '?') !== false) ? '&' : '?';
+                    $response = \WpOrg\Requests\Requests::get($url . $sep . $query_params, $headers, $options);
                     break;
             }
 
@@ -420,7 +576,11 @@ class Run {
                 } else {
                     $errorMessage .= " Response: " . substr($response->body, 0, 500);
                 }
-                echo $errorMessage . "\n";
+                // Quiet mode still throws — it just skips printing, for
+                // best-effort probes against sites that predate the endpoint.
+                if (!$quiet) {
+                    echo $errorMessage . "\n";
+                }
                 // Throw an exception instead of exiting directly to allow potential cleanup
                 throw new \Exception("API request failed for {$endpoint}");
             }
@@ -444,7 +604,9 @@ class Run {
                 }
                 // Not JSON and not an allowed raw endpoint, or it's empty
                 if (!empty(trim($response->body))) {
-                    echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                    if (!$quiet) {
+                        echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                    }
                     throw new \Exception("Invalid JSON response for {$endpoint}");
                 }
                 // Allow empty responses for cleanup
@@ -458,7 +620,9 @@ class Run {
             // If it was a JSON object/array, it will be a PHP object/array.
             return $decoded;
         } catch (\WpOrg\Requests\Exception $e) {
-            echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
+            if (!$quiet) {
+                echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
+            }
             // Re-throw or handle as needed
             throw $e; // Re-throw to allow potential cleanup in calling function
         }
@@ -710,7 +874,7 @@ class Run {
                 $attempts++;
                 try {
                     // UPDATED: Use self::$siteUrl
-                    $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                    $endpoint_url = self::rest_url('/stream-file');
                     
                     // UPDATED: Use self::$token
                     $payload = json_encode([
@@ -1241,7 +1405,7 @@ class Run {
                 $job['attempts']++;
                 
                 // Start STAGE_ZIP
-                $url = self::$siteUrl . "/wp-json/disembark/v1/zip-sync-files";
+                $url = self::rest_url("/zip-sync-files");
                 $payload = json_encode([
                     'token' => self::$token, 
                     'backup_token' => self::$backup_token, 
@@ -2046,6 +2210,28 @@ class Run {
         try {
             if (!mkdir($temp_directory, 0755, true)) throw new \Exception("Could not create temp directory $temp_directory.");
             if (!mkdir($local_public_path, 0755, true)) throw new \Exception("Could not create public directory.");
+
+            // Capture source metadata so `disembark restore` knows the origin URL
+            // and table prefix to remap. A failure here is non-fatal — restore can
+            // still be pointed with --source-url / --source-prefix.
+            try {
+                // Quiet: pre-2.8 sources don't have this endpoint and would
+                // otherwise print a scary 404 on every backup.
+                $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST', true);
+                if (is_object($src_info)) {
+                    $source_meta = [
+                        'home_url'  => $src_info->home_url ?? '',
+                        'site_url'  => $src_info->site_url ?? '',
+                        'db_prefix' => $src_info->db_prefix ?? '',
+                        'captured'  => date('c'),
+                    ];
+                    // Written inside public/ so it lands in the backup zip; the
+                    // restore step reads it and skips it when deploying files.
+                    file_put_contents($local_public_path . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
+                }
+            } catch (\Exception $e) {
+                echo "Note: source metadata not captured (source may be running pre-2.8 Disembark); 'disembark restore' will need --source-url.\n";
+            }
             // --- CALCULATE GLOBAL TOTALS ---
             $total_db_bytes = 0;
             $database = [];
@@ -2212,6 +2398,397 @@ class Run {
         echo "\n";
     }
 
+    /**
+     * Restores a local snapshot (produced by `disembark backup`) into a
+     * connected destination site: preflight -> snapshot -> upload+deploy files
+     * -> import DB (prefix-remapped) -> serialize-aware URL search/replace ->
+     * finalize. A rollback point is saved first so the import can be undone.
+     */
+    private static function restore($folder) {
+        if (!is_dir($folder)) {
+            echo "Error: folder not found: $folder\n";
+            exit(1);
+        }
+
+        // Locate the site files. A backup snapshot keeps them under public/.
+        $public_dir = $folder . '/public';
+        if (!is_dir($public_dir)) {
+            if (is_dir($folder . '/wp-includes') || is_dir($folder . '/wp-content')) {
+                $public_dir = $folder;
+            } else {
+                echo "Error: no 'public' directory in $folder. Point restore at a 'disembark backup' snapshot.\n";
+                exit(1);
+            }
+        }
+
+        // Locate the SQL dump (written into public/ by backup). More than one
+        // is ambiguous — refuse rather than guess which state to restore.
+        $sql_files = glob($public_dir . '/database-*.sql');
+        if (empty($sql_files)) {
+            $sql_files = glob($folder . '/database-*.sql');
+        }
+        if (count($sql_files) > 1) {
+            echo "Error: multiple database dumps found in the snapshot — remove the extras or re-run 'disembark backup':\n";
+            foreach ($sql_files as $f) {
+                echo "  - $f\n";
+            }
+            exit(1);
+        }
+        $sql_file = !empty($sql_files) ? $sql_files[0] : null;
+
+        // Resolve source metadata: --source-* overrides, else disembark-source.json.
+        $source_home   = self::$source_url;
+        $source_prefix = self::$source_prefix;
+        $meta_file     = $folder . '/disembark-source.json';
+        if (!file_exists($meta_file) && file_exists($public_dir . '/disembark-source.json')) {
+            $meta_file = $public_dir . '/disembark-source.json';
+        }
+        if (file_exists($meta_file)) {
+            $meta = json_decode(file_get_contents($meta_file));
+            if (is_object($meta)) {
+                if (!$source_home && !empty($meta->home_url))  $source_home   = rtrim($meta->home_url, '/');
+                if (!$source_prefix && !empty($meta->db_prefix)) $source_prefix = $meta->db_prefix;
+            }
+        }
+
+        $import_id = bin2hex(random_bytes(12));
+
+        // Preflight the destination.
+        echo "Preflighting destination " . self::$siteUrl . "...\n";
+        $pre = self::make_request('/import/preflight', ['import_id' => $import_id], 'POST');
+        if (!is_object($pre)) {
+            echo "Error: preflight failed.\n";
+            exit(1);
+        }
+        $dest_home   = rtrim($pre->home_url ?? self::$siteUrl, '/');
+        $dest_prefix = $pre->db_prefix ?? '';
+
+        // The DB import overwrites users/usermeta (killing any application
+        // password) but the plugin preserves its token across the import. So
+        // pin auth to that token for every step after this, regardless of how we
+        // connected — otherwise post-import calls (search-replace, finalize)
+        // would 403.
+        $was_app_password = !empty(self::$username);
+        if (!empty($pre->disembark_token)) {
+            self::$token    = $pre->disembark_token;
+            self::$username = null;
+            self::$password = null;
+            if ($was_app_password) {
+                // Persist the pinned token so a later --rollback (a fresh
+                // process) can still authenticate after the import killed the
+                // application password.
+                self::save_site_token(self::$siteUrl, $pre->disembark_token);
+            }
+        } elseif ($was_app_password && empty(self::$token)) {
+            echo "Error: the destination did not return its Disembark token. With application-password\n";
+            echo "auth alone, access is lost mid-restore (the database import replaces wp_users) and a\n";
+            echo "rollback would be impossible. Update Disembark on the destination, or connect with\n";
+            echo "the site token instead: disembark connect " . self::$siteUrl . " <token>\n";
+            exit(1);
+        }
+
+        // Summarise and confirm — this overwrites the destination.
+        echo "\n";
+        echo "About to RESTORE into: " . self::$siteUrl . "\n";
+        echo "  Source folder : $folder\n";
+        echo "  Files         : " . (!self::$skip_files ? "yes" : "skipped") . "\n";
+        echo "  Database      : " . (!self::$skip_db && $sql_file ? basename($sql_file) : (self::$skip_db ? "skipped" : "none found")) . "\n";
+        if ($source_home) {
+            echo "  URL replace   : $source_home  ->  $dest_home\n";
+        } else {
+            echo "  URL replace   : (none - pass --source-url to rewrite URLs)\n";
+        }
+        if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+            echo "  Prefix remap  : $source_prefix  ->  $dest_prefix\n";
+        }
+        echo "  This OVERWRITES the destination database and files. A rollback point is saved first.\n\n";
+        if (!self::$assume_yes) {
+            echo "Type 'yes' to continue: ";
+            $line = trim(fgets(STDIN));
+            if (strtolower($line) !== 'yes') {
+                echo "Aborted.\n";
+                exit(1);
+            }
+        }
+
+        // Save a rollback point. Abort while the destination is still intact
+        // if the snapshot can't be verified — without it there is no undo.
+        echo "Creating rollback snapshot...\n";
+        try {
+            $snap = self::make_request('/import/snapshot', ['import_id' => $import_id], 'POST');
+        } catch (\Exception $e) {
+            $snap = null;
+        }
+        if (!is_object($snap) || empty($snap->rollback_id)) {
+            echo "Error: could not create the rollback snapshot. Aborting — nothing was changed.\n";
+            exit(1);
+        }
+        echo "  Rollback id: $import_id\n";
+        echo "  (undo at any point with: disembark restore " . self::$siteUrl . " --rollback=$import_id)\n";
+
+        $zip_tmp = null;
+        try {
+            // Files: zip the tree, upload, deploy in batches.
+            if (!self::$skip_files) {
+                echo "Packaging files...\n";
+                $zip_tmp   = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-restore-' . $import_id . '.zip';
+                $rel_files = [];
+                self::zip_directory_collect($public_dir, $zip_tmp, $rel_files);
+                echo "Uploading " . count($rel_files) . " files (" . self::humanFilesize(filesize($zip_tmp)) . ")...\n";
+                self::upload_zip_to_staging($zip_tmp, $import_id);
+                @unlink($zip_tmp);
+                $zip_tmp = null;
+                echo "Deploying files...\n";
+                $deployed      = 0;
+                $deploy_errors = [];
+                foreach (array_chunk($rel_files, 500) as $batch) {
+                    $dep = self::make_request('/import/deploy-files', ['import_id' => $import_id, 'files' => $batch], 'POST');
+                    if (is_object($dep) && isset($dep->deployed)) {
+                        $deployed += (int) $dep->deployed;
+                    }
+                    if (is_object($dep) && !empty($dep->errors)) {
+                        $deploy_errors = array_merge($deploy_errors, (array) $dep->errors);
+                    }
+                }
+                // Every file sent must land — proceeding to wipe the database
+                // after a partial (or zero) deploy would leave a broken hybrid.
+                if ($deployed < count($rel_files)) {
+                    $detail = !empty($deploy_errors) ? ' First error: ' . $deploy_errors[0] : '';
+                    throw new \Exception("only {$deployed} of " . count($rel_files) . " files deployed.{$detail}");
+                }
+                echo "  Deployed $deployed files.\n";
+            }
+
+            // Database: stage the dump on the server (chunked, so a large dump
+            // never needs one giant request), then import it there. The server
+            // applies the transforms per statement (prefix remap on identifiers,
+            // DROP-before-CREATE) — safer than rewriting the whole dump here,
+            // where INSERT values could be corrupted.
+            if (!self::$skip_db && $sql_file) {
+                echo "Uploading database (" . self::humanFilesize(filesize($sql_file)) . ")...\n";
+                // Staged as database-import.sql: the server's deploy step skips
+                // database-*.sql, so the dump can never land in the web root.
+                self::upload_file_to_staging($sql_file, 'database-import.sql', $import_id);
+                echo "Importing database...\n";
+                $payload = ['import_id' => $import_id, 'sql_file' => 'database-import.sql'];
+                if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+                    $payload['old_prefix'] = $source_prefix;
+                    $payload['new_prefix'] = $dest_prefix;
+                }
+                $res = self::make_request('/import/import-staged-sql', $payload, 'POST');
+                if (is_object($res)) {
+                    echo "  " . ($res->statements_executed ?? 0) . " statements executed";
+                    if (!empty($res->errors)) {
+                        echo ", " . count($res->errors) . " errors (first: " . substr($res->errors[0], 0, 120) . ")";
+                    }
+                    echo ".\n";
+                }
+
+                // Cross-prefix migration: remap the prefix stored inside the data
+                // (usermeta capabilities, options user_roles) so users keep roles.
+                if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+                    echo "Remapping table prefix in data ($source_prefix -> $dest_prefix)...\n";
+                    $rp = self::make_request('/import/remap-prefix', ['import_id' => $import_id, 'old_prefix' => $source_prefix, 'new_prefix' => $dest_prefix], 'POST');
+                    if (is_object($rp)) {
+                        echo "  " . ($rp->keys_changed ?? 0) . " keys remapped.\n";
+                    }
+                }
+
+                if ($source_home && $dest_home && $source_home !== $dest_home) {
+                    echo "Rewriting URLs ($source_home -> $dest_home)...\n";
+                    $sr = self::make_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'POST');
+                    if (is_object($sr)) {
+                        echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
+                    }
+                }
+            }
+
+            echo "Finalizing...\n";
+            self::make_request('/import/finalize', ['import_id' => $import_id], 'POST');
+        } catch (\Exception $e) {
+            if ($zip_tmp) {
+                @unlink($zip_tmp);
+            }
+            echo "\nError: restore failed: {$e->getMessage()}\n";
+            echo "The destination may be partially modified. Undo with:\n";
+            echo "  disembark restore " . self::$siteUrl . " --rollback=$import_id\n";
+            exit(1);
+        }
+
+        echo "\nRestore complete. Rollback id: $import_id\n";
+        echo "To undo:  disembark restore " . self::$siteUrl . " --rollback=$import_id\n";
+    }
+
+    /**
+     * Undo a prior restore using its saved rollback point.
+     */
+    private static function restore_rollback($id) {
+        echo "Rolling back import $id on " . self::$siteUrl . "...\n";
+        $res = self::make_request('/import/rollback', ['import_id' => $id], 'POST');
+        if (is_object($res) && !empty($res->success)) {
+            echo "Rollback complete. Tables restored: " . ($res->tables_restored ?? '?') . ", files restored: " . ($res->files_restored ?? '?') . ".\n";
+        } else {
+            echo "Rollback finished (response: " . json_encode($res) . ").\n";
+        }
+    }
+
+    /**
+     * Zips every file under $source (recursively), collecting the archive-
+     * relative paths. Skips ALL database-*.sql dumps by pattern (a deployed
+     * dump would be a guessable-URL full-database disclosure), Disembark's own
+     * snapshot metadata, and wp-config.php (the server never deploys it, and
+     * the source's credentials don't belong in the destination's staging).
+     */
+    private static function zip_directory_collect($source, $zip_path, &$rel_files) {
+        $rel_files = [];
+        $zip = new \ZipArchive();
+        if ($zip->open($zip_path, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
+            throw new \Exception("Could not create zip at $zip_path");
+        }
+        $source = rtrim($source, DIRECTORY_SEPARATOR);
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($source, \RecursiveDirectoryIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($it as $file) {
+            if ($file->isDir()) {
+                continue;
+            }
+            $path = $file->getPathname();
+            $base = basename($path);
+            if ($base === 'disembark-source.json' || $base === 'wp-config.php') {
+                continue;
+            }
+            if (preg_match('/^database-.*\.sql$/', $base)) {
+                continue;
+            }
+            $rel = ltrim(substr($path, strlen($source)), DIRECTORY_SEPARATOR);
+            $rel = str_replace('\\', '/', $rel);
+            $zip->addFile($path, $rel);
+            $rel_files[] = $rel;
+        }
+        $zip->close();
+    }
+
+    /**
+     * Uploads a zip to staging. Small zips go in one POST; larger ones are sent
+     * in chunks (so a multi-GB site never needs a single huge request or the
+     * whole file in memory) and reassembled + extracted server-side.
+     */
+    private static function upload_zip_to_staging($zip_path, $import_id) {
+        $chunk_threshold = 40 * 1024 * 1024; // 40MB
+
+        if (filesize($zip_path) <= $chunk_threshold) {
+            self::post_multipart('/import/upload-zip', self::upload_fields($import_id), 'restore.zip', file_get_contents($zip_path));
+            return;
+        }
+
+        self::upload_file_to_staging($zip_path, 'restore.zip', $import_id);
+        self::make_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'POST');
+    }
+
+    /**
+     * Uploads any local file into the import's staging area as $remote_name,
+     * streamed in chunks to /import/upload-chunk so no single request carries
+     * the whole file (and the file is never fully read into memory).
+     */
+    private static function upload_file_to_staging($local_path, $remote_name, $import_id) {
+        $size         = filesize($local_path);
+        $chunk_bytes  = 20 * 1024 * 1024; // 20MB per chunk
+        $total_chunks = max(1, (int) ceil($size / $chunk_bytes));
+        $fh = fopen($local_path, 'rb');
+        if (!$fh) {
+            throw new \Exception("Could not open $local_path for chunked upload.");
+        }
+        for ($i = 0; $i < $total_chunks; $i++) {
+            $data = fread($fh, $chunk_bytes);
+            if ($data === false) {
+                fclose($fh);
+                throw new \Exception("Failed reading $local_path at chunk $i.");
+            }
+            self::post_multipart(
+                '/import/upload-chunk',
+                self::upload_fields($import_id, ['file_path' => $remote_name, 'chunk_index' => $i, 'total_chunks' => $total_chunks]),
+                $remote_name,
+                $data
+            );
+            if ($total_chunks > 1) {
+                echo "\r  Uploaded chunk " . ($i + 1) . "/$total_chunks";
+            }
+        }
+        fclose($fh);
+        if ($total_chunks > 1) {
+            echo "\n";
+        }
+    }
+
+    /**
+     * Common multipart fields for upload requests: import_id, plus the token for
+     * token-auth sites (app-password auth rides the Authorization header).
+     */
+    private static function upload_fields($import_id, $extra = []) {
+        $fields = ['import_id' => $import_id];
+        if (!empty(self::$token)) {
+            $fields['token'] = self::$token;
+        }
+        return array_merge($fields, $extra);
+    }
+
+    /**
+     * POSTs multipart/form-data with a set of text fields plus one file part
+     * (so PHP populates $_FILES and the server's is_uploaded_file() passes).
+     * Transient failures (connection drops, 502/503/504 gateway hiccups) are
+     * retried with backoff — chunked uploads shouldn't die on one bad proxy
+     * response mid-transfer.
+     */
+    private static function post_multipart($endpoint, $fields, $filename, $file_bytes) {
+        $url      = self::rest_url($endpoint);
+        $boundary = '----disembark' . bin2hex(random_bytes(8));
+        $eol      = "\r\n";
+
+        $body = '';
+        foreach ($fields as $name => $value) {
+            $body .= "--$boundary$eol";
+            $body .= "Content-Disposition: form-data; name=\"$name\"$eol$eol$value$eol";
+        }
+        $body .= "--$boundary$eol";
+        $body .= "Content-Disposition: form-data; name=\"file\"; filename=\"$filename\"$eol";
+        $body .= "Content-Type: application/octet-stream$eol$eol";
+        $body .= $file_bytes;
+        $body .= "$eol--$boundary--$eol";
+
+        $headers = ['Content-Type' => "multipart/form-data; boundary=$boundary"];
+        $auth = self::auth_header();
+        if ($auth) {
+            $headers['Authorization'] = $auth;
+        }
+        $options  = ['verify' => false, 'timeout' => 1800, 'useragent' => self::$user_agent];
+
+        $attempts = 3;
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            try {
+                $response = \WpOrg\Requests\Requests::post($url, $headers, $body, $options);
+            } catch (\WpOrg\Requests\Exception $e) {
+                if ($attempt < $attempts) {
+                    echo "\n  Upload attempt $attempt failed ({$e->getMessage()}); retrying...\n";
+                    sleep($attempt * 5);
+                    continue;
+                }
+                throw new \Exception("upload failed: {$e->getMessage()}");
+            }
+            if ($response->status_code === 200) {
+                return json_decode($response->body);
+            }
+            if (in_array($response->status_code, [502, 503, 504], true) && $attempt < $attempts) {
+                echo "\n  Upload got HTTP {$response->status_code}; retrying...\n";
+                sleep($attempt * 5);
+                continue;
+            }
+            echo "Error: upload failed. HTTP {$response->status_code}: " . substr($response->body, 0, 300) . "\n";
+            throw new \Exception("upload failed");
+        }
+    }
+
     private static function sites() {
         $homeDir = getenv('HOME');
         if (!$homeDir) {
@@ -2365,11 +2942,23 @@ class Run {
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI to load its manifest.\n";
         echo "      --debug                            Save raw manifest and ncdu input files locally for debugging.\n";
         echo "\n";
+        echo "  disembark restore <site-url> <folder> [options]\n";
+        echo "    Restore a local backup snapshot into a connected site.\n";
+        echo "\n";
+        echo "    Options for restore:\n";
+        echo "      --source-url=<url>                 Origin URL to rewrite to the destination (else read from disembark-source.json).\n";
+        echo "      --source-prefix=<prefix>           Origin DB table prefix to remap (else read from disembark-source.json).\n";
+        echo "      --skip-db                          Restore files only.\n";
+        echo "      --skip-files                       Restore database only.\n";
+        echo "      --yes, -y                          Skip the confirmation prompt.\n";
+        echo "      --rollback=<id>                    Undo a prior restore using its rollback id (no <folder> needed).\n";
+        echo "\n";
         echo "  disembark info <site-url>\n";
         echo "    Display connection status, token, and storage usage for a site.\n";
         echo "\n";
         echo "Other Commands:\n";
-        echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
+        echo "  disembark connect <site-url> <token>              Connect using a per-site token.\n";
+        echo "  disembark connect <site-url> \"<user>:<app-password>\"  Connect using a WordPress application password (preferred).\n";
         echo "  disembark remove <site-url>            Remove a connected site and its credentials.\n";
         echo "  disembark list                         List all sites currently connected.\n";
         echo "  disembark upgrade                      Upgrade the Disembark CLI tool to the latest version.\n";
@@ -2406,12 +2995,25 @@ class Run {
 
         foreach ($data as $entry) {
             if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === self::$siteUrl) {
-                self::$token = $entry->token;
+                // Load both credential kinds when present: after a restore the
+                // application password is gone (the import replaced wp_users)
+                // but the pinned site token still works — --rollback relies on
+                // it. make_request sends whichever it has.
+                if (!empty($entry->username) && isset($entry->password)) {
+                    self::$username = $entry->username;
+                    self::$password = $entry->password;
+                }
+                if (!empty($entry->token)) {
+                    self::$token = $entry->token;
+                }
+                if (!empty($entry->rest_style)) {
+                    self::$rest_style = $entry->rest_style;
+                }
                 return;
             }
         }
 
-        echo "Error: No token found for " . self::$siteUrl . ".\n";
+        echo "Error: No credentials found for " . self::$siteUrl . ".\n";
         exit(1);
     }
 
@@ -3010,7 +3612,7 @@ class Run {
             $attempts++;
             try {
                 // Use self::$siteUrl and self::$token
-                $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                $endpoint_url = self::rest_url('/stream-file');
                 $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
                 $headers = ['Content-Type' => 'application/json'];
                 if (self::$cookie) {
