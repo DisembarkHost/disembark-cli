@@ -2382,6 +2382,17 @@ class Run {
         $dest_home   = rtrim($pre->home_url ?? self::$siteUrl, '/');
         $dest_prefix = $pre->db_prefix ?? '';
 
+        // The DB import overwrites users/usermeta (killing any application
+        // password) but the plugin preserves its token across the import. So
+        // pin auth to that token for every step after this, regardless of how we
+        // connected — otherwise post-import calls (search-replace, finalize)
+        // would 403.
+        if (!empty($pre->disembark_token)) {
+            self::$token    = $pre->disembark_token;
+            self::$username = null;
+            self::$password = null;
+        }
+
         // Summarise and confirm — this overwrites the destination.
         echo "\n";
         echo "About to RESTORE into: " . self::$siteUrl . "\n";
