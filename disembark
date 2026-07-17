@@ -2503,6 +2503,16 @@ class Run {
                 echo ".\n";
             }
 
+            // Cross-prefix migration: remap the prefix stored inside the data
+            // (usermeta capabilities, options user_roles) so users keep roles.
+            if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+                echo "Remapping table prefix in data ($source_prefix -> $dest_prefix)...\n";
+                $rp = self::make_request('/import/remap-prefix', ['import_id' => $import_id, 'old_prefix' => $source_prefix, 'new_prefix' => $dest_prefix], 'POST');
+                if (is_object($rp)) {
+                    echo "  " . ($rp->keys_changed ?? 0) . " keys remapped.\n";
+                }
+            }
+
             if ($source_home && $dest_home && $source_home !== $dest_home) {
                 echo "Rewriting URLs ($source_home -> $dest_home)...\n";
                 $sr = self::make_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'POST');
