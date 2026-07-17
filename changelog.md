@@ -1,6 +1,6 @@
 # Changelog
 
-## **v2.8.0** - Unreleased
+## **v2.8.0** - July 17, 2026
 
 ### Added
 * **Restore Command:** `disembark restore <site-url> <folder>` pushes a local backup snapshot into a connected site — preflight, rollback snapshot, file upload + deploy, database import (with table-prefix remap), serialize-aware URL search/replace, and finalize. `disembark restore <site-url> --rollback=<id>` undoes an import.
