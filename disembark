@@ -10,6 +10,10 @@ class Run {
     private static $siteUrl;
     private static $token;
     private static $backup_token;
+    // Application-password credentials (preferred auth). When set, requests
+    // send HTTP Basic Auth and the server authorizes via current_user_can.
+    private static $username;
+    private static $password;
     
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
@@ -248,12 +252,33 @@ class Run {
         }
 
         if (empty($siteUrl) || empty($token)) {
-            echo "Error: Required arguments <site-url> and <token>.\n";
+            echo "Error: Required arguments <site-url> and <token-or-credential>.\n";
             exit(1);
         }
+
+        // A credential containing a colon is treated as an application password
+        // in "username:application password" form (the preferred, capability-
+        // gated auth). Anything else is the legacy per-site token.
+        $username    = null;
+        $app_password = null;
+        if (strpos($token, ':') !== false) {
+            list($username, $app_password) = explode(':', $token, 2);
+            // WordPress ignores the display spaces in application passwords.
+            $app_password = str_replace(' ', '', $app_password);
+        }
+
         try {
-            // Test connection by fetching database info
-            $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 60]);
+            if ($username !== null) {
+                // Verify via Basic Auth so we know the app password works.
+                $response = \WpOrg\Requests\Requests::get(
+                    "$siteUrl/wp-json/disembark/v1/database",
+                    ['Authorization' => 'Basic ' . base64_encode("$username:$app_password")],
+                    ['verify' => false, 'timeout' => 60]
+                );
+            } else {
+                // Test connection by fetching database info with the token.
+                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 60]);
+            }
         } catch (\WpOrg\Requests\Exception $e) {
             // Handle the exception
             echo "Error: Request failed with error: {$e->getMessage()}\n";
@@ -289,23 +314,34 @@ class Run {
             }
         }
 
-        // Check if the siteUrl already exists and update it, otherwise add new
+        // Build the entry for this site: either app-password credentials or a
+        // legacy token.
+        if ($username !== null) {
+            $entry_data = (object) [
+                'siteUrl'  => $siteUrl,
+                'username' => $username,
+                'password' => $app_password,
+            ];
+        } else {
+            $entry_data = (object) [
+                'siteUrl' => $siteUrl,
+                'token'   => $token,
+            ];
+        }
+
+        // Check if the siteUrl already exists and replace it, otherwise add new
         $found = false;
         foreach ($data as $key => $entry) {
             // Ensure entry is an object before accessing properties
             if (is_object($entry) && !empty($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
-                $data[$key]->token = $token; // Update token directly on the object within the array
+                $data[$key] = $entry_data; // Replace so stale auth fields don't linger
                 $found = true;
                 break;
             }
         }
 
         if (!$found) {
-            // Add new entry as an object
-            $data[] = (object) [
-                'siteUrl' => $siteUrl,
-                'token' => $token
-            ];
+            $data[] = $entry_data;
         }
 
         $jsonData = json_encode($data, JSON_PRETTY_PRINT);
@@ -314,7 +350,8 @@ class Run {
             exit(1);
         }
 
-        echo "Successfully connected to $siteUrl and saved credentials to $filePath\n";
+        $auth_kind = $username !== null ? "application password for user '$username'" : "token";
+        echo "Successfully connected to $siteUrl using $auth_kind. Saved credentials to $filePath\n";
     }
 
     private static function remove($siteUrl) {
@@ -369,8 +406,25 @@ class Run {
         }
     }
 
+    /**
+     * Returns the HTTP Basic Auth header value when application-password
+     * credentials are configured, otherwise null.
+     */
+    private static function auth_header() {
+        if (!empty(self::$username) && !empty(self::$password)) {
+            return 'Basic ' . base64_encode(self::$username . ':' . self::$password);
+        }
+        return null;
+    }
+
     private static function make_request($endpoint, $payload = [], $method = 'POST') {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'];
+        // Preferred: application-password Basic Auth. Fall back to the token,
+        // which make_request still sends in the body/query for token-only sites.
+        $auth = self::auth_header();
+        if ($auth) {
+            $headers['Authorization'] = $auth;
+        }
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
         $url = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
         if (self::$cookie) {
@@ -2369,7 +2423,8 @@ class Run {
         echo "    Display connection status, token, and storage usage for a site.\n";
         echo "\n";
         echo "Other Commands:\n";
-        echo "  disembark connect <site-url> <token>   Connect to a site and save its token.\n";
+        echo "  disembark connect <site-url> <token>              Connect using a per-site token.\n";
+        echo "  disembark connect <site-url> \"<user>:<app-password>\"  Connect using a WordPress application password (preferred).\n";
         echo "  disembark remove <site-url>            Remove a connected site and its credentials.\n";
         echo "  disembark list                         List all sites currently connected.\n";
         echo "  disembark upgrade                      Upgrade the Disembark CLI tool to the latest version.\n";
@@ -2406,12 +2461,17 @@ class Run {
 
         foreach ($data as $entry) {
             if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === self::$siteUrl) {
-                self::$token = $entry->token;
+                if (!empty($entry->username) && isset($entry->password)) {
+                    self::$username = $entry->username;
+                    self::$password = $entry->password;
+                } else {
+                    self::$token = isset($entry->token) ? $entry->token : null;
+                }
                 return;
             }
         }
 
-        echo "Error: No token found for " . self::$siteUrl . ".\n";
+        echo "Error: No credentials found for " . self::$siteUrl . ".\n";
         exit(1);
     }
 
