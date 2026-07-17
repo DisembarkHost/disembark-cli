@@ -401,9 +401,46 @@ class Run {
             echo "Error: Unable to write to $filePath.\n";
             exit(1);
         }
+        @chmod($filePath, 0600); // holds tokens / app passwords in plain text
 
         $auth_kind = $username !== null ? "application password for user '$username'" : "token";
         echo "Successfully connected to $siteUrl using $auth_kind. Saved credentials to $filePath\n";
+    }
+
+    /**
+     * Persists (or updates) the stored token for a connected site, keeping any
+     * app-password fields. Used by restore to pin the destination's preserved
+     * token so a later --rollback still authenticates: the database import
+     * wipes application passwords, leaving the preserved site token as the
+     * only credential that survives a restore.
+     */
+    private static function save_site_token($siteUrl, $token) {
+        $homeDir = getenv('HOME');
+        if (!$homeDir || empty($token)) {
+            return;
+        }
+        $filePath = $homeDir . '/.disembark';
+        $data = [];
+        if (file_exists($filePath)) {
+            $data = json_decode(file_get_contents($filePath));
+            if (!is_array($data)) {
+                $data = is_object($data) ? [$data] : [];
+            }
+        }
+        $found = false;
+        foreach ($data as $entry) {
+            if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === $siteUrl) {
+                $entry->token = $token;
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            $data[] = (object) ['siteUrl' => $siteUrl, 'token' => $token, 'rest_style' => self::$rest_style];
+        }
+        if (file_put_contents($filePath, json_encode($data, JSON_PRETTY_PRINT)) !== false) {
+            @chmod($filePath, 0600);
+        }
     }
 
     private static function remove($siteUrl) {
@@ -470,19 +507,6 @@ class Run {
     }
 
     /**
-     * Like rest_url() but appends query parameters with the correct separator
-     * (rest_route URLs already contain a '?').
-     */
-    private static function rest_url_query($endpoint, $params) {
-        $url = self::rest_url($endpoint);
-        if (empty($params)) {
-            return $url;
-        }
-        $sep = (strpos($url, '?') !== false) ? '&' : '?';
-        return $url . $sep . http_build_query($params);
-    }
-
-    /**
      * Returns the HTTP Basic Auth header value when application-password
      * credentials are configured, otherwise null.
      */
@@ -493,7 +517,7 @@ class Run {
         return null;
     }
 
-    private static function make_request($endpoint, $payload = [], $method = 'POST') {
+    private static function make_request($endpoint, $payload = [], $method = 'POST', $quiet = false) {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'];
         // Preferred: application-password Basic Auth. Fall back to the token,
         // which make_request still sends in the body/query for token-only sites.
@@ -523,7 +547,7 @@ class Run {
             switch (strtoupper($method)) {
                 case 'POST':
                     // Increase timeout specifically for zip operations which can take longer
-                    if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files') {
+                    if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files' || $endpoint === '/import/import-staged-sql') {
                         $options['timeout'] = 1800; // 30 minutes
                     } elseif (strpos($endpoint, '/export/database/') === 0 && isset($payload['parts'])) {
                         $options['timeout'] = 1200; // 20 minutes for large table parts
@@ -552,7 +576,11 @@ class Run {
                 } else {
                     $errorMessage .= " Response: " . substr($response->body, 0, 500);
                 }
-                echo $errorMessage . "\n";
+                // Quiet mode still throws — it just skips printing, for
+                // best-effort probes against sites that predate the endpoint.
+                if (!$quiet) {
+                    echo $errorMessage . "\n";
+                }
                 // Throw an exception instead of exiting directly to allow potential cleanup
                 throw new \Exception("API request failed for {$endpoint}");
             }
@@ -576,7 +604,9 @@ class Run {
                 }
                 // Not JSON and not an allowed raw endpoint, or it's empty
                 if (!empty(trim($response->body))) {
-                    echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                    if (!$quiet) {
+                        echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                    }
                     throw new \Exception("Invalid JSON response for {$endpoint}");
                 }
                 // Allow empty responses for cleanup
@@ -590,7 +620,9 @@ class Run {
             // If it was a JSON object/array, it will be a PHP object/array.
             return $decoded;
         } catch (\WpOrg\Requests\Exception $e) {
-            echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
+            if (!$quiet) {
+                echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
+            }
             // Re-throw or handle as needed
             throw $e; // Re-throw to allow potential cleanup in calling function
         }
@@ -2183,7 +2215,9 @@ class Run {
             // and table prefix to remap. A failure here is non-fatal — restore can
             // still be pointed with --source-url / --source-prefix.
             try {
-                $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST');
+                // Quiet: pre-2.8 sources don't have this endpoint and would
+                // otherwise print a scary 404 on every backup.
+                $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST', true);
                 if (is_object($src_info)) {
                     $source_meta = [
                         'home_url'  => $src_info->home_url ?? '',
@@ -2196,7 +2230,7 @@ class Run {
                     file_put_contents($local_public_path . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
                 }
             } catch (\Exception $e) {
-                echo "Warning: could not capture source metadata (restore will need --source-url): {$e->getMessage()}\n";
+                echo "Note: source metadata not captured (source may be running pre-2.8 Disembark); 'disembark restore' will need --source-url.\n";
             }
             // --- CALCULATE GLOBAL TOTALS ---
             $total_db_bytes = 0;
@@ -2387,10 +2421,18 @@ class Run {
             }
         }
 
-        // Locate the SQL dump (written into public/ by backup).
+        // Locate the SQL dump (written into public/ by backup). More than one
+        // is ambiguous — refuse rather than guess which state to restore.
         $sql_files = glob($public_dir . '/database-*.sql');
         if (empty($sql_files)) {
             $sql_files = glob($folder . '/database-*.sql');
+        }
+        if (count($sql_files) > 1) {
+            echo "Error: multiple database dumps found in the snapshot — remove the extras or re-run 'disembark backup':\n";
+            foreach ($sql_files as $f) {
+                echo "  - $f\n";
+            }
+            exit(1);
         }
         $sql_file = !empty($sql_files) ? $sql_files[0] : null;
 
@@ -2426,10 +2468,23 @@ class Run {
         // pin auth to that token for every step after this, regardless of how we
         // connected — otherwise post-import calls (search-replace, finalize)
         // would 403.
+        $was_app_password = !empty(self::$username);
         if (!empty($pre->disembark_token)) {
             self::$token    = $pre->disembark_token;
             self::$username = null;
             self::$password = null;
+            if ($was_app_password) {
+                // Persist the pinned token so a later --rollback (a fresh
+                // process) can still authenticate after the import killed the
+                // application password.
+                self::save_site_token(self::$siteUrl, $pre->disembark_token);
+            }
+        } elseif ($was_app_password && empty(self::$token)) {
+            echo "Error: the destination did not return its Disembark token. With application-password\n";
+            echo "auth alone, access is lost mid-restore (the database import replaces wp_users) and a\n";
+            echo "rollback would be impossible. Update Disembark on the destination, or connect with\n";
+            echo "the site token instead: disembark connect " . self::$siteUrl . " <token>\n";
+            exit(1);
         }
 
         // Summarise and confirm — this overwrites the destination.
@@ -2456,74 +2511,109 @@ class Run {
             }
         }
 
-        // Save a rollback point.
+        // Save a rollback point. Abort while the destination is still intact
+        // if the snapshot can't be verified — without it there is no undo.
         echo "Creating rollback snapshot...\n";
-        self::make_request('/import/snapshot', ['import_id' => $import_id], 'POST');
-
-        // Files: zip the tree, upload, deploy in batches.
-        if (!self::$skip_files) {
-            echo "Packaging files...\n";
-            $zip_tmp   = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-restore-' . $import_id . '.zip';
-            $rel_files = [];
-            self::zip_directory_collect($public_dir, $zip_tmp, $sql_file, $rel_files);
-            echo "Uploading " . count($rel_files) . " files (" . self::humanFilesize(filesize($zip_tmp)) . ")...\n";
-            self::upload_zip_to_staging($zip_tmp, $import_id);
-            @unlink($zip_tmp);
-            echo "Deploying files...\n";
-            $deployed = 0;
-            foreach (array_chunk($rel_files, 500) as $batch) {
-                $dep = self::make_request('/import/deploy-files', ['import_id' => $import_id, 'files' => $batch], 'POST');
-                if (is_object($dep) && isset($dep->deployed)) {
-                    $deployed += (int) $dep->deployed;
-                }
-            }
-            echo "  Deployed $deployed files.\n";
+        try {
+            $snap = self::make_request('/import/snapshot', ['import_id' => $import_id], 'POST');
+        } catch (\Exception $e) {
+            $snap = null;
         }
-
-        // Database: import, then serialize-aware URL rewrite.
-        if (!self::$skip_db && $sql_file) {
-            echo "Importing database...\n";
-            $sql = file_get_contents($sql_file);
-
-            // Remap the table-name prefix on identifiers only (backtick-quoted).
-            if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
-                $sql = str_replace('`' . $source_prefix, '`' . $dest_prefix, $sql);
-            }
-
-            // The dump has no DROP before each CREATE; add one so the import
-            // overwrites the destination's existing tables instead of erroring.
-            $sql = preg_replace('/CREATE TABLE `([^`]+)`/', "DROP TABLE IF EXISTS `$1`;\nCREATE TABLE `$1`", $sql);
-
-            $res = self::make_request('/import/sql', ['import_id' => $import_id, 'sql' => $sql], 'POST');
-            if (is_object($res)) {
-                echo "  " . ($res->statements_executed ?? 0) . " statements executed";
-                if (!empty($res->errors)) {
-                    echo ", " . count($res->errors) . " errors (first: " . substr($res->errors[0], 0, 120) . ")";
-                }
-                echo ".\n";
-            }
-
-            // Cross-prefix migration: remap the prefix stored inside the data
-            // (usermeta capabilities, options user_roles) so users keep roles.
-            if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
-                echo "Remapping table prefix in data ($source_prefix -> $dest_prefix)...\n";
-                $rp = self::make_request('/import/remap-prefix', ['import_id' => $import_id, 'old_prefix' => $source_prefix, 'new_prefix' => $dest_prefix], 'POST');
-                if (is_object($rp)) {
-                    echo "  " . ($rp->keys_changed ?? 0) . " keys remapped.\n";
-                }
-            }
-
-            if ($source_home && $dest_home && $source_home !== $dest_home) {
-                echo "Rewriting URLs ($source_home -> $dest_home)...\n";
-                $sr = self::make_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'POST');
-                if (is_object($sr)) {
-                    echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
-                }
-            }
+        if (!is_object($snap) || empty($snap->rollback_id)) {
+            echo "Error: could not create the rollback snapshot. Aborting — nothing was changed.\n";
+            exit(1);
         }
+        echo "  Rollback id: $import_id\n";
+        echo "  (undo at any point with: disembark restore " . self::$siteUrl . " --rollback=$import_id)\n";
 
-        echo "Finalizing...\n";
-        self::make_request('/import/finalize', ['import_id' => $import_id], 'POST');
+        $zip_tmp = null;
+        try {
+            // Files: zip the tree, upload, deploy in batches.
+            if (!self::$skip_files) {
+                echo "Packaging files...\n";
+                $zip_tmp   = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-restore-' . $import_id . '.zip';
+                $rel_files = [];
+                self::zip_directory_collect($public_dir, $zip_tmp, $rel_files);
+                echo "Uploading " . count($rel_files) . " files (" . self::humanFilesize(filesize($zip_tmp)) . ")...\n";
+                self::upload_zip_to_staging($zip_tmp, $import_id);
+                @unlink($zip_tmp);
+                $zip_tmp = null;
+                echo "Deploying files...\n";
+                $deployed      = 0;
+                $deploy_errors = [];
+                foreach (array_chunk($rel_files, 500) as $batch) {
+                    $dep = self::make_request('/import/deploy-files', ['import_id' => $import_id, 'files' => $batch], 'POST');
+                    if (is_object($dep) && isset($dep->deployed)) {
+                        $deployed += (int) $dep->deployed;
+                    }
+                    if (is_object($dep) && !empty($dep->errors)) {
+                        $deploy_errors = array_merge($deploy_errors, (array) $dep->errors);
+                    }
+                }
+                // Every file sent must land — proceeding to wipe the database
+                // after a partial (or zero) deploy would leave a broken hybrid.
+                if ($deployed < count($rel_files)) {
+                    $detail = !empty($deploy_errors) ? ' First error: ' . $deploy_errors[0] : '';
+                    throw new \Exception("only {$deployed} of " . count($rel_files) . " files deployed.{$detail}");
+                }
+                echo "  Deployed $deployed files.\n";
+            }
+
+            // Database: stage the dump on the server (chunked, so a large dump
+            // never needs one giant request), then import it there. The server
+            // applies the transforms per statement (prefix remap on identifiers,
+            // DROP-before-CREATE) — safer than rewriting the whole dump here,
+            // where INSERT values could be corrupted.
+            if (!self::$skip_db && $sql_file) {
+                echo "Uploading database (" . self::humanFilesize(filesize($sql_file)) . ")...\n";
+                // Staged as database-import.sql: the server's deploy step skips
+                // database-*.sql, so the dump can never land in the web root.
+                self::upload_file_to_staging($sql_file, 'database-import.sql', $import_id);
+                echo "Importing database...\n";
+                $payload = ['import_id' => $import_id, 'sql_file' => 'database-import.sql'];
+                if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+                    $payload['old_prefix'] = $source_prefix;
+                    $payload['new_prefix'] = $dest_prefix;
+                }
+                $res = self::make_request('/import/import-staged-sql', $payload, 'POST');
+                if (is_object($res)) {
+                    echo "  " . ($res->statements_executed ?? 0) . " statements executed";
+                    if (!empty($res->errors)) {
+                        echo ", " . count($res->errors) . " errors (first: " . substr($res->errors[0], 0, 120) . ")";
+                    }
+                    echo ".\n";
+                }
+
+                // Cross-prefix migration: remap the prefix stored inside the data
+                // (usermeta capabilities, options user_roles) so users keep roles.
+                if ($source_prefix && $dest_prefix && $source_prefix !== $dest_prefix) {
+                    echo "Remapping table prefix in data ($source_prefix -> $dest_prefix)...\n";
+                    $rp = self::make_request('/import/remap-prefix', ['import_id' => $import_id, 'old_prefix' => $source_prefix, 'new_prefix' => $dest_prefix], 'POST');
+                    if (is_object($rp)) {
+                        echo "  " . ($rp->keys_changed ?? 0) . " keys remapped.\n";
+                    }
+                }
+
+                if ($source_home && $dest_home && $source_home !== $dest_home) {
+                    echo "Rewriting URLs ($source_home -> $dest_home)...\n";
+                    $sr = self::make_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'POST');
+                    if (is_object($sr)) {
+                        echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
+                    }
+                }
+            }
+
+            echo "Finalizing...\n";
+            self::make_request('/import/finalize', ['import_id' => $import_id], 'POST');
+        } catch (\Exception $e) {
+            if ($zip_tmp) {
+                @unlink($zip_tmp);
+            }
+            echo "\nError: restore failed: {$e->getMessage()}\n";
+            echo "The destination may be partially modified. Undo with:\n";
+            echo "  disembark restore " . self::$siteUrl . " --rollback=$import_id\n";
+            exit(1);
+        }
 
         echo "\nRestore complete. Rollback id: $import_id\n";
         echo "To undo:  disembark restore " . self::$siteUrl . " --rollback=$import_id\n";
@@ -2544,9 +2634,12 @@ class Run {
 
     /**
      * Zips every file under $source (recursively), collecting the archive-
-     * relative paths, and skips $exclude_file (the SQL dump) if given.
+     * relative paths. Skips ALL database-*.sql dumps by pattern (a deployed
+     * dump would be a guessable-URL full-database disclosure), Disembark's own
+     * snapshot metadata, and wp-config.php (the server never deploys it, and
+     * the source's credentials don't belong in the destination's staging).
      */
-    private static function zip_directory_collect($source, $zip_path, $exclude_file, &$rel_files) {
+    private static function zip_directory_collect($source, $zip_path, &$rel_files) {
         $rel_files = [];
         $zip = new \ZipArchive();
         if ($zip->open($zip_path, \ZipArchive::CREATE | \ZipArchive::OVERWRITE) !== true) {
@@ -2562,11 +2655,11 @@ class Run {
                 continue;
             }
             $path = $file->getPathname();
-            if ($exclude_file && $path === $exclude_file) {
+            $base = basename($path);
+            if ($base === 'disembark-source.json' || $base === 'wp-config.php') {
                 continue;
             }
-            // Never deploy Disembark's own snapshot metadata as a site file.
-            if (basename($path) === 'disembark-source.json') {
+            if (preg_match('/^database-.*\.sql$/', $base)) {
                 continue;
             }
             $rel = ltrim(substr($path, strlen($source)), DIRECTORY_SEPARATOR);
@@ -2578,44 +2671,55 @@ class Run {
     }
 
     /**
-     * POSTs a file as multipart/form-data (so PHP populates $_FILES and the
-     * server's is_uploaded_file() check passes), carrying import_id and, for
-     * token-auth sites, the token field. App-password auth rides the header.
-     */
-    /**
      * Uploads a zip to staging. Small zips go in one POST; larger ones are sent
      * in chunks (so a multi-GB site never needs a single huge request or the
      * whole file in memory) and reassembled + extracted server-side.
      */
     private static function upload_zip_to_staging($zip_path, $import_id) {
-        $size            = filesize($zip_path);
         $chunk_threshold = 40 * 1024 * 1024; // 40MB
 
-        if ($size <= $chunk_threshold) {
+        if (filesize($zip_path) <= $chunk_threshold) {
             self::post_multipart('/import/upload-zip', self::upload_fields($import_id), 'restore.zip', file_get_contents($zip_path));
             return;
         }
 
-        // Chunked: stream the zip in pieces to /import/upload-chunk, then extract.
+        self::upload_file_to_staging($zip_path, 'restore.zip', $import_id);
+        self::make_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'POST');
+    }
+
+    /**
+     * Uploads any local file into the import's staging area as $remote_name,
+     * streamed in chunks to /import/upload-chunk so no single request carries
+     * the whole file (and the file is never fully read into memory).
+     */
+    private static function upload_file_to_staging($local_path, $remote_name, $import_id) {
+        $size         = filesize($local_path);
         $chunk_bytes  = 20 * 1024 * 1024; // 20MB per chunk
         $total_chunks = max(1, (int) ceil($size / $chunk_bytes));
-        $fh = fopen($zip_path, 'rb');
+        $fh = fopen($local_path, 'rb');
         if (!$fh) {
-            throw new \Exception("Could not open zip for chunked upload.");
+            throw new \Exception("Could not open $local_path for chunked upload.");
         }
         for ($i = 0; $i < $total_chunks; $i++) {
             $data = fread($fh, $chunk_bytes);
+            if ($data === false) {
+                fclose($fh);
+                throw new \Exception("Failed reading $local_path at chunk $i.");
+            }
             self::post_multipart(
                 '/import/upload-chunk',
-                self::upload_fields($import_id, ['file_path' => 'restore.zip', 'chunk_index' => $i, 'total_chunks' => $total_chunks]),
-                'restore.zip',
+                self::upload_fields($import_id, ['file_path' => $remote_name, 'chunk_index' => $i, 'total_chunks' => $total_chunks]),
+                $remote_name,
                 $data
             );
-            echo "\r  Uploaded chunk " . ($i + 1) . "/$total_chunks";
+            if ($total_chunks > 1) {
+                echo "\r  Uploaded chunk " . ($i + 1) . "/$total_chunks";
+            }
         }
         fclose($fh);
-        echo "\n";
-        self::make_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'POST');
+        if ($total_chunks > 1) {
+            echo "\n";
+        }
     }
 
     /**
@@ -2633,6 +2737,9 @@ class Run {
     /**
      * POSTs multipart/form-data with a set of text fields plus one file part
      * (so PHP populates $_FILES and the server's is_uploaded_file() passes).
+     * Transient failures (connection drops, 502/503/504 gateway hiccups) are
+     * retried with backoff — chunked uploads shouldn't die on one bad proxy
+     * response mid-transfer.
      */
     private static function post_multipart($endpoint, $fields, $filename, $file_bytes) {
         $url      = self::rest_url($endpoint);
@@ -2656,12 +2763,30 @@ class Run {
             $headers['Authorization'] = $auth;
         }
         $options  = ['verify' => false, 'timeout' => 1800, 'useragent' => self::$user_agent];
-        $response = \WpOrg\Requests\Requests::post($url, $headers, $body, $options);
-        if ($response->status_code !== 200) {
+
+        $attempts = 3;
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            try {
+                $response = \WpOrg\Requests\Requests::post($url, $headers, $body, $options);
+            } catch (\WpOrg\Requests\Exception $e) {
+                if ($attempt < $attempts) {
+                    echo "\n  Upload attempt $attempt failed ({$e->getMessage()}); retrying...\n";
+                    sleep($attempt * 5);
+                    continue;
+                }
+                throw new \Exception("upload failed: {$e->getMessage()}");
+            }
+            if ($response->status_code === 200) {
+                return json_decode($response->body);
+            }
+            if (in_array($response->status_code, [502, 503, 504], true) && $attempt < $attempts) {
+                echo "\n  Upload got HTTP {$response->status_code}; retrying...\n";
+                sleep($attempt * 5);
+                continue;
+            }
             echo "Error: upload failed. HTTP {$response->status_code}: " . substr($response->body, 0, 300) . "\n";
             throw new \Exception("upload failed");
         }
-        return json_decode($response->body);
     }
 
     private static function sites() {
@@ -2870,11 +2995,16 @@ class Run {
 
         foreach ($data as $entry) {
             if (is_object($entry) && isset($entry->siteUrl) && $entry->siteUrl === self::$siteUrl) {
+                // Load both credential kinds when present: after a restore the
+                // application password is gone (the import replaced wp_users)
+                // but the pinned site token still works — --rollback relies on
+                // it. make_request sends whichever it has.
                 if (!empty($entry->username) && isset($entry->password)) {
                     self::$username = $entry->username;
                     self::$password = $entry->password;
-                } else {
-                    self::$token = isset($entry->token) ? $entry->token : null;
+                }
+                if (!empty($entry->token)) {
+                    self::$token = $entry->token;
                 }
                 if (!empty($entry->rest_style)) {
                     self::$rest_style = $entry->rest_style;
