@@ -19,15 +19,34 @@ sudo mv disembark.phar /usr/local/bin/disembark
 
 ## Usage
 
+Connect a site with its per-site token (from Tools → Disembark), or with a WordPress application password in `user:application password` form:
+
+```
+disembark connect <site-url> <token>
+disembark connect <site-url> "admin:xxxx xxxx xxxx xxxx xxxx xxxx"
+```
+
+Back up a connected site (writes a `snapshot-<timestamp>-<domain>.zip` in the current directory):
+
 ```
 disembark backup <site-url>
 ```
 
-```
-disembark connect <site-url> <token>
-```
+Restore a backup snapshot into a connected site. This overwrites the destination — a rollback point is saved first, and its id is printed before anything destructive runs:
 
 ```
+disembark restore <site-url> <folder>
+disembark restore <site-url> --rollback=<id>
+```
+
+The restore reads the origin URL and table prefix from the snapshot's `disembark-source.json` (recorded by `disembark backup`), rewrites URLs to the destination (serialize-aware), and remaps the table prefix when the destination's differs — migrated users keep their roles. Use `--source-url=` / `--source-prefix=` to override, `--skip-db` / `--skip-files` to restore only part, and `--yes` to skip the confirmation prompt.
+
+Other commands:
+
+```
+disembark sync <site-url> [<folder>]   # create/update a local mirror
+disembark info <site-url>              # connection status + storage usage
+disembark ncdu <site-url>              # browse remote disk usage interactively
 disembark version
 ```
 

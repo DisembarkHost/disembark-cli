@@ -9,7 +9,18 @@
 
 ### Improved
 * **Plain-Permalink Sites:** `connect` detects and stores the working REST routing style, so every command works on sites with plain permalinks (via `?rest_route=`) where `/wp-json/` has no rewrite rule.
-* **Large Restores:** The restore file archive uploads in one request under 40MB, otherwise streams to the server in chunks (never loading the whole archive in memory) and is reassembled and extracted server-side.
+* **Large Restores:** The restore file archive uploads in one request under 40MB, otherwise streams to the server in chunks (never loading the whole archive in memory) and is reassembled and extracted server-side. The database dump uploads the same way — staged in chunks and imported server-side, so a large database never rides a single request.
+* **Cross-Prefix Restores:** Restoring into a site with a different table prefix remaps table names during import and prefix-scoped data (user capabilities, roles) afterward, so migrated users keep their roles. All SQL transforms happen server-side, anchored to statement starts — post content containing table names or SQL keywords is never corrupted.
+* **Upload Reliability:** Chunked uploads retry transient connection drops and 502/503/504 gateway errors with backoff instead of failing the restore.
+* **Quieter Backups:** Backing up a site running an older plugin version no longer prints a spurious 404 while capturing source metadata — just a one-line note.
+
+### Fixed
+* **Restore is always recoverable:** The rollback id prints immediately after the snapshot is taken and again if anything fails mid-restore, with the exact undo command. The snapshot is verified before anything destructive runs, and a restore aborts (with the rollback hint) if any file fails to deploy — the database is never wiped on top of a partial file deploy.
+* **App-password rollbacks:** Restoring over an application-password connection pins the destination's Disembark token and saves it to `~/.disembark`, so `--rollback` still authenticates after the database import wipes application passwords. A restore now refuses to start if no surviving credential is available.
+
+### Security
+* **No database dumps in the web root:** Restore excludes every `database-*.sql` (and `wp-config.php`) from the deployed file set — previously a stray dump in a snapshot could be deployed to a guessable public URL. A snapshot containing multiple dumps is refused as ambiguous.
+* **Credential file permissions:** `~/.disembark` is written with `0600` permissions.
 
 ## **v2.7.0** - January 28th, 2026
 
