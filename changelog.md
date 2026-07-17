@@ -1,5 +1,16 @@
 # Changelog
 
+## **v2.8.0** - Unreleased
+
+### Added
+* **Restore Command:** `disembark restore <site-url> <folder>` pushes a local backup snapshot into a connected site — preflight, rollback snapshot, file upload + deploy, database import (with table-prefix remap), serialize-aware URL search/replace, and finalize. `disembark restore <site-url> --rollback=<id>` undoes an import.
+* **Application-Password Auth:** `disembark connect <site-url> "user:application password"` connects with a WordPress application password (sent as HTTP Basic Auth); a colon-free argument is still the legacy token.
+* **Source Metadata:** `disembark backup` records `disembark-source.json` (origin URL and table prefix) in the snapshot so restore knows what to remap.
+
+### Improved
+* **Plain-Permalink Sites:** `connect` detects and stores the working REST routing style, so every command works on sites with plain permalinks (via `?rest_route=`) where `/wp-json/` has no rewrite rule.
+* **Large Restores:** The restore file archive uploads in one request under 40MB, otherwise streams to the server in chunks (never loading the whole archive in memory) and is reassembled and extracted server-side.
+
 ## **v2.7.0** - January 28th, 2026
 
 ### Added
