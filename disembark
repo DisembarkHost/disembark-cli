@@ -14,6 +14,10 @@ class Run {
     // send HTTP Basic Auth and the server authorizes via current_user_can.
     private static $username;
     private static $password;
+    // REST routing style for the site: 'pretty' (/wp-json/...) or 'rest_route'
+    // (/?rest_route=/...), the latter for sites with plain permalinks where the
+    // pretty path has no rewrite rule.
+    private static $rest_style = 'pretty';
     
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
@@ -306,32 +310,39 @@ class Run {
             $app_password = str_replace(' ', '', $app_password);
         }
 
-        try {
+        // Probe the pretty route first, then the plain-permalink form. Whichever
+        // returns the table list is stored so later commands use it directly.
+        $rest_style = null;
+        $last_status = null;
+        foreach (['pretty', 'rest_route'] as $style) {
+            $probe_url = ($style === 'rest_route')
+                ? "$siteUrl/?rest_route=/disembark/v1/database"
+                : "$siteUrl/wp-json/disembark/v1/database";
+            $headers = [];
             if ($username !== null) {
-                // Verify via Basic Auth so we know the app password works.
-                $response = \WpOrg\Requests\Requests::get(
-                    "$siteUrl/wp-json/disembark/v1/database",
-                    ['Authorization' => 'Basic ' . base64_encode("$username:$app_password")],
-                    ['verify' => false, 'timeout' => 60]
-                );
+                $headers['Authorization'] = 'Basic ' . base64_encode("$username:$app_password");
             } else {
-                // Test connection by fetching database info with the token.
-                $response = \WpOrg\Requests\Requests::get("$siteUrl/wp-json/disembark/v1/database?token=$token", [], ['verify' => false, 'timeout' => 60]);
+                $sep = (strpos($probe_url, '?') !== false) ? '&' : '?';
+                $probe_url .= $sep . 'token=' . urlencode($token);
             }
-        } catch (\WpOrg\Requests\Exception $e) {
-            // Handle the exception
-            echo "Error: Request failed with error: {$e->getMessage()}\n";
-            exit(1);
+            try {
+                $response = \WpOrg\Requests\Requests::get($probe_url, $headers, ['verify' => false, 'timeout' => 60]);
+            } catch (\WpOrg\Requests\Exception $e) {
+                echo "Error: Request failed with error: {$e->getMessage()}\n";
+                exit(1);
+            }
+            $last_status = $response->status_code;
+            if ($response->status_code === 200) {
+                $tables = json_decode($response->body);
+                if (!empty($tables)) {
+                    $rest_style = $style;
+                    break;
+                }
+            }
         }
 
-        if ($response->status_code != 200) {
-            echo "Error: Failed to connect to $siteUrl. Status code: {$response->status_code}. Please check your URL, token, and ensure the Disembark plugin is active.\n";
-            exit(1);
-        }
-
-        $tables = json_decode($response->body);
-        if (empty($tables)) {
-            echo "Error: Connected to $siteUrl, but failed to retrieve database information. Please check plugin functionality.\n";
+        if ($rest_style === null) {
+            echo "Error: Failed to connect to $siteUrl (last status: $last_status). Check your URL, credentials, and that the Disembark plugin is active.\n";
             exit(1);
         }
 
@@ -357,14 +368,16 @@ class Run {
         // legacy token.
         if ($username !== null) {
             $entry_data = (object) [
-                'siteUrl'  => $siteUrl,
-                'username' => $username,
-                'password' => $app_password,
+                'siteUrl'    => $siteUrl,
+                'username'   => $username,
+                'password'   => $app_password,
+                'rest_style' => $rest_style,
             ];
         } else {
             $entry_data = (object) [
-                'siteUrl' => $siteUrl,
-                'token'   => $token,
+                'siteUrl'    => $siteUrl,
+                'token'      => $token,
+                'rest_style' => $rest_style,
             ];
         }
 
@@ -446,6 +459,30 @@ class Run {
     }
 
     /**
+     * Builds a REST URL for an endpoint honoring the site's routing style.
+     * $endpoint is like '/database' or '/import/sql'.
+     */
+    private static function rest_url($endpoint) {
+        if (self::$rest_style === 'rest_route') {
+            return self::$siteUrl . '/?rest_route=/disembark/v1' . $endpoint;
+        }
+        return self::$siteUrl . '/wp-json/disembark/v1' . $endpoint;
+    }
+
+    /**
+     * Like rest_url() but appends query parameters with the correct separator
+     * (rest_route URLs already contain a '?').
+     */
+    private static function rest_url_query($endpoint, $params) {
+        $url = self::rest_url($endpoint);
+        if (empty($params)) {
+            return $url;
+        }
+        $sep = (strpos($url, '?') !== false) ? '&' : '?';
+        return $url . $sep . http_build_query($params);
+    }
+
+    /**
      * Returns the HTTP Basic Auth header value when application-password
      * credentials are configured, otherwise null.
      */
@@ -465,7 +502,7 @@ class Run {
             $headers['Authorization'] = $auth;
         }
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
-        $url = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
+        $url = self::rest_url($endpoint);
         if (self::$cookie) {
             $headers['Cookie'] = self::$cookie;
             
@@ -499,9 +536,11 @@ class Run {
                     if ($endpoint === '/cleanup') {
                         $options['timeout'] = 120;
                     }
-                    // For GET, build query params correctly
+                    // For GET, build query params correctly. rest_route URLs
+                    // already contain '?', so pick the separator accordingly.
                     $query_params = http_build_query($data);
-                    $response = \WpOrg\Requests\Requests::get($url . '?' . $query_params, $headers, $options);
+                    $sep = (strpos($url, '?') !== false) ? '&' : '?';
+                    $response = \WpOrg\Requests\Requests::get($url . $sep . $query_params, $headers, $options);
                     break;
             }
 
@@ -803,7 +842,7 @@ class Run {
                 $attempts++;
                 try {
                     // UPDATED: Use self::$siteUrl
-                    $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                    $endpoint_url = self::rest_url('/stream-file');
                     
                     // UPDATED: Use self::$token
                     $payload = json_encode([
@@ -1334,7 +1373,7 @@ class Run {
                 $job['attempts']++;
                 
                 // Start STAGE_ZIP
-                $url = self::$siteUrl . "/wp-json/disembark/v1/zip-sync-files";
+                $url = self::rest_url("/zip-sync-files");
                 $payload = json_encode([
                     'token' => self::$token, 
                     'backup_token' => self::$backup_token, 
@@ -2534,7 +2573,7 @@ class Run {
      * token-auth sites, the token field. App-password auth rides the header.
      */
     private static function upload_zip_multipart($endpoint, $zip_path, $import_id) {
-        $url      = self::$siteUrl . "/wp-json/disembark/v1" . $endpoint;
+        $url      = self::rest_url($endpoint);
         $boundary = '----disembark' . bin2hex(random_bytes(8));
         $eol      = "\r\n";
 
@@ -2775,6 +2814,9 @@ class Run {
                     self::$password = $entry->password;
                 } else {
                     self::$token = isset($entry->token) ? $entry->token : null;
+                }
+                if (!empty($entry->rest_style)) {
+                    self::$rest_style = $entry->rest_style;
                 }
                 return;
             }
@@ -3379,7 +3421,7 @@ class Run {
             $attempts++;
             try {
                 // Use self::$siteUrl and self::$token
-                $endpoint_url = self::$siteUrl . '/wp-json/disembark/v1/stream-file';
+                $endpoint_url = self::rest_url('/stream-file');
                 $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
                 $headers = ['Content-Type' => 'application/json'];
                 if (self::$cookie) {
