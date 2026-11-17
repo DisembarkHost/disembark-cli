@@ -22,6 +22,8 @@ class Run {
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
     private static $db_max_rows = 1000000;         // 1M rows
+    private static $upload_chunk_bytes = 20971520; // 20MB restore upload chunks
+    private static $upload_limit_known = false;
     private static $file_chunk_size = 2500;        // 2500 files
     private static $file_chunk_max_size = 524288000; // 500MB
     private static $large_file_threshold = 10485760; // 10MB
@@ -1078,6 +1080,30 @@ class Run {
    /**
      * Synchronizes the remote site to a local folder (Remote -> Local).
      */
+    /**
+     * Writes disembark-source.json (origin home URL, site URL and table prefix)
+     * into $dir so `disembark restore` knows what to remap. Non-fatal: restore
+     * can still be pointed with --source-url / --source-prefix.
+     */
+    private static function write_source_meta($dir) {
+        try {
+            // Quiet: pre-2.8 sources don't have this endpoint and would
+            // otherwise print a scary 404 on every backup.
+            $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST', true);
+            if (is_object($src_info)) {
+                $source_meta = [
+                    'home_url'  => $src_info->home_url ?? '',
+                    'site_url'  => $src_info->site_url ?? '',
+                    'db_prefix' => $src_info->db_prefix ?? '',
+                    'captured'  => date('c'),
+                ];
+                file_put_contents(rtrim($dir, '/') . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
+            }
+        } catch (\Exception $e) {
+            echo "Note: source metadata not captured (source may be running pre-2.8 Disembark); 'disembark restore' will need --source-url.\n";
+        }
+    }
+
     private static function sync($folder) {
 
         // 1. Setup Session / Backup Token
@@ -1351,6 +1377,11 @@ class Run {
             }
         }
         if ($wait_ticks > 0) echo " Done.\n";
+
+        // Record the origin URL and table prefix (as backup does) so the mirror
+        // can be restored without --source-url / --source-prefix. Written last:
+        // it isn't on the server, so nothing above treats it as a stray file.
+        self::write_source_meta($folder);
 
         // Final Output with Stats
         $stats_str = self::humanFilesize($transferred_bytes);
@@ -2214,24 +2245,9 @@ class Run {
             // Capture source metadata so `disembark restore` knows the origin URL
             // and table prefix to remap. A failure here is non-fatal — restore can
             // still be pointed with --source-url / --source-prefix.
-            try {
-                // Quiet: pre-2.8 sources don't have this endpoint and would
-                // otherwise print a scary 404 on every backup.
-                $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST', true);
-                if (is_object($src_info)) {
-                    $source_meta = [
-                        'home_url'  => $src_info->home_url ?? '',
-                        'site_url'  => $src_info->site_url ?? '',
-                        'db_prefix' => $src_info->db_prefix ?? '',
-                        'captured'  => date('c'),
-                    ];
-                    // Written inside public/ so it lands in the backup zip; the
-                    // restore step reads it and skips it when deploying files.
-                    file_put_contents($local_public_path . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
-                }
-            } catch (\Exception $e) {
-                echo "Note: source metadata not captured (source may be running pre-2.8 Disembark); 'disembark restore' will need --source-url.\n";
-            }
+            // Written inside public/ so it lands in the backup zip; the
+            // restore step reads it and skips it when deploying files.
+            self::write_source_meta($local_public_path);
             // --- CALCULATE GLOBAL TOTALS ---
             $total_db_bytes = 0;
             $database = [];
@@ -2427,6 +2443,10 @@ class Run {
         if (empty($sql_files)) {
             $sql_files = glob($folder . '/database-*.sql');
         }
+        // A `disembark sync` mirror keeps its dump as database.sql at the root.
+        if (empty($sql_files) && file_exists($public_dir . '/database.sql')) {
+            $sql_files = [$public_dir . '/database.sql'];
+        }
         if (count($sql_files) > 1) {
             echo "Error: multiple database dumps found in the snapshot — remove the extras or re-run 'disembark backup':\n";
             foreach ($sql_files as $f) {
@@ -2462,6 +2482,11 @@ class Run {
         }
         $dest_home   = rtrim($pre->home_url ?? self::$siteUrl, '/');
         $dest_prefix = $pre->db_prefix ?? '';
+        // Plugins from 2.9 report the largest upload chunk the host accepts.
+        if (!empty($pre->upload_chunk_bytes) && (int) $pre->upload_chunk_bytes > 0) {
+            self::$upload_chunk_bytes = (int) $pre->upload_chunk_bytes;
+            self::$upload_limit_known = true;
+        }
 
         // The DB import overwrites users/usermeta (killing any application
         // password) but the plugin preserves its token across the import. So
@@ -2634,7 +2659,8 @@ class Run {
 
     /**
      * Zips every file under $source (recursively), collecting the archive-
-     * relative paths. Skips ALL database-*.sql dumps by pattern (a deployed
+     * relative paths. Skips ALL database dumps (database-*.sql anywhere, any
+     * .sql at the root such as a sync mirror's database.sql; a deployed
      * dump would be a guessable-URL full-database disclosure), Disembark's own
      * snapshot metadata, and wp-config.php (the server never deploys it, and
      * the source's credentials don't belong in the destination's staging).
@@ -2656,14 +2682,20 @@ class Run {
             }
             $path = $file->getPathname();
             $base = basename($path);
+            $rel  = ltrim(substr($path, strlen($source)), DIRECTORY_SEPARATOR);
+            $rel  = str_replace('\\', '/', $rel);
             if ($base === 'disembark-source.json' || $base === 'wp-config.php') {
                 continue;
             }
-            if (preg_match('/^database-.*\.sql$/', $base)) {
+            // Database dumps never go in the upload: Disembark's database-*.sql
+            // anywhere, and any .sql at the root (a sync mirror's database.sql).
+            if (preg_match('/^database-.*\.sql$/i', $base) || (strpos($rel, '/') === false && preg_match('/\.sql$/i', $rel))) {
                 continue;
             }
-            $rel = ltrim(substr($path, strlen($source)), DIRECTORY_SEPARATOR);
-            $rel = str_replace('\\', '/', $rel);
+            // Sync's own working folders.
+            if (strpos($rel, '.disembark-db-parts/') === 0 || strpos($rel, '.disembark-manifests/') === 0) {
+                continue;
+            }
             $zip->addFile($path, $rel);
             $rel_files[] = $rel;
         }
@@ -2676,7 +2708,9 @@ class Run {
      * whole file in memory) and reassembled + extracted server-side.
      */
     private static function upload_zip_to_staging($zip_path, $import_id) {
-        $chunk_threshold = 40 * 1024 * 1024; // 40MB
+        // One request when the archive fits in one chunk. A 2.9+ destination
+        // reports its own limit; older ones keep the 40MB single-request cutoff.
+        $chunk_threshold = self::$upload_limit_known ? self::$upload_chunk_bytes : 40 * 1024 * 1024;
 
         if (filesize($zip_path) <= $chunk_threshold) {
             self::post_multipart('/import/upload-zip', self::upload_fields($import_id), 'restore.zip', file_get_contents($zip_path));
@@ -2694,7 +2728,7 @@ class Run {
      */
     private static function upload_file_to_staging($local_path, $remote_name, $import_id) {
         $size         = filesize($local_path);
-        $chunk_bytes  = 20 * 1024 * 1024; // 20MB per chunk
+        $chunk_bytes  = self::$upload_chunk_bytes; // 20MB unless the destination asks for less
         $total_chunks = max(1, (int) ceil($size / $chunk_bytes));
         $fh = fopen($local_path, 'rb');
         if (!$fh) {
@@ -3705,6 +3739,7 @@ class Run {
             // Skip sync-specific files
             if ($relative_path === 'database.sql' ||
                 $relative_path === 'db_export.sql' ||
+                $relative_path === 'disembark-source.json' ||
                 strpos($relative_path, '.disembark-db-parts') === 0 ||
                 strpos($relative_path, '.disembark-manifests') === 0) {
                 continue;

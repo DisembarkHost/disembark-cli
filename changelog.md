@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+* **Restoring a sync mirror:** `disembark restore` now finds the `database.sql` that `disembark sync` writes. Before, it restored files only, reported success, and left the database untouched.
+* **No dump in the destination's web root:** Restore no longer uploads any `.sql` at the snapshot's root (a sync mirror's `database.sql`) or sync's working folders with the site files. CLI 2.8.0 deployed a sync mirror's `database.sql` where the web server could serve it.
+* **Sync records its source:** `disembark sync` writes `disembark-source.json` (origin URL and table prefix), like `backup`, so a mirror restores without `--source-url` / `--source-prefix`.
+* **Upload chunks fit the destination:** Restore uploads use the chunk size a 2.9+ destination reports from its PHP upload limits instead of a fixed 20MB (and a 40MB single-request cutoff), which small-limit hosts rejected.
+
 ## **v2.8.0** - July 17, 2026
 
 ### Added
