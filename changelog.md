@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## **v2.9.0** - November 17, 2026
 
 ### Fixed
 * **Restoring a sync mirror:** `disembark restore` now finds the `database.sql` that `disembark sync` writes. Before, it restored files only, reported success, and left the database untouched.
