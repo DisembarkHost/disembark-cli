@@ -50,6 +50,8 @@ disembark ncdu <site-url>              # browse remote disk usage interactively
 disembark version
 ```
 
+`sync` copies what changed since the last run and deletes a local file only when the source listed it at the last sync and no longer does. Files you add to the mirror, paths left out with `-x`, and anything reached through a symlink are never deleted, and a sync deletes nothing when the source's file list comes back with an error, incomplete or empty. It keeps that list in `.disembark-manifests/sync-state.json` inside the mirror. The database is copied in full each run as `database.sql`.
+
 ## Installing Disembark via WP-CLI
 
 On the source WordPress website run the following commands:

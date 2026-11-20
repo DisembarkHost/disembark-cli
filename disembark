@@ -4,7 +4,7 @@ namespace Disembark;
 
 class Run {
 
-    const VERSION = '2.9.0';
+    const VERSION = '3.0.0';
     const USER_AGENT = 'Disembark/' . self::VERSION;
 
     private static $siteUrl;
@@ -46,6 +46,19 @@ class Run {
     private static $source_prefix = null;
     private static $rollback_id = null;
     private static $assume_yes = false;
+
+    // What the source announced in its preflight (null until asked, false
+    // when it didn't answer): v3 sources say `pacing`, `resumable` and
+    // `fingerprint`, and take the token in the X-Disembark-Token header.
+    private static $source_caps = null;
+
+    // Files a backup or sync could not copy, reported at the end (and the
+    // exit status is non-zero when there are any).
+    private static $failures = [];
+
+    // Where sync keeps its record of the source's files (relative to the
+    // mirror). Restore never deploys .disembark-manifests/.
+    const SYNC_STATE = '.disembark-manifests/sync-state.json';
 
     // Global Progress Tracking
     private static $global_bytes_total = 0;
@@ -147,7 +160,12 @@ class Run {
             if ($arg === '-x') {
                 // Check if next arg exists and is not another flag
                 if (isset($argv[$i + 1]) && strpos($argv[$i + 1], '-') !== 0) {
-                    self::$exclude_paths[] = rtrim($argv[$i + 1], '/');
+                    // Paths are relative to the site root: "./wp-content/x/"
+                    // and "/wp-content/x" both mean "wp-content/x".
+                    $exclude = trim(preg_replace('#^(\./)+#', '', $argv[$i + 1]), '/');
+                    if ($exclude !== '') {
+                        self::$exclude_paths[] = $exclude;
+                    }
                     $i++; // Skip the next argument as we consumed it
                 } else {
                     echo "Error: Missing value for -x option.\n";
@@ -227,6 +245,12 @@ class Run {
 
         // C. Parse Flags
         $sync_folder = self::parseArguments($argv, 3);
+
+        // Ask the source what it supports first: a v3 source takes the token
+        // in a header (kept out of URLs) and cleans up over POST.
+        if (in_array($command, ['backup', 'sync', 'ncdu', 'info'], true)) {
+            self::source_caps();
+        }
 
         // 3. Dispatch Command
         switch ($command) {
@@ -316,19 +340,31 @@ class Run {
         // returns the table list is stored so later commands use it directly.
         $rest_style = null;
         $last_status = null;
+        // A token goes in the X-Disembark-Token header first (v3 reads it
+        // there, keeping it out of URLs and logs), then in the query for
+        // 2.9 sources, which only read it there.
+        $attempts = [];
         foreach (['pretty', 'rest_route'] as $style) {
+            $attempts[] = [$style, false];
+            if ($username === null) {
+                $attempts[] = [$style, true];
+            }
+        }
+        foreach ($attempts as list($style, $token_in_query)) {
             $probe_url = ($style === 'rest_route')
                 ? "$siteUrl/?rest_route=/disembark/v1/database"
                 : "$siteUrl/wp-json/disembark/v1/database";
             $headers = [];
             if ($username !== null) {
                 $headers['Authorization'] = 'Basic ' . base64_encode("$username:$app_password");
-            } else {
+            } elseif ($token_in_query) {
                 $sep = (strpos($probe_url, '?') !== false) ? '&' : '?';
                 $probe_url .= $sep . 'token=' . urlencode($token);
+            } else {
+                $headers['X-Disembark-Token'] = $token;
             }
             try {
-                $response = \WpOrg\Requests\Requests::get($probe_url, $headers, ['verify' => false, 'timeout' => 60]);
+                $response = \WpOrg\Requests\Requests::get($probe_url, $headers, ['verify' => false, 'timeout' => 60, 'useragent' => self::USER_AGENT]);
             } catch (\WpOrg\Requests\Exception $e) {
                 echo "Error: Request failed with error: {$e->getMessage()}\n";
                 exit(1);
@@ -336,7 +372,7 @@ class Run {
             $last_status = $response->status_code;
             if ($response->status_code === 200) {
                 $tables = json_decode($response->body);
-                if (!empty($tables)) {
+                if (!empty($tables) && is_array($tables)) {
                     $rest_style = $style;
                     break;
                 }
@@ -519,19 +555,98 @@ class Run {
         return null;
     }
 
-    private static function make_request($endpoint, $payload = [], $method = 'POST', $quiet = false) {
-        $headers = ['Content-Type' => 'application/json; charset=utf-8'];
-        // Preferred: application-password Basic Auth. Fall back to the token,
-        // which make_request still sends in the body/query for token-only sites.
+    /**
+     * A new session or import id: 128 random bits as 32 hex characters, the
+     * form v3 mints itself. The id names a folder of dumps and zips under the
+     * source's uploads, so it has to be unguessable. 2.9 takes any hex.
+     */
+    private static function new_session_id() {
+        return bin2hex(random_bytes(16));
+    }
+
+    /**
+     * Auth headers for Disembark's API: the application password (Basic
+     * Auth) and the token in X-Disembark-Token, which v3 reads so the token
+     * can stay out of URLs. 2.9 ignores the header and reads the token from
+     * the body or query, which make_request() still sends. Never sent to
+     * public file URLs.
+     */
+    private static function api_headers() {
+        $headers = [];
         $auth = self::auth_header();
         if ($auth) {
             $headers['Authorization'] = $auth;
         }
+        if (!empty(self::$token)) {
+            $headers['X-Disembark-Token'] = self::$token;
+        }
+        if (self::$cookie) {
+            $headers['Cookie'] = self::$cookie;
+        }
+        return $headers;
+    }
+
+    /** api_headers() as "Name: value" lines, for raw cURL handles. */
+    private static function api_header_lines($extra = []) {
+        $lines = [];
+        foreach (array_merge(self::api_headers(), $extra) as $name => $value) {
+            $lines[] = "$name: $value";
+        }
+        return $lines;
+    }
+
+    /**
+     * Asks the source's preflight once and keeps the answer: its address and
+     * table prefix (for disembark-source.json) and what it supports (`pacing`,
+     * `resumable` and `fingerprint` on v3). False when it didn't answer
+     * (a pre-2.8 source).
+     */
+    private static function source_caps() {
+        if (self::$source_caps !== null) {
+            return self::$source_caps;
+        }
+        self::$source_caps = false; // also stops make_request() asking again meanwhile
+        try {
+            $pre = self::make_request('/import/preflight', ['import_id' => self::new_session_id()], 'POST', true);
+            if (is_object($pre)) {
+                unset($pre->disembark_token);
+                self::$source_caps = $pre;
+            }
+        } catch (\Exception $e) {
+            // Older source; carry on with the 2.9 behavior.
+        }
+        return self::$source_caps;
+    }
+
+    /** True when the source is v3 (it announces pacing in its preflight). */
+    private static function source_is_v3() {
+        return is_object(self::$source_caps) && !empty(self::$source_caps->pacing);
+    }
+
+    /**
+     * Seconds to wait before retrying a request the host turned away:
+     * the Retry-After it sent (seconds or an HTTP date, at most 5 minutes),
+     * else a growing backoff.
+     */
+    private static function retry_wait($response, $attempt) {
+        $wait = min(60, 2 * (2 ** ($attempt - 1)));
+        if ($response && isset($response->headers['retry-after'])) {
+            $value = trim((string) $response->headers['retry-after']);
+            if (ctype_digit($value)) {
+                $wait = (int) $value;
+            } elseif (($when = strtotime($value)) !== false) {
+                $wait = $when - time();
+            }
+        }
+        return max(1, min(300, $wait));
+    }
+
+    private static function make_request($endpoint, $payload = [], $method = 'POST', $quiet = false) {
+        $headers = ['Content-Type' => 'application/json; charset=utf-8'] + self::api_headers();
+        $method  = strtoupper($method);
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
         $url = self::rest_url($endpoint);
         if (self::$cookie) {
-            $headers['Cookie'] = self::$cookie;
-            
             // Critical: Cloudflare often blocks requests without a valid Referer matching the cookie's domain
             $headers['Referer'] = self::$siteUrl . '/'; 
             
@@ -545,88 +660,157 @@ class Run {
             'useragent' => self::$user_agent
         ];
 
-        try {
-            switch (strtoupper($method)) {
-                case 'POST':
-                    // Increase timeout specifically for zip operations which can take longer
-                    if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files' || $endpoint === '/import/import-staged-sql') {
-                        $options['timeout'] = 1800; // 30 minutes
-                    } elseif (strpos($endpoint, '/export/database/') === 0 && isset($payload['parts'])) {
-                        $options['timeout'] = 1200; // 20 minutes for large table parts
-                    }
-                    $response = \WpOrg\Requests\Requests::post($url, $headers, json_encode($data), $options);
-                    break;
-                case 'GET':
-                default:
-                    // Increase timeout for cleanup as well
-                    if ($endpoint === '/cleanup') {
-                        $options['timeout'] = 120;
-                    }
-                    // For GET, build query params correctly. rest_route URLs
-                    // already contain '?', so pick the separator accordingly.
-                    $query_params = http_build_query($data);
-                    $sep = (strpos($url, '?') !== false) ? '&' : '?';
-                    $response = \WpOrg\Requests\Requests::get($url . $sep . $query_params, $headers, $options);
-                    break;
-            }
+        // /cleanup is POST on v3 (the token stays out of the URL); 2.9 only
+        // answers GET.
+        if ($endpoint === '/cleanup') {
+            $method = self::source_is_v3() ? 'POST' : 'GET';
+            $options['timeout'] = 120;
+        }
 
-            if ($response->status_code !== 200) {
-                $errorMessage = "Error: Request to {$endpoint} failed. HTTP status: {$response->status_code}.";
-                $errorBody = json_decode($response->body);
-                if (json_last_error() === JSON_ERROR_NONE && isset($errorBody->message)) {
-                    $errorMessage .= " Message: " . $errorBody->message;
-                } else {
-                    $errorMessage .= " Response: " . substr($response->body, 0, 500);
-                }
-                // Quiet mode still throws — it just skips printing, for
-                // best-effort probes against sites that predate the endpoint.
-                if (!$quiet) {
-                    echo $errorMessage . "\n";
-                }
-                // Throw an exception instead of exiting directly to allow potential cleanup
-                throw new \Exception("API request failed for {$endpoint}");
-            }
+        // Import steps on a resumable (v3) destination carry a request id, so
+        // a resend after a dropped connection or a gateway timeout gets the
+        // step's answer instead of running it twice. Without that (2.9), an
+        // import step is never resent: it might run twice.
+        $is_import = strpos($endpoint, '/import/') === 0 && $endpoint !== '/import/preflight';
+        $resumable = is_object(self::$source_caps) && !empty(self::$source_caps->resumable);
+        if ($is_import && $resumable && $method === 'POST' && !isset($data['request_id'])) {
+            $data['request_id'] = self::new_session_id();
+        }
+        $max_attempts = ($is_import && !$resumable) ? 1 : 6;
 
-            $decoded = json_decode($response->body);
-            // Check if this endpoint is allowed to return a raw string (like a path or URL)
-            $allowed_raw_endpoints = ['/cleanup', '/zip-database', '/zip-sync-files'];
-            $is_raw_endpoint = false;
-            foreach ($allowed_raw_endpoints as $raw_ep) {
-                if ($endpoint === $raw_ep) $is_raw_endpoint = true;
+        if ($method === 'POST') {
+            // Increase timeout specifically for zip operations which can take longer
+            if ($endpoint === '/zip-database' || $endpoint === '/zip-sync-files' || $endpoint === '/import/import-staged-sql') {
+                $options['timeout'] = 1800; // 30 minutes
+            } elseif (strpos($endpoint, '/export/database/') === 0 && isset($payload['parts'])) {
+                $options['timeout'] = 1200; // 20 minutes for large table parts
             }
-            if (strpos($endpoint, '/export/database/') === 0) {
-                $is_raw_endpoint = true;
+            $body = json_encode($data);
+        } else {
+            // For GET, build query params. v3 reads the token from the
+            // X-Disembark-Token header, so it stays out of the URL (and the
+            // host's access logs); 2.9 needs it in the query. rest_route
+            // URLs already contain '?', so pick the separator accordingly.
+            if (self::source_is_v3()) {
+                unset($data['token']);
             }
+            $query_params = http_build_query($data);
+            $sep = (strpos($url, '?') !== false) ? '&' : '?';
+            $url = $url . ($query_params !== '' ? $sep . $query_params : '');
+        }
 
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                // Not JSON.
-                // Is it an endpoint that *should* return a raw string?
-                if (!empty(trim($response->body)) && $is_raw_endpoint) {
-                    return trim($response->body); // Return the raw body (e.g., URL)
-                }
-                // Not JSON and not an allowed raw endpoint, or it's empty
-                if (!empty(trim($response->body))) {
+        for ($attempt = 1; ; $attempt++) {
+            $response = null;
+            try {
+                $response = ($method === 'POST')
+                    ? \WpOrg\Requests\Requests::post($url, $headers, $body, $options)
+                    : \WpOrg\Requests\Requests::get($url, $headers, $options);
+            } catch (\WpOrg\Requests\Exception $e) {
+                if ($attempt < $max_attempts) {
+                    $wait = self::retry_wait(null, $attempt);
                     if (!$quiet) {
-                        echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                        echo "\nRequest to {$endpoint} failed ({$e->getMessage()}); retrying in {$wait}s...\n";
                     }
-                    throw new \Exception("Invalid JSON response for {$endpoint}");
+                    sleep($wait);
+                    continue;
                 }
-                // Allow empty responses for cleanup
-                if ($endpoint === '/cleanup') {
-                    return "Cleanup requested";
+                if (!$quiet) {
+                    echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
                 }
+                throw $e; // Re-throw to allow potential cleanup in calling function
             }
 
-            // If it *is* valid JSON, but the API might have returned a JSON-encoded string (e.g. "path\/to\/file.sql")
-            // json_decode will have correctly turned this into a PHP string.
-            // If it was a JSON object/array, it will be a PHP object/array.
-            return $decoded;
-        } catch (\WpOrg\Requests\Exception $e) {
-            if (!$quiet) {
-                echo "Error: Request failed for {$endpoint}: {$e->getMessage()}\n";
+            // Busy host (429/502/503/504), or a resumable step still running
+            // from an earlier send (202): wait as asked, then send again.
+            $running = $response->status_code === 202 && strpos((string) $response->body, 'disembark_step_running') !== false;
+            if (($running || in_array($response->status_code, [429, 502, 503, 504], true)) && $attempt < $max_attempts) {
+                $wait = $running ? 5 : self::retry_wait($response, $attempt);
+                if (!$quiet) {
+                    echo "\n" . ($running ? "{$endpoint} is still running on the server" : "{$endpoint} answered HTTP {$response->status_code}") . "; asking again in {$wait}s...\n";
+                }
+                sleep($wait);
+                continue;
             }
-            // Re-throw or handle as needed
-            throw $e; // Re-throw to allow potential cleanup in calling function
+            break;
+        }
+
+        if ($response->status_code !== 200) {
+            $errorMessage = "Error: Request to {$endpoint} failed. HTTP status: {$response->status_code}.";
+            $errorBody = json_decode($response->body);
+            if (json_last_error() === JSON_ERROR_NONE && isset($errorBody->message)) {
+                $errorMessage .= " Message: " . $errorBody->message;
+            } else {
+                $errorMessage .= " Response: " . substr($response->body, 0, 500);
+            }
+            // Quiet mode still throws — it just skips printing, for
+            // best-effort probes against sites that predate the endpoint.
+            if (!$quiet) {
+                echo $errorMessage . "\n";
+            }
+            // Throw an exception instead of exiting directly to allow potential cleanup
+            throw new \Exception("API request failed for {$endpoint}");
+        }
+
+        $decoded = json_decode($response->body);
+        // Check if this endpoint is allowed to return a raw string (like a path or URL)
+        $is_raw_endpoint = in_array($endpoint, ['/cleanup', '/zip-database', '/zip-sync-files'], true)
+            || strpos($endpoint, '/export/database/') === 0;
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            // Not JSON.
+            // Is it an endpoint that *should* return a raw string?
+            if (!empty(trim($response->body)) && $is_raw_endpoint) {
+                return trim($response->body); // Return the raw body (e.g., URL)
+            }
+            // Not JSON and not an allowed raw endpoint, or it's empty
+            if (!empty(trim($response->body))) {
+                if (!$quiet) {
+                    echo "Error: Could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 500) . "\n";
+                }
+                throw new \Exception("Invalid JSON response for {$endpoint}");
+            }
+            // Allow empty responses for cleanup
+            if ($endpoint === '/cleanup') {
+                return "Cleanup requested";
+            }
+        }
+
+        // If it *is* valid JSON, but the API might have returned a JSON-encoded string (e.g. "path\/to\/file.sql")
+        // json_decode will have correctly turned this into a PHP string.
+        // If it was a JSON object/array, it will be a PHP object/array.
+        return $decoded;
+    }
+
+    /**
+     * An import step that works in pieces on a v3 destination: sent with
+     * `paced` and the host's budget, and sent again while it answers
+     * done: false. A 2.9 destination (no `pacing` in its preflight) runs the
+     * whole step in one request, as before.
+     */
+    private static function paced_request($endpoint, $payload, $label = '') {
+        if (!self::source_is_v3()) {
+            return self::make_request($endpoint, $payload, 'POST');
+        }
+        $payload['paced']  = 1;
+        $payload['budget'] = !empty(self::$source_caps->budget) ? (float) self::$source_caps->budget : 20;
+        $rounds = 0;
+        while (true) {
+            $res = self::make_request($endpoint, $payload, 'POST');
+            if (!is_object($res) || !isset($res->done) || $res->done !== false) {
+                if ($rounds > 0) {
+                    echo "\n";
+                }
+                return $res;
+            }
+            $rounds++;
+            $progress = '';
+            foreach ([['tables_done', 'tables_total', 'tables'], ['entries_done', 'entries_total', 'entries'], ['placed', 'total', 'files'], ['parts_done', 'parts_total', 'parts'], ['files_done', 'files_total', 'files']] as $pair) {
+                if (isset($res->{$pair[0]}, $res->{$pair[1]})) {
+                    $progress = "{$res->{$pair[0]}} of {$res->{$pair[1]}} {$pair[2]}";
+                    break;
+                }
+            }
+            echo "\r  " . ($label ?: $endpoint) . ": working in pieces" . ($progress ? " ($progress)" : " (round $rounds)") . "...   ";
         }
     }
 
@@ -701,9 +885,10 @@ class Run {
             // Step 5: Finalize
             $files_manifests = self::make_request('/regenerate-manifest', ['step' => 'finalize'] + $payload, 'POST');
             
+            // Anything but a list is an error, never "no files": sync would
+            // read an empty list as "everything was deleted on the source".
             if (!is_array($files_manifests)) {
-                echo "Warning: Final manifest data is not in the expected format. File stats may be inaccurate.\n";
-                $files_manifests = [];
+                throw new \Exception("The source's file list came back in an unexpected format.");
             }
             echo "Analysis complete.\n";
 
@@ -813,10 +998,15 @@ class Run {
      * Helper function specifically for cleanup after preview or backup failure
      */
     private static function cleanupTemporaryFiles() {
+        // Without a session id the source's /cleanup removes every backup
+        // session on it, including other people's: never send that here.
+        if (empty(self::$backup_token)) {
+            return;
+        }
         echo "Cleaning up temporary files on server...\n";
         try {
             $payload = ['backup_token' => self::$backup_token];
-            self::make_request('/cleanup', $payload, 'GET');
+            self::make_request('/cleanup', $payload, 'POST'); // GET on a 2.9 source, see make_request()
         } catch (\Exception $e) {
             echo "Warning: Cleanup request failed: {$e->getMessage()}\n";
         }
@@ -886,12 +1076,15 @@ class Run {
                         'length' => $length
                     ]);
 
-                    $headers = ['Content-Type' => 'application/json'];
+                    // App-password connections authenticate by header; v3
+                    // also takes the token in X-Disembark-Token.
+                    $headers = ['Content-Type' => 'application/json'] + self::api_headers();
                     
                     $options = [
                         'verify' => false,
                         'timeout' => 300, // 5 minutes per 50MB chunk should be plenty
                         'connect_timeout' => 30,
+                        'useragent' => self::$user_agent,
                     ];
                     
                     $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
@@ -1086,22 +1279,20 @@ class Run {
      * can still be pointed with --source-url / --source-prefix.
      */
     private static function write_source_meta($dir) {
-        try {
-            // Quiet: pre-2.8 sources don't have this endpoint and would
-            // otherwise print a scary 404 on every backup.
-            $src_info = self::make_request('/import/preflight', ['import_id' => bin2hex(random_bytes(12))], 'POST', true);
-            if (is_object($src_info)) {
-                $source_meta = [
-                    'home_url'  => $src_info->home_url ?? '',
-                    'site_url'  => $src_info->site_url ?? '',
-                    'db_prefix' => $src_info->db_prefix ?? '',
-                    'captured'  => date('c'),
-                ];
-                file_put_contents(rtrim($dir, '/') . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
-            }
-        } catch (\Exception $e) {
+        // Pre-2.8 sources don't have the preflight; say so in one line rather
+        // than print a scary 404 on every backup.
+        $src_info = self::source_caps();
+        if (!is_object($src_info)) {
             echo "Note: source metadata not captured (source may be running pre-2.8 Disembark); 'disembark restore' will need --source-url.\n";
+            return;
         }
+        $source_meta = [
+            'home_url'  => $src_info->home_url ?? '',
+            'site_url'  => $src_info->site_url ?? '',
+            'db_prefix' => $src_info->db_prefix ?? '',
+            'captured'  => date('c'),
+        ];
+        file_put_contents(rtrim($dir, '/') . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
     }
 
     private static function sync($folder) {
@@ -1115,7 +1306,7 @@ class Run {
                 echo " - Forcing --skip-checksums (GUI sessions do not contain checksum data).\n";
             }
         } else {
-            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+            self::$backup_token = self::new_session_id();
         }
 
         // 2. Folder Setup
@@ -1132,33 +1323,57 @@ class Run {
 
         $local_db_parts_path = $folder . '/.disembark-db-parts';
         $db_export_file = $folder . '/database.sql';
+        // The dump is written beside the last one and swapped in when whole,
+        // so a sync that stops partway leaves the previous database.sql.
+        $db_part_file = $db_export_file . '.part';
         
         // Initialize Stats
         $transferred_bytes = 0;
         $transferred_files = 0;
+        $deleted_files = 0;
 
         try {
             // --- Database Sync ---
             if (!self::$skip_db) {
                 echo "Starting database sync...\n";
+                foreach ([$db_export_file, $db_part_file, $local_db_parts_path] as $own) {
+                    if (is_link($own)) {
+                        throw new \Exception("$own is a symlink; sync won't write through it.");
+                    }
+                }
                 if (!is_dir($local_db_parts_path) && !mkdir($local_db_parts_path, 0755, true)) {
                     throw new \Exception("Could not create temp DB directory.");
                 }
                 
-                if (file_put_contents($db_export_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
+                if (file_put_contents($db_part_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
                     throw new \Exception("Could not write to local SQL file.");
                 }
 
                 $database = self::make_request('/database', [], 'GET');
                 if (!is_array($database)) throw new \Exception("Invalid database list received.");
 
+                // --exclude-tables applies to sync too (2.9 ignored it here).
+                if (!empty(self::$exclude_tables)) {
+                    $database = array_values(array_filter($database, function ($table) {
+                        foreach (self::$exclude_tables as $pattern) {
+                            if (isset($table->table) && fnmatch($pattern, $table->table)) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    }));
+                }
+
                 // Tally Database Stats
                 foreach ($database as $tbl) {
                     $transferred_bytes += (isset($tbl->size) ? (float)$tbl->size : 0);
                 }
 
-                self::processDatabaseBackup($database, $db_export_file, $local_db_parts_path);
+                self::processDatabaseBackup($database, $db_part_file, $local_db_parts_path);
                 self::delete_directory($local_db_parts_path);
+                if (!rename($db_part_file, $db_export_file)) {
+                    throw new \Exception("Could not move the new dump into place as database.sql.");
+                }
             } else {
                 echo "Skipping database sync as requested.\n";
             }
@@ -1176,7 +1391,6 @@ class Run {
                         echo "Successfully fetched manifest with " . count($files_manifest_chunks) . " file chunks.\n";
                     } catch (\Exception $e) {
                         echo "Error fetching manifest: {$e->getMessage()}\n";
-                        if (!self::$session_id) self::cleanupTemporaryFiles();
                         exit(1);
                     }
                 } else {
@@ -1185,83 +1399,34 @@ class Run {
                     $files_manifest_chunks = self::runManifestGeneration($include_checksums);
                 }
 
-                // Initial Sync Logic
+                echo "Fetching remote file manifest...\n";
+                list($remote_files_map, , $report) = self::fetch_manifests_parallel($files_manifest_chunks);
+                echo str_pad("", 80, " ") . "\r";
+
+                // A list we couldn't read whole would make every file in the
+                // missing part look deleted on the source. Stop instead.
+                if (!$report['complete']) {
+                    throw new \Exception("The source's file list is incomplete (" . implode('; ', $report['problems']) . "). No files were changed or deleted; run the sync again.");
+                }
+                $listed = $report['listed'];
+                $remote_files_map = self::filter_writable_files($remote_files_map, $folder, true);
+                $previous = $is_initial_sync ? null : self::read_sync_state($folder);
+
                 if ($is_initial_sync) {
                     echo "Performing initial file download (Optimized)...\n";
-                    echo "Fetching remote file manifest...\n";
-                    
-                    list($remote_files_map, $all_files_debug) = self::fetch_manifests_parallel($files_manifest_chunks);
-                    
-                    // Calculate Total Size for Global Progress
-                    $total_bytes_to_sync = 0;
-                    foreach ($remote_files_map as $f) {
-                        $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
-                    }
-                    self::$global_bytes_total = $total_bytes_to_sync;
-                    self::$global_bytes_processed = 0;
-                    
-                    // Add to Transferred Stats
-                    $transferred_bytes += $total_bytes_to_sync;
-                    $transferred_files += count($remote_files_map);
-
-                    $large_files_queue = [];
-                    $small_files_queue = [];
-
-                    foreach ($remote_files_map as $file) {
-                        $fsize = isset($file->size) ? (int)$file->size : 0;
-                        if ($fsize > self::$large_file_threshold) {
-                            $large_files_queue[] = $file;
-                        } else {
-                            $small_files_queue[] = $file;
-                        }
-                    }
-
-                    if (!empty($large_files_queue)) {
-                        self::download_files_parallel($large_files_queue, $folder);
-                    }
-
-                    if (!empty($small_files_queue)) {
-                        $total_small = count($small_files_queue);
-                        
-                        $file_chunks = [];
-                        $current_chunk = [];
-                        $current_chunk_size = 0;
-                        foreach ($small_files_queue as $file) {
-                            $fsize = $file->size ?? 0;
-                            if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
-                                $file_chunks[] = $current_chunk;
-                                $current_chunk = [$file];
-                                $current_chunk_size = $fsize;
-                            } else {
-                                $current_chunk[] = $file;
-                                $current_chunk_size += $fsize;
-                            }
-                        }
-                        if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
-                        
-                        // Use the new Parallel State Machine
-                        if (!empty($file_chunks)) {
-                            self::sync_chunks_parallel($file_chunks, $folder);
-                        }
-                    }
-                    echo "Initial file sync complete.\n";
+                    $files_to_download = array_values($remote_files_map);
                 } else {
                     // Subsequent Sync (Diff)
-                    echo "Fetching remote file manifest...\n";
-                    list($remote_files_map, $all_remote_files) = self::fetch_manifests_parallel($files_manifest_chunks);
-                    echo str_pad("", 80, " ") . "\r";
-
                     echo "Generating local file manifest...\n";
                     $local_files_map = self::generate_local_manifest($folder, self::$skip_checksums);
                     echo "Comparing manifests and syncing changes...\n";
                     
                     $files_to_download = [];
-                    $files_to_delete = [];
                     foreach ($remote_files_map as $path => $remote_file) {
                         $local_file = $local_files_map[$path] ?? null;
                         $should_download = false;
                         if (self::$skip_checksums) {
-                            if (!$local_file || (isset($local_file->size) && isset($remote_file->size) && $local_file->size !== $remote_file->size)) {
+                            if (!$local_file || (isset($local_file->size) && isset($remote_file->size) && (int) $local_file->size !== (int) $remote_file->size)) {
                                 $should_download = true;
                             }
                         } else {
@@ -1271,85 +1436,79 @@ class Run {
                         }
                         if ($should_download) $files_to_download[] = $remote_file;
                     }
-                    foreach ($local_files_map as $path => $local_file) {
-                        if (!isset($remote_files_map[$path])) $files_to_delete[] = $path;
-                    }
-
-                    // Stats
-                    $total_bytes_to_sync = 0;
-                    foreach ($files_to_download as $f) {
-                        $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
-                    }
-                    self::$global_bytes_total = $total_bytes_to_sync;
-                    self::$global_bytes_processed = 0;
-
-                    $transferred_bytes += $total_bytes_to_sync;
-                    $transferred_files += count($files_to_download);
-
-                    if (!empty($files_to_download)) {
-                        $total_files_to_download = count($files_to_download);
-                        echo " - Syncing $total_files_to_download new/changed file(s)...\n";
-                        
-                        $file_chunks = [];
-                        $current_chunk = [];
-                        $current_chunk_size = 0;
-                        $large_files_parallel_queue = [];
-                        foreach ($files_to_download as $file) {
-                            $fsize = $file->size ?? 0;
-                            
-                            if ($fsize > self::$large_file_threshold) {
-                                if (!empty($current_chunk)) { 
-                                    $file_chunks[] = $current_chunk;
-                                    $current_chunk = []; 
-                                    $current_chunk_size = 0; 
-                                }
-                                $large_files_parallel_queue[] = $file;
-                                continue;
-                            }
-                            
-                            if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
-                                $file_chunks[] = $current_chunk;
-                                $current_chunk = [$file];
-                                $current_chunk_size = $fsize;
-                            } else {
-                                $current_chunk[] = $file;
-                                $current_chunk_size += $fsize;
-                            }
-                        }
-                        if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
-
-                        if (!empty($large_files_parallel_queue)) {
-                            self::download_files_parallel($large_files_parallel_queue, $folder);
-                        }
-
-                        // Use the new Parallel State Machine
-                        if (!empty($file_chunks)) {
-                            self::sync_chunks_parallel($file_chunks, $folder);
-                        }
-
-                        echo " - All sync chunks processed.\n";
-                    } else {
-                        echo " - No new or changed files to download.\n";
-                    }
-
-                    if (!empty($files_to_delete)) {
-                        foreach ($files_to_delete as $path) {
-                            echo " - Removing: $path\n";
-                            $f = $folder . DIRECTORY_SEPARATOR . $path;
-                            if (file_exists($f)) unlink($f);
-                        }
-                    }
-
-                    echo "Cleaning up empty directories...\n";
-                    self::delete_empty_dirs($folder);
-                    echo "File sync complete.\n";
                 }
+
+                // Stats
+                $total_bytes_to_sync = 0;
+                foreach ($files_to_download as $f) {
+                    $total_bytes_to_sync += (isset($f->size) ? (float)$f->size : 0);
+                }
+                self::$global_bytes_total = $total_bytes_to_sync;
+                self::$global_bytes_processed = 0;
+
+                $transferred_bytes += $total_bytes_to_sync;
+                $transferred_files += count($files_to_download);
+
+                if (!empty($files_to_download)) {
+                    echo " - Syncing " . count($files_to_download) . " new/changed file(s)...\n";
+                    
+                    $file_chunks = [];
+                    $current_chunk = [];
+                    $current_chunk_size = 0;
+                    $large_files_parallel_queue = [];
+                    foreach ($files_to_download as $file) {
+                        $fsize = $file->size ?? 0;
+                        
+                        if ($fsize > self::$large_file_threshold) {
+                            $large_files_parallel_queue[] = $file;
+                            continue;
+                        }
+                        
+                        if (($current_chunk_size + $fsize > self::$file_chunk_max_size) || (count($current_chunk) >= self::$file_chunk_size)) {
+                            $file_chunks[] = $current_chunk;
+                            $current_chunk = [$file];
+                            $current_chunk_size = $fsize;
+                        } else {
+                            $current_chunk[] = $file;
+                            $current_chunk_size += $fsize;
+                        }
+                    }
+                    if (!empty($current_chunk)) $file_chunks[] = $current_chunk;
+
+                    if (!empty($large_files_parallel_queue)) {
+                        self::download_files_parallel($large_files_parallel_queue, $folder);
+                    }
+
+                    // Use the new Parallel State Machine
+                    if (!empty($file_chunks)) {
+                        self::sync_chunks_parallel($file_chunks, $folder);
+                    }
+
+                    echo " - All sync chunks processed.\n";
+                } else {
+                    echo " - No new or changed files to download.\n";
+                }
+
+                // Deletions: only files the source listed at the last sync
+                // and no longer lists. Never a file sync didn't bring (yours),
+                // an excluded path, or anything on an incomplete or empty list.
+                if (!$is_initial_sync) {
+                    $deleted_files = self::apply_source_deletions($folder, $previous, $listed);
+                }
+
+                // Remember what the source listed, for the next sync's
+                // deletions. An empty list keeps the last record.
+                if (!empty($listed)) {
+                    self::write_sync_state($folder, $listed, $previous);
+                }
+                echo "File sync complete.\n";
             } else {
                 echo "Skipping file sync as requested.\n";
             }
         } catch (\Exception $e) {
             echo "\033[?25h"; 
             echo "\nSync failed: {$e->getMessage()}\n";
+            @unlink($db_part_file);
             if (!self::$session_id) {
                 self::cleanupTemporaryFiles();
             }
@@ -1362,36 +1521,133 @@ class Run {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
         
-        // Wait for background extractions
-        $wait_ticks = 0;
-        // The background logic in sync_chunks_parallel creates zips.
-        // We verify that they are gone before finishing.
-        while (count(glob($folder . '/sync-files-*.zip')) > 0 || count(glob($folder . '/files-*.zip')) > 0) {
-            if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
-            echo ".";
-            sleep(1);
-            $wait_ticks++;
-            if ($wait_ticks > 60) {
-                 echo "\nWarning: Background extraction taking too long. Some zip files may remain in $folder.\n";
-                 break;
-            }
-        }
-        if ($wait_ticks > 0) echo " Done.\n";
+        // Wait for background extractions, and collect anything they refused.
+        self::wait_for_extractions($folder, 60);
 
         // Record the origin URL and table prefix (as backup does) so the mirror
-        // can be restored without --source-url / --source-prefix. Written last:
-        // it isn't on the server, so nothing above treats it as a stray file.
+        // can be restored without --source-url / --source-prefix.
         self::write_source_meta($folder);
 
+        $had_failures = self::report_failures();
+
         // Final Output with Stats
-        $stats_str = self::humanFilesize($transferred_bytes);
-        $files_str = number_format($transferred_files);
-        echo "\nSync Completed Successfully\n";
+        echo $had_failures ? "\nSync Finished With Errors\n" : "\nSync Completed Successfully\n";
         echo "-----------------------------\n";
         printf("%-15s %s\n", "Destination:", $folder);
         printf("%-15s %s\n", "Transferred:", self::humanFilesize($transferred_bytes));
         printf("%-15s %s\n", "Items:", number_format($transferred_files));
+        printf("%-15s %s\n", "Deleted:", number_format($deleted_files));
         echo "\n";
+        if ($had_failures) {
+            exit(1);
+        }
+    }
+
+    /** A site address without scheme, www. or trailing slash, for comparing. */
+    private static function normalize_site($url) {
+        return preg_replace('#^https?://(www\.)?#i', '', rtrim(strtolower((string) $url), '/'));
+    }
+
+    /**
+     * The files the source listed at the last sync into $folder, as a set,
+     * or null when there's no usable record (none yet, unreadable, or kept
+     * for a different source). Without one, nothing is deleted.
+     */
+    private static function read_sync_state($folder) {
+        $file = rtrim($folder, '/') . '/' . self::SYNC_STATE;
+        if (!file_exists($file)) {
+            echo " - No sync record in this folder yet (first sync with CLI 3.0): nothing will be deleted this time.\n";
+            return null;
+        }
+        if (is_link($file) || is_link(dirname($file))) {
+            echo " - Warning: the sync record is a symlink; ignoring it, so nothing will be deleted.\n";
+            return null;
+        }
+        $state = json_decode((string) file_get_contents($file));
+        if (!is_object($state) || !isset($state->files) || !is_array($state->files)) {
+            echo " - Warning: the sync record is unreadable; nothing will be deleted this time.\n";
+            return null;
+        }
+        if (self::normalize_site($state->source ?? '') !== self::normalize_site(self::$siteUrl)) {
+            echo " - Warning: this folder was last synced from " . ($state->source ?? 'another site') . "; nothing will be deleted this time.\n";
+            return null;
+        }
+        return array_fill_keys(array_filter($state->files, 'is_string'), true);
+    }
+
+    /**
+     * Saves what the source listed this time. Paths excluded this run (-x)
+     * keep their entries from the last record, so dropping the -x later still
+     * knows they came from the source. Written to a temp file and moved into
+     * place, so a stopped sync never leaves half a record.
+     */
+    private static function write_sync_state($folder, $listed, $previous) {
+        $files = $listed;
+        foreach ((array) $previous as $path => $unused) {
+            if (self::is_excluded($path)) {
+                $files[$path] = true;
+            }
+        }
+        $file = rtrim($folder, '/') . '/' . self::SYNC_STATE;
+        $dir  = dirname($file);
+        if (is_link($dir) || (!is_dir($dir) && !mkdir($dir, 0755, true))) {
+            echo " - Warning: could not save the sync record in $dir; the next sync won't delete anything.\n";
+            return;
+        }
+        $tmp  = $file . '.tmp';
+        $json = json_encode([
+            'version' => 1,
+            'source'  => rtrim(self::$siteUrl, '/'),
+            'synced'  => date('c'),
+            'files'   => array_keys($files),
+        ], JSON_UNESCAPED_SLASHES);
+        if (is_link($tmp) || is_link($file) || file_put_contents($tmp, $json) === false || !rename($tmp, $file)) {
+            @unlink($tmp);
+            echo " - Warning: could not save the sync record; the next sync won't delete anything.\n";
+        }
+    }
+
+    /**
+     * Deletes local copies of files deleted on the source since the last
+     * sync: listed then ($previous), not listed now ($listed), not excluded,
+     * a plain file at a safe path inside the folder. Returns how many.
+     */
+    private static function apply_source_deletions($folder, $previous, $listed) {
+        if ($previous === null) {
+            return 0;
+        }
+        if (empty($listed)) {
+            echo " - The source listed no files: nothing deleted (the last sync record is kept).\n";
+            return 0;
+        }
+        $real_root = realpath($folder);
+        $deleted   = 0;
+        $kept      = [];
+        foreach ($previous as $path => $unused) {
+            $path = (string) $path;
+            if (isset($listed[$path]) || self::is_excluded($path) || self::is_reserved_sync_path($path)) {
+                continue;
+            }
+            if ($real_root === false || !self::local_path_safe($real_root, $path)) {
+                $kept[] = "$path (unsafe path or a symlink on the way)";
+                continue;
+            }
+            $full = $real_root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path);
+            if (is_link($full) || !is_file($full)) {
+                continue; // already gone, or not a plain file sync wrote
+            }
+            echo " - Removing (deleted on the source): $path\n";
+            if (@unlink($full)) {
+                $deleted++;
+                self::remove_emptied_parents($real_root, $path);
+            } else {
+                $kept[] = "$path (could not delete)";
+            }
+        }
+        foreach ($kept as $line) {
+            echo " - Kept: $line\n";
+        }
+        return $deleted;
     }
 
     /**
@@ -1452,10 +1708,9 @@ class Run {
 
                 curl_setopt($ch, CURLOPT_POST, 1);
                 curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-                if (self::$cookie) {
-                    curl_setopt($ch, CURLOPT_COOKIE, self::$cookie);
-                }
+                // Same auth as every API call: an app-password connection
+                // sent none here before 3.0.
+                curl_setopt($ch, CURLOPT_HTTPHEADER, self::api_header_lines(['Content-Type' => 'application/json']));
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_TIMEOUT, 1800);
@@ -1531,16 +1786,10 @@ class Run {
                         $safe_zip = escapeshellarg($zip_path);
                         $safe_dest = escapeshellarg($dest_path);
 
-                        // PHP One-Liner: Open, Extract, Close, Delete.
-                        $php_code = sprintf(
-                            '$z = new ZipArchive; if ($z->open(%s) === TRUE) { $z->extractTo(%s); $z->close(); unlink(%s); }',
-                            $safe_zip,
-                            $safe_dest,
-                            $safe_zip
-                        );
-                        
-                        // Execute in background (> /dev/null 2>&1 &)
-                        $cmd = sprintf('php -r %s > /dev/null 2>&1 &', escapeshellarg($php_code));
+                        // Unpacked by a separate PHP process (see
+                        // extractor_script()) that never writes outside
+                        // the folder or through a symlink, then deletes the zip.
+                        $cmd = sprintf('%s %s %s %s > /dev/null 2>&1 &', escapeshellarg(PHP_BINARY), escapeshellarg(self::extractor_script()), $safe_zip, $safe_dest);
                         exec($cmd);
 
                         // Update global stats immediately (based on zip size)
@@ -1598,8 +1847,10 @@ class Run {
 
                     if ($http_code === 200 && !empty($zip_url) && strpos($zip_url, 'http') === 0) {
                         // SUCCESS -> TRANSITION TO DOWNLOAD
-                        $fname = basename($zip_url);
-                        $lpath = $folder . '/' . $fname;
+                        $fname = basename(parse_url($zip_url, PHP_URL_PATH) ?: $zip_url);
+                        // Our own name locally: the server's could match a
+                        // site file in the folder (the zip is deleted after).
+                        $lpath = $folder . '/sync-files-' . self::new_session_id() . '.zip';
                         
                         $fp = fopen($lpath, 'w+');
                         $ch_dl = curl_init($zip_url);
@@ -1690,6 +1941,10 @@ class Run {
             echo "\nProcessing failed chunks via stream fallback...\n";
             foreach ($fallback_chunks as $chunk) {
                 foreach ($chunk as $f) {
+                    if (!self::local_path_safe($folder, $f->name)) {
+                        self::$failures[] = "{$f->name} (unsafe path)";
+                        continue;
+                    }
                     $ldest = $folder . '/' . $f->name;
                     $ldir = dirname($ldest);
                     if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
@@ -1699,6 +1954,7 @@ class Run {
                         self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
                     } catch (\Exception $fe) {
                         echo "   - Failed to download: {$f->name}\n";
+                        self::$failures[] = "{$f->name} (download failed)";
                     }
                 }
             }
@@ -1820,7 +2076,7 @@ class Run {
             self::$backup_token = self::$session_id;
             echo "Reusing backup session: " . self::$backup_token . "\n";
         } else {
-            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+            self::$backup_token = self::new_session_id();
         }
 
         // 3. Fetch Manifest
@@ -1991,7 +2247,7 @@ class Run {
                         $id_short = $session->token;
                         $chunks   = $session->count;
                         
-                        $session_output .= sprintf("%-20s %-16s (%d chunks)\n", $date_str, $id_short, $chunks);
+                        $session_output .= sprintf("%-20s %-32s (%d chunks)\n", $date_str, $id_short, $chunks);
                     }
                 }
 
@@ -2146,7 +2402,7 @@ class Run {
             self::$backup_token = self::$session_id;
             echo "Reusing backup session: " . self::$backup_token . "\n";
         } else {
-            self::$backup_token = substr(bin2hex(random_bytes(20)), 0, -28);
+            self::$backup_token = self::new_session_id();
         }
 
         $files = [];
@@ -2318,7 +2574,12 @@ class Run {
                 $all_files_to_process = $filtered_files;
                 if (empty($all_files_to_process) && !empty($files)) {
                     // Fetch using parallel fetcher (uses static excludes)
-                    list($remote_files_map, $debug) = self::fetch_manifests_parallel($files);
+                    list($remote_files_map, $debug, $report) = self::fetch_manifests_parallel($files);
+                    // A backup missing part of the site is not a backup.
+                    if (!$report['complete']) {
+                        throw new \Exception("The source's file list is incomplete (" . implode('; ', $report['problems']) . ").");
+                    }
+                    $remote_files_map = self::filter_writable_files($remote_files_map, $local_public_path, false);
                     $all_files_to_process = array_values($remote_files_map);
                     // Update exact count from fetch
                     $total_items_processed = count($remote_files_map) + (!self::$skip_db ? count($database) : 0);
@@ -2363,18 +2624,7 @@ class Run {
                             self::sync_chunks_parallel($file_chunks, $local_public_path);
                         }
 
-                        $wait_ticks = 0;
-                        while (count(glob($local_public_path . '/sync-files-*.zip')) > 0 || count(glob($local_public_path . '/files-*.zip')) > 0) {
-                            if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
-                            echo ".";
-                            sleep(1);
-                            $wait_ticks++;
-                            if ($wait_ticks > 120) { 
-                                 echo "\nWarning: Background extraction taking too long. Some zip files may be left in the backup.\n";
-                                 break;
-                            }
-                        }
-                        if ($wait_ticks > 0) echo " Done.\n";
+                        self::wait_for_extractions($local_public_path, 120);
                         echo "\n";
                         echo "Small file batches complete.\n";
                     }
@@ -2405,13 +2655,17 @@ class Run {
 
         // FINAL SUMMARY
         $final_size = file_exists($final_zip_name) ? filesize($final_zip_name) : 0;
+        $had_failures = self::report_failures();
         
-        echo "\nBackup Completed Successfully\n";
+        echo $had_failures ? "\nBackup Finished With Errors (the zip is missing the files above)\n" : "\nBackup Completed Successfully\n";
         echo "-----------------------------\n";
         printf("%-15s %s\n", "File Name:", $final_zip_name);
         printf("%-15s %s\n", "Total Size:", self::humanFilesize($final_size));
         printf("%-15s %s\n", "Items:", number_format($total_items_processed));
         echo "\n";
+        if ($had_failures) {
+            exit(1);
+        }
     }
 
     /**
@@ -2471,15 +2725,30 @@ class Run {
             }
         }
 
-        $import_id = bin2hex(random_bytes(12));
+        $import_id = self::new_session_id();
 
         // Preflight the destination.
         echo "Preflighting destination " . self::$siteUrl . "...\n";
-        $pre = self::make_request('/import/preflight', ['import_id' => $import_id], 'POST');
+        try {
+            $pre = self::make_request('/import/preflight', ['import_id' => $import_id], 'POST');
+        } catch (\Exception $e) {
+            $pre = null;
+        }
         if (!is_object($pre)) {
             echo "Error: preflight failed.\n";
             exit(1);
         }
+        // v3 refuses a whole-site restore into a subsite or tenant reached
+        // directly; stop before asking anything.
+        if (!empty($pre->refused)) {
+            echo "Error: " . $pre->refused . "\n";
+            exit(1);
+        }
+        // What the destination supports: v3 announces pacing (steps that
+        // work in pieces) and resumable steps (safe to resend).
+        $caps = clone $pre;
+        unset($caps->disembark_token);
+        self::$source_caps = $caps;
         $dest_home   = rtrim($pre->home_url ?? self::$siteUrl, '/');
         $dest_prefix = $pre->db_prefix ?? '';
         // Plugins from 2.9 report the largest upload chunk the host accepts.
@@ -2540,7 +2809,7 @@ class Run {
         // if the snapshot can't be verified — without it there is no undo.
         echo "Creating rollback snapshot...\n";
         try {
-            $snap = self::make_request('/import/snapshot', ['import_id' => $import_id], 'POST');
+            $snap = self::paced_request('/import/snapshot', ['import_id' => $import_id], 'Rollback snapshot');
         } catch (\Exception $e) {
             $snap = null;
         }
@@ -2600,7 +2869,7 @@ class Run {
                     $payload['old_prefix'] = $source_prefix;
                     $payload['new_prefix'] = $dest_prefix;
                 }
-                $res = self::make_request('/import/import-staged-sql', $payload, 'POST');
+                $res = self::paced_request('/import/import-staged-sql', $payload, 'Importing database');
                 if (is_object($res)) {
                     echo "  " . ($res->statements_executed ?? 0) . " statements executed";
                     if (!empty($res->errors)) {
@@ -2621,7 +2890,7 @@ class Run {
 
                 if ($source_home && $dest_home && $source_home !== $dest_home) {
                     echo "Rewriting URLs ($source_home -> $dest_home)...\n";
-                    $sr = self::make_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'POST');
+                    $sr = self::paced_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'Rewriting URLs');
                     if (is_object($sr)) {
                         echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
                     }
@@ -2649,7 +2918,14 @@ class Run {
      */
     private static function restore_rollback($id) {
         echo "Rolling back import $id on " . self::$siteUrl . "...\n";
-        $res = self::make_request('/import/rollback', ['import_id' => $id], 'POST');
+        self::source_caps(); // a v3 destination rolls back in pieces
+        try {
+            $res = self::paced_request('/import/rollback', ['import_id' => $id], 'Rolling back');
+        } catch (\Exception $e) {
+            echo "Error: rollback failed: {$e->getMessage()}\n";
+            echo "Nothing more was changed by this command; run it again to retry.\n";
+            exit(1);
+        }
         if (is_object($res) && !empty($res->success)) {
             echo "Rollback complete. Tables restored: " . ($res->tables_restored ?? '?') . ", files restored: " . ($res->files_restored ?? '?') . ".\n";
         } else {
@@ -2677,7 +2953,8 @@ class Run {
             \RecursiveIteratorIterator::SELF_FIRST
         );
         foreach ($it as $file) {
-            if ($file->isDir()) {
+            // Never a symlink: it could carry a file from outside the folder.
+            if ($file->isLink() || $file->isDir()) {
                 continue;
             }
             $path = $file->getPathname();
@@ -2689,7 +2966,7 @@ class Run {
             }
             // Database dumps never go in the upload: Disembark's database-*.sql
             // anywhere, and any .sql at the root (a sync mirror's database.sql).
-            if (preg_match('/^database-.*\.sql$/i', $base) || (strpos($rel, '/') === false && preg_match('/\.sql$/i', $rel))) {
+            if (preg_match('/^database-.*\.sql$/i', $base) || (strpos($rel, '/') === false && preg_match('/\.sql(\.part)?$/i', $rel))) {
                 continue;
             }
             // Sync's own working folders.
@@ -2718,7 +2995,7 @@ class Run {
         }
 
         self::upload_file_to_staging($zip_path, 'restore.zip', $import_id);
-        self::make_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'POST');
+        self::paced_request('/import/extract-zip', ['import_id' => $import_id, 'file_path' => 'restore.zip'], 'Unpacking');
     }
 
     /**
@@ -2791,11 +3068,7 @@ class Run {
         $body .= $file_bytes;
         $body .= "$eol--$boundary--$eol";
 
-        $headers = ['Content-Type' => "multipart/form-data; boundary=$boundary"];
-        $auth = self::auth_header();
-        if ($auth) {
-            $headers['Authorization'] = $auth;
-        }
+        $headers = ['Content-Type' => "multipart/form-data; boundary=$boundary"] + self::api_headers();
         $options  = ['verify' => false, 'timeout' => 1800, 'useragent' => self::$user_agent];
 
         $attempts = 3;
@@ -2956,7 +3229,8 @@ class Run {
         echo "      --session-id=<id>                  Reuse a specific backup session ID (backup token) generated by the plugin UI.\n";
         echo "\n";
         echo "  disembark sync <site-url> [<folder>] [options]\n";
-        echo "    Create or update a local mirror of the site.\n";
+        echo "    Create or update a local mirror of the site. A file is deleted locally only when the\n";
+        echo "    source listed it at the last sync and no longer does; files you add are kept.\n";
         echo "\n";
         echo "    Options for sync:\n";
         echo "      --debug                            Save local and remote manifest files for debugging.\n";
@@ -2967,6 +3241,8 @@ class Run {
         echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
         echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 500MB.\n";
         echo "      --large-file-threshold=<size>      Set size threshold for individual file downloads (e.g., 100MB). Default: 200MB.\n";
+        echo "      -x <path>                          Leave a path out (its local copy is kept). Can be repeated.\n";
+        echo "      --exclude-tables=<tables>          Leave tables out of database.sql (comma-separated, * wildcards).\n";
         echo "      --session-id=<id>                  Reuse a backup session ID from the UI.\n";
         echo "\n";
         echo "  disembark ncdu <site-url> [options]\n";
@@ -3289,6 +3565,7 @@ class Run {
                 if (!$fp) {
                     $line_offset = $slot_index + 1;
                     echo "\033[{$line_offset}B\033[KError: Could not open $local_dest\r\033[{$line_offset}A";
+                    self::$failures[] = "{$file->name} (could not open the local file)";
                     $processed_count++;
                     continue;
                 }
@@ -3446,6 +3723,7 @@ class Run {
                     self::$global_bytes_processed += (int)$file->size;
                 } catch (\Exception $e) {
                     echo "      Error: " . $e->getMessage() . "\n";
+                    self::$failures[] = "{$file->name} (download failed)";
                 }
             }
         }
@@ -3462,11 +3740,20 @@ class Run {
         $max_retries = 5;
         $mh = curl_multi_init();
         $queue = [];
-        
+
+        // What the source listed, and whether the list is whole. Sync only
+        // deletes when it is: a chunk that can't be fetched, doesn't decode,
+        // or holds fewer files than the source counted means "unknown", never
+        // "deleted on the source".
+        $listed   = [];
+        $problems = [];
+
         // Filter valid chunks and prepare queue
-        foreach ($manifest_chunks as $chunk) {
-            if (isset($chunk->url)) {
+        foreach ((array) $manifest_chunks as $chunk) {
+            if (is_object($chunk) && isset($chunk->url)) {
                 $queue[] = ['chunk' => $chunk, 'attempts' => 0];
+            } else {
+                $problems[] = "a manifest chunk without a URL";
             }
         }
 
@@ -3495,7 +3782,7 @@ class Run {
                 }
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_multi_add_handle($mh, $ch);
-                $active_transfers[(int)$ch] = ['wrapper' => $item];
+                $active_transfers[spl_object_id($ch)] = ['wrapper' => $item];
             }
 
             // 2. EXECUTE
@@ -3505,7 +3792,7 @@ class Run {
             // 3. CHECK COMPLETION
             while ($info = curl_multi_info_read($mh)) {
                 $ch = $info['handle'];
-                $ch_id = (int)$ch;
+                $ch_id = spl_object_id($ch);
                 
                 if (isset($active_transfers[$ch_id])) {
                     $transfer = $active_transfers[$ch_id];
@@ -3516,12 +3803,12 @@ class Run {
                     $error = curl_error($ch);
 
                     curl_multi_remove_handle($mh, $ch);
-                    if (is_resource($ch)) {
-                        curl_close($ch);
-                    }
                     unset($active_transfers[$ch_id]);
 
-                    if ($http_code !== 200 || $error || empty($content)) {
+                    $absorbed = ($http_code === 200 && !$error && !empty($content))
+                        && self::absorb_manifest_chunk($transfer['wrapper']['chunk'], $content, $remote_files_map, $listed, $problems, false);
+
+                    if (!$absorbed) {
                         // FAILURE
                         if ($transfer['wrapper']['attempts'] < $max_retries) {
                             echo ".";
@@ -3544,27 +3831,6 @@ class Run {
                             $processed_count++;
                         }
                     } else {
-                        // SUCCESS - Process JSON immediately
-                        $files = json_decode($content);
-                        if (is_array($files)) {
-                            foreach ($files as $file) {
-                                if (!isset($file->name)) continue;
-                                // Apply exclusions using static property
-                                $is_excluded = false;
-                                if (!empty(self::$exclude_paths)) {
-                                    foreach (self::$exclude_paths as $exclude_path) {
-                                        if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
-                                            $is_excluded = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                               
-                                if ($is_excluded) continue;
-                                $remote_files_map[$file->name] = $file;
-                                // $all_remote_files[] = $file; // Uncomment if needed for debug
-                            }
-                        }
                         $processed_count++;
                         // Progress indicator
                         if ($processed_count % 10 === 0 || $processed_count === $total_chunks) {
@@ -3574,66 +3840,305 @@ class Run {
                     }
                 }
             }
-        } while ($running > 0 || !empty($queue));
+        } while ($running > 0 || !empty($queue) || !empty($active_transfers));
 
-        if (is_resource($mh)) {
-            curl_multi_close($mh);
-        }
+        curl_multi_close($mh);
 
         if (!empty($failed_chunks)) {
             echo "\n - Attempting fallback stream download for " .
             count($failed_chunks) . " failed chunks...\n";
             
             foreach ($failed_chunks as $chunk) {
+                $chunk_label = $chunk->name ?? ($chunk->path ?? 'unknown');
+                if (empty($chunk->path)) {
+                    $problems[] = "manifest chunk $chunk_label could not be fetched";
+                    continue;
+                }
                 // Determine temp path for this chunk
-                $temp_manifest_path = sys_get_temp_dir() .
-                '/' . basename($chunk->path);
+                $temp_manifest_path = sys_get_temp_dir() . '/disembark-manifest-' . self::new_session_id() . '.json';
                 
                 try {
                     echo "   > Streaming manifest: {$chunk->path}\n";
                     // Reuse existing robust stream downloader
                     self::download_file_via_stream($chunk->path, $temp_manifest_path);
-                    if (file_exists($temp_manifest_path)) {
-                        $content = file_get_contents($temp_manifest_path);
-                        $files = json_decode($content);
-                        
-                        if (is_array($files)) {
-                            $added_count = 0;
-                            foreach ($files as $file) {
-                                if (!isset($file->name)) continue;
-                                // Apply exclusions
-                                $is_excluded = false;
-                                if (!empty(self::$exclude_paths)) {
-                                    foreach (self::$exclude_paths as $exclude_path) {
-                                        if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
-                                            $is_excluded = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                               
-                                if ($is_excluded) continue;
-                                
-                                $remote_files_map[$file->name] = $file;
-                                $added_count++;
-                            }
-                            echo "     - Recovered $added_count files from stream.\n";
-                        } else {
-                            echo "     - Failed to decode JSON from stream.\n";
-                        }
-                        
-                        unlink($temp_manifest_path);
+                    $content = file_exists($temp_manifest_path) ? file_get_contents($temp_manifest_path) : '';
+                    @unlink($temp_manifest_path);
+                    $before = count($remote_files_map);
+                    if (self::absorb_manifest_chunk($chunk, $content, $remote_files_map, $listed, $problems, true)) {
+                        echo "     - Recovered " . (count($remote_files_map) - $before) . " files from stream.\n";
+                    } else {
+                        echo "     - Failed to read the manifest chunk from the stream.\n";
                     }
                 } catch (\Exception $e) {
-                    echo "     - Critical: Fallback failed for {$chunk->name}. {$e->getMessage()}\n";
+                    @unlink($temp_manifest_path);
+                    $problems[] = "manifest chunk $chunk_label could not be fetched";
+                    echo "     - Critical: Fallback failed for {$chunk_label}. {$e->getMessage()}\n";
                 }
             }
         }
 
         echo "\n - Manifest download complete.\n";
-        return [$remote_files_map, $all_remote_files];
+        $report = [
+            'complete' => empty($problems),
+            'problems' => array_values(array_unique($problems)),
+            'listed'   => $listed,
+        ];
+        return [$remote_files_map, $all_remote_files, $report];
     }
 
+    /**
+     * Reads one manifest chunk into the remote file map. True when the chunk
+     * decoded to a list holding as many entries as the source counted for it.
+     * With $final false, a bad chunk is left for a retry without being
+     * recorded as a problem; with $final true it is recorded.
+     */
+    private static function absorb_manifest_chunk($chunk, $content, &$remote_files_map, &$listed, &$problems, $final) {
+        $label = $chunk->name ?? 'unknown';
+        $files = json_decode((string) $content);
+        if (!is_array($files)) {
+            if ($final) {
+                $problems[] = "manifest chunk $label is not a file list";
+            }
+            return false;
+        }
+        if (isset($chunk->count) && is_numeric($chunk->count) && count($files) !== (int) $chunk->count) {
+            if ($final) {
+                $problems[] = "manifest chunk $label lists " . count($files) . " of {$chunk->count} files";
+            }
+            return false;
+        }
+        foreach ($files as $file) {
+            if (!is_object($file) || !isset($file->name) || !is_string($file->name) || $file->name === '') continue;
+            $listed[$file->name] = true;
+            // Apply exclusions using static property
+            if (self::is_excluded($file->name)) continue;
+            $remote_files_map[$file->name] = $file;
+        }
+        return true;
+    }
+
+    /** True when $path is one of the -x paths or inside one. */
+    private static function is_excluded($path) {
+        foreach (self::$exclude_paths as $exclude_path) {
+            if ($path === $exclude_path || strpos($path, $exclude_path . '/') === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * True for a relative path that names something inside a folder: no
+     * leading slash or drive, no "." or ".." segment, no empty segment, no
+     * backslash or NUL. Source file names are checked with this before
+     * anything is written or deleted for them.
+     */
+    private static function is_safe_relative_path($name) {
+        if (!is_string($name) || $name === '' || strpos($name, "\0") !== false || strpos($name, '\\') !== false) {
+            return false;
+        }
+        if ($name[0] === '/' || preg_match('#^[A-Za-z]:#', $name)) {
+            return false;
+        }
+        foreach (explode('/', $name) as $segment) {
+            if ($segment === '' || $segment === '.' || $segment === '..') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * True when $rel can be written or deleted under $root without leaving
+     * it: a safe relative path, and no part of it that exists locally is a
+     * symlink (or a file where a folder is needed). Missing parts are fine:
+     * they're created as real folders.
+     */
+    private static function local_path_safe($root, $rel) {
+        $real_root = realpath($root);
+        if ($real_root === false || !self::is_safe_relative_path($rel)) {
+            return false;
+        }
+        $parts = explode('/', $rel);
+        $last  = count($parts) - 1;
+        $path  = $real_root;
+        foreach ($parts as $i => $segment) {
+            $path .= DIRECTORY_SEPARATOR . $segment;
+            if (is_link($path)) {
+                return false;
+            }
+            if (!file_exists($path)) {
+                return true;
+            }
+            if ($i < $last && !is_dir($path)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Sync's own files at the mirror's root, which a source file of the same
+     * name must never overwrite (or be deleted as).
+     */
+    private static function is_reserved_sync_path($path) {
+        return in_array($path, ['database.sql', 'database.sql.part', 'disembark-source.json'], true)
+            || strpos($path, '.disembark-db-parts/') === 0
+            || strpos($path, '.disembark-manifests/') === 0;
+    }
+
+    /**
+     * Drops source files that can't be written safely under $folder (unsafe
+     * names, a local symlink on the way) and, for a sync mirror, ones named
+     * like sync's own files. Says what it left out; they count as failures.
+     */
+    private static function filter_writable_files($remote_files_map, $folder, $is_mirror) {
+        $skipped = [];
+        foreach ($remote_files_map as $name => $file) {
+            $reason = null;
+            if ($is_mirror && self::is_reserved_sync_path($name)) {
+                $reason = 'named like one of sync\'s own files';
+            } elseif (!self::local_path_safe($folder, $name)) {
+                $reason = 'unsafe path or a symlink in the local folder';
+            }
+            if ($reason !== null) {
+                $skipped[] = "$name ($reason)";
+                unset($remote_files_map[$name]);
+            }
+        }
+        if (!empty($skipped)) {
+            echo " - Left out " . count($skipped) . " file(s) that can't be written safely here:\n";
+            foreach (array_slice($skipped, 0, 10) as $line) {
+                echo "   - $line\n";
+            }
+            if (count($skipped) > 10) {
+                echo "   - ...and " . (count($skipped) - 10) . " more\n";
+            }
+            self::$failures = array_merge(self::$failures, $skipped);
+        }
+        return $remote_files_map;
+    }
+
+    /**
+     * The background extractor: a small PHP script (written once to the temp
+     * folder) that unpacks a downloaded chunk into the folder entry by entry.
+     * Unlike ZipArchive::extractTo it refuses any entry whose path leaves the
+     * folder or passes through a symlink, and replaces files rather than
+     * writing through an existing link. Refused entries are listed in
+     * <zip>.skipped for the caller to report.
+     */
+    private static function extractor_script() {
+        static $path = null;
+        if ($path !== null && file_exists($path)) {
+            return $path;
+        }
+        $code = <<<'PHP'
+<?php
+// Disembark CLI: unpack a chunk zip into a folder without leaving it.
+list(, $zip_path, $dest) = $argv;
+$root = realpath($dest);
+$zip = new ZipArchive();
+if ($root === false || $zip->open($zip_path) !== true) {
+    file_put_contents($zip_path . '.skipped', "(could not open the chunk zip)\n", FILE_APPEND);
+    @unlink($zip_path);
+    exit(1);
+}
+$safe = function ($rel) use ($root) {
+    if ($rel === '' || strpos($rel, "\0") !== false || strpos($rel, '\\') !== false || $rel[0] === '/' || preg_match('#^[A-Za-z]:#', $rel)) return false;
+    $parts = explode('/', $rel);
+    $path = $root;
+    foreach ($parts as $i => $seg) {
+        if ($seg === '' || $seg === '.' || $seg === '..') return false;
+        $path .= '/' . $seg;
+        if (is_link($path)) return false;
+        if (!file_exists($path)) return true;
+        if ($i < count($parts) - 1 && !is_dir($path)) return false;
+    }
+    return !is_dir($path);
+};
+for ($i = 0; $i < $zip->numFiles; $i++) {
+    $name = $zip->getNameIndex($i);
+    if ($name === false || substr($name, -1) === '/') continue;
+    if (!$safe($name)) {
+        file_put_contents($zip_path . '.skipped', $name . "\n", FILE_APPEND);
+        continue;
+    }
+    $target = $root . '/' . $name;
+    $dir = dirname($target);
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true) && !is_dir($dir)) {
+        file_put_contents($zip_path . '.skipped', $name . "\n", FILE_APPEND);
+        continue;
+    }
+    // Checked again now the folders exist, then written to a new file
+    // (x: never an existing path or link) and moved into place.
+    $tmp = $target . '.disembark-' . bin2hex(random_bytes(4));
+    $in = $safe($name) ? $zip->getStream($name) : false;
+    $out = $in ? @fopen($tmp, 'xb') : false;
+    if (!$in || !$out) {
+        if ($in) fclose($in);
+        file_put_contents($zip_path . '.skipped', $name . "\n", FILE_APPEND);
+        continue;
+    }
+    $ok = stream_copy_to_stream($in, $out) !== false;
+    fclose($in);
+    fclose($out);
+    if (!$ok || !rename($tmp, $target)) {
+        @unlink($tmp);
+        file_put_contents($zip_path . '.skipped', $name . "\n", FILE_APPEND);
+    }
+}
+$zip->close();
+unlink($zip_path);
+PHP;
+        $path = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-extract-' . self::VERSION . '-' . getmypid() . '.php';
+        file_put_contents($path, $code);
+        return $path;
+    }
+
+    /**
+     * Waits for background extractions in $folder to finish and reports any
+     * entries they refused or couldn't write as failures.
+     */
+    private static function wait_for_extractions($folder, $max_seconds) {
+        $wait_ticks = 0;
+        while (count(glob($folder . '/sync-files-*.zip')) > 0 || count(glob($folder . '/files-*.zip')) > 0) {
+            if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
+            echo ".";
+            sleep(1);
+            $wait_ticks++;
+            if ($wait_ticks > $max_seconds) {
+                echo "\nWarning: Background extraction taking too long. Some zip files may remain in $folder.\n";
+                self::$failures[] = "(chunk zips still unpacking in $folder)";
+                break;
+            }
+        }
+        if ($wait_ticks > 0) echo " Done.\n";
+        foreach (glob($folder . '/*.zip.skipped') ?: [] as $list) {
+            foreach (file($list, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $name) {
+                self::$failures[] = "$name (not unpacked)";
+            }
+            @unlink($list);
+        }
+    }
+
+    /**
+     * Prints the files that couldn't be copied. Returns true when there were
+     * any (the caller then exits non-zero).
+     */
+    private static function report_failures() {
+        if (empty(self::$failures)) {
+            return false;
+        }
+        $failures = array_values(array_unique(self::$failures));
+        echo "\n" . count($failures) . " file(s) could not be copied:\n";
+        foreach (array_slice($failures, 0, 20) as $line) {
+            echo " - $line\n";
+        }
+        if (count($failures) > 20) {
+            echo " - ...and " . (count($failures) - 20) . " more\n";
+        }
+        return true;
+    }
     /**
      * Downloads a file from the /stream-file endpoint using WpOrg\Requests.
      */
@@ -3648,10 +4153,7 @@ class Run {
                 // Use self::$siteUrl and self::$token
                 $endpoint_url = self::rest_url('/stream-file');
                 $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
-                $headers = ['Content-Type' => 'application/json'];
-                if (self::$cookie) {
-                    $headers['Cookie'] = self::$cookie;
-                }
+                $headers = ['Content-Type' => 'application/json'] + self::api_headers();
                 $options = [
                     'verify' => false,
                     'timeout' => 1800,
@@ -3732,16 +4234,14 @@ class Run {
             \RecursiveIteratorIterator::SELF_FIRST
         );
         foreach ($iterator as $file) {
-            if ($file->isDir()) continue;
-            $path = $file->getRealPath();
-            $relative_path = ltrim(substr($path, strlen($real_root)), DIRECTORY_SEPARATOR);
+            // Symlinks are never followed or read: a link may point outside
+            // the mirror. (The iterator doesn't descend into linked folders.)
+            if ($file->isLink() || $file->isDir()) continue;
+            $path = $file->getPathname();
+            $relative_path = str_replace(DIRECTORY_SEPARATOR, '/', ltrim(substr($path, strlen($real_root)), DIRECTORY_SEPARATOR));
 
             // Skip sync-specific files
-            if ($relative_path === 'database.sql' ||
-                $relative_path === 'db_export.sql' ||
-                $relative_path === 'disembark-source.json' ||
-                strpos($relative_path, '.disembark-db-parts') === 0 ||
-                strpos($relative_path, '.disembark-manifests') === 0) {
+            if ($relative_path === 'db_export.sql' || self::is_reserved_sync_path($relative_path)) {
                 continue;
             }
 
@@ -3758,15 +4258,22 @@ class Run {
     }
 
     /**
-     * Recursively deletes empty directories.
+     * Removes the folders a sync emptied by deleting $rel: its parent, then
+     * theirs, up to (never including) $root. Stops at the first folder that
+     * still holds something, or that is a symlink.
      */
-    private static function delete_empty_dirs($dir) {
-        if (!is_dir($dir)) return;
-        $iterator = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
-        foreach ($iterator as $file) {
-            if ($file->isDir() && !(new \FilesystemIterator($file->getPathname()))->valid()) {
-                rmdir($file->getPathname());
+    private static function remove_emptied_parents($root, $rel) {
+        $real_root = realpath($root);
+        $dir = dirname($rel);
+        while ($real_root !== false && $dir !== '.' && $dir !== '' && $dir !== '/') {
+            $path = $real_root . DIRECTORY_SEPARATOR . $dir;
+            if (is_link($path) || !is_dir($path) || (new \FilesystemIterator($path))->valid()) {
+                return;
             }
+            if (!@rmdir($path)) {
+                return;
+            }
+            $dir = dirname($dir);
         }
     }
 
@@ -3836,16 +4343,21 @@ class Run {
      * Recursively deletes a directory.
      */
     private static function delete_directory($dir) {
+        if (is_link($dir)) {
+            unlink($dir); // the link only, never the folder it points to
+            return;
+        }
         if (!is_dir($dir)) {
             return;
         }
         $it = new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS);
         $files = new \RecursiveIteratorIterator($it, \RecursiveIteratorIterator::CHILD_FIRST);
         foreach ($files as $file) {
-            if ($file->isDir()) {
-                rmdir($file->getRealPath());
+            // A link is removed itself, never what it points to.
+            if ($file->isDir() && !$file->isLink()) {
+                rmdir($file->getPathname());
             } else {
-                unlink($file->getRealPath());
+                unlink($file->getPathname());
             }
         }
         rmdir($dir);
