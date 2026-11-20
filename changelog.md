@@ -1,5 +1,23 @@
 # Changelog
 
+## **v3.0.0** - November 20, 2026
+
+### Fixed
+* **Sync never deletes files it shouldn't:** `disembark sync` deleted every local file missing from the source's list, so a list that came back empty (the whole mirror), short a manifest chunk it couldn't fetch, or missing paths left out with `-x` deleted those local files, and still reported success. Sync now keeps a record of what the source listed (`.disembark-manifests/sync-state.json`) and deletes a local file only when the source listed it at the last sync and no longer does. Files you add to the mirror are kept, `-x` paths keep their local copies (and their record, so dropping `-x` later still works), and a list that comes back with an error or incomplete stops the sync before anything is changed. An empty list deletes nothing. A mirror made by an older CLI deletes nothing on its first 3.0 sync while the record is made.
+* **Symlinks stay where they are:** sync and backup never write, read or delete through a symlink, and never outside the target folder. A source file whose local path runs through a symlink is left out and reported, chunk zips are unpacked entry by entry (refusing `..` and linked paths) instead of with `ZipArchive::extractTo`, and restore no longer packs files a symlink points to. The local scan no longer follows linked files.
+* **Application-password connections copy files:** file batches (`/zip-sync-files`) and the stream fallback sent no credentials on an application-password connection, so every file failed with 403 and a sync or backup copied nothing.
+* **Failures say so:** files that couldn't be copied are listed at the end and the command exits 1 ("Sync Finished With Errors"); a backup whose file list is incomplete fails instead of zipping part of the site. Restore and rollback failures before the first step exit 1 with a message instead of a PHP fatal.
+* **A stopped sync keeps its database.sql:** the dump is written as `database.sql.part` and moved into place when whole.
+* **`--exclude-tables` works with `sync`:** it was ignored there.
+
+### Improved
+* **Disembark 3.0 sources and destinations:** every API request also sends the token in the `X-Disembark-Token` header. On a 3.0 site the token stays out of URLs (GET requests and `connect` use the header), cleanup is a `POST /cleanup`, restore steps (rollback snapshot, unpacking, database import, URL rewrite) and `--rollback` work in pieces when the site announces `pacing`, import steps carry a request id so a resend after a dropped connection or gateway timeout never runs a step twice, and busy answers (429, 502, 503, 504) are asked again after the site's `Retry-After`. A restore into a subsite or tenant that 3.0 refuses stops before anything is asked. Sites on 2.9 keep working as before.
+* **Session ids:** backup sessions and restore ids are 32 hex characters (128 random bits), as Disembark 3.0 mints them; `info` lists them in full.
+* **`-x` paths:** a leading `./` or `/` is ignored.
+
+### Known
+* **Sync copies the whole database every run.** Skipping unchanged tables with Disembark 3.0's `POST /fingerprint` is planned for 3.1.
+
 ## **v2.9.0** - November 17, 2026
 
 ### Fixed
