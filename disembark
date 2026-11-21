@@ -1484,6 +1484,10 @@ class Run {
                         self::sync_chunks_parallel($file_chunks, $folder);
                     }
 
+                    // Wait for background extractions before applying deletions
+                    // or writing sync state, and collect anything they refused.
+                    self::wait_for_extractions($folder, 60);
+
                     echo " - All sync chunks processed.\n";
                 } else {
                     echo " - No new or changed files to download.\n";
@@ -1520,9 +1524,6 @@ class Run {
         } else {
             echo "\nSkipping remote cleanup to preserve UI session files.\n";
         }
-        
-        // Wait for background extractions, and collect anything they refused.
-        self::wait_for_extractions($folder, 60);
 
         // Record the origin URL and table prefix (as backup does) so the mirror
         // can be restored without --source-url / --source-prefix.
@@ -2212,23 +2213,9 @@ class Run {
                     $scan_size = self::humanFilesize($stats->total_size);
                     $scan_count = number_format($stats->total_files);
                     
-                    // Format timestamp (try to use system date for consistent timezone)
-                    $format = "'+%b %e, %Y %l:%M %p %Z'"; 
-                    $scan_time = "";
-                    
-                    if (PHP_OS === 'Darwin') {
-                        $cmd = "date -r {$stats->timestamp} $format";
-                        $scan_time = trim((string)shell_exec($cmd));
-                    } elseif (strtoupper(substr(PHP_OS, 0, 3)) === 'LIN') {
-                        $cmd = "date -d @{$stats->timestamp} $format";
-                        $scan_time = trim((string)shell_exec($cmd));
-                    }
-
-                    if (empty($scan_time)) {
-                        $scan_time = date('M j, Y g:i A T', $stats->timestamp);
-                    }
-                    
-                    $time_diff = time() - $stats->timestamp;
+                    $ts        = (int) $stats->timestamp;
+                    $scan_time = date('M j, Y g:i A T', $ts);
+                    $time_diff = time() - $ts;
                     $age_str = ($time_diff < 60) ? "Just now" :
                                (($time_diff < 3600) ? floor($time_diff/60) . "m ago" : 
                                (($time_diff < 86400) ? floor($time_diff/3600) . "h ago" : floor($time_diff/86400) . "d ago"));
@@ -2421,38 +2408,12 @@ class Run {
                 if (!empty(self::$exclude_paths)) {
                     $client_side_filtering = true;
                     echo "Applying client-side exclusions to session manifest...\n";
-                    
-                    $temp_manifest_dir = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/disembark-manifests-' . self::$backup_token;
-                    if (!is_dir($temp_manifest_dir) && !mkdir($temp_manifest_dir, 0755, true)) {
-                        throw new \Exception("Could not create temp manifest dir for filtering.");
-                    }
 
-                    $all_remote_files = [];
-                    foreach ($files as $file_manifest) {
-                        $local_chunk_path = $temp_manifest_dir . '/' . $file_manifest->name;
-                        self::download_file_direct($file_manifest->url, $local_chunk_path);
-                        $chunk_json = file_get_contents($local_chunk_path);
-                        unlink($local_chunk_path);
-                        $chunk_files = json_decode($chunk_json);
-                        if (is_array($chunk_files)) {
-                            $all_remote_files = array_merge($all_remote_files, $chunk_files);
-                        }
+                    list($remote_files_map, $debug, $report) = self::fetch_manifests_parallel($files);
+                    if (!$report['complete']) {
+                        throw new \Exception("The source's file list is incomplete (" . implode('; ', $report['problems']) . ").");
                     }
-                    self::delete_directory($temp_manifest_dir);
-                    foreach ($all_remote_files as $file) {
-                        if (!is_object($file) || empty($file->name)) continue;
-                        $is_excluded = false;
-                        foreach (self::$exclude_paths as $exclude_path) {
-                            if ($file->name === $exclude_path || strpos($file->name, $exclude_path . '/') === 0) {
-                                $is_excluded = true;
-                                break;
-                            }
-                        }
-
-                        if (!$is_excluded) {
-                            $filtered_files[] = $file;
-                        }
-                    }
+                    $filtered_files = $remote_files_map;
                 }
                 
                 self::displayBackupSummary($client_side_filtering ? [] : $files);
@@ -2571,19 +2532,23 @@ class Run {
 
             if (!self::$skip_files) {
                 echo "Preparing optimized file backup...\n";
-                $all_files_to_process = $filtered_files;
-                if (empty($all_files_to_process) && !empty($files)) {
+                $remote_files_map = [];
+                if ($client_side_filtering) {
+                    $remote_files_map = $filtered_files;
+                } elseif (!empty($files)) {
                     // Fetch using parallel fetcher (uses static excludes)
                     list($remote_files_map, $debug, $report) = self::fetch_manifests_parallel($files);
                     // A backup missing part of the site is not a backup.
                     if (!$report['complete']) {
                         throw new \Exception("The source's file list is incomplete (" . implode('; ', $report['problems']) . ").");
                     }
-                    $remote_files_map = self::filter_writable_files($remote_files_map, $local_public_path, false);
-                    $all_files_to_process = array_values($remote_files_map);
-                    // Update exact count from fetch
-                    $total_items_processed = count($remote_files_map) + (!self::$skip_db ? count($database) : 0);
                 }
+                if (!empty($remote_files_map)) {
+                    $remote_files_map = self::filter_writable_files($remote_files_map, $local_public_path, false);
+                }
+                $all_files_to_process = array_values($remote_files_map);
+                // Update exact count from fetch
+                $total_items_processed = count($remote_files_map) + (!self::$skip_db ? count($database) : 0);
 
                 if (!empty($all_files_to_process)) {
                     $large_files_queue = [];
@@ -2871,11 +2836,16 @@ class Run {
                 }
                 $res = self::paced_request('/import/import-staged-sql', $payload, 'Importing database');
                 if (is_object($res)) {
-                    echo "  " . ($res->statements_executed ?? 0) . " statements executed";
-                    if (!empty($res->errors)) {
-                        echo ", " . count($res->errors) . " errors (first: " . substr($res->errors[0], 0, 120) . ")";
+                    $sql_errors = !empty($res->errors) && is_array($res->errors) ? $res->errors : [];
+                    if (!empty($sql_errors) || !empty($res->database_unchanged)) {
+                        $err_count = count($sql_errors);
+                        $first_err = $err_count > 0 ? substr((string) $sql_errors[0], 0, 200) : 'unknown error';
+                        $detail    = !empty($res->database_unchanged)
+                            ? 'The destination database was not changed: the import works on copies of the tables and only swaps them in when every statement succeeds.'
+                            : 'Stopped before rewriting URLs.';
+                        throw new \Exception("The database import reported {$err_count} error(s) (first: {$first_err}). {$detail}");
                     }
-                    echo ".\n";
+                    echo "  " . ($res->statements_executed ?? 0) . " statements executed.\n";
                 }
 
                 // Cross-prefix migration: remap the prefix stored inside the data
@@ -2926,11 +2896,27 @@ class Run {
             echo "Nothing more was changed by this command; run it again to retry.\n";
             exit(1);
         }
-        if (is_object($res) && !empty($res->success)) {
-            echo "Rollback complete. Tables restored: " . ($res->tables_restored ?? '?') . ", files restored: " . ($res->files_restored ?? '?') . ".\n";
-        } else {
-            echo "Rollback finished (response: " . json_encode($res) . ").\n";
+        if (is_object($res) && !empty($res->warnings) && is_array($res->warnings)) {
+            foreach ($res->warnings as $warning) {
+                echo "Warning: {$warning}\n";
+            }
         }
+        $errors = (is_object($res) && !empty($res->errors) && is_array($res->errors)) ? $res->errors : [];
+        if (!is_object($res) || empty($res->success) || !empty($errors)) {
+            if (!empty($errors)) {
+                echo "Error: rollback reported " . count($errors) . " problem(s):\n";
+                foreach (array_slice($errors, 0, 10) as $err) {
+                    echo "  - {$err}\n";
+                }
+                if (count($errors) > 10) {
+                    echo "  - ...and " . (count($errors) - 10) . " more\n";
+                }
+            } else {
+                echo "Error: rollback did not succeed (response: " . json_encode($res) . ").\n";
+            }
+            exit(1);
+        }
+        echo "Rollback complete. Tables restored: " . ($res->tables_restored ?? '?') . ", files restored: " . ($res->files_restored ?? '?') . ".\n";
     }
 
     /**
@@ -2961,16 +2947,29 @@ class Run {
             $base = basename($path);
             $rel  = ltrim(substr($path, strlen($source)), DIRECTORY_SEPARATOR);
             $rel  = str_replace('\\', '/', $rel);
-            if ($base === 'disembark-source.json' || $base === 'wp-config.php') {
+            $low_base = strtolower($base);
+            $low_rel  = strtolower($rel);
+            if ($low_base === 'disembark-source.json' || $low_base === 'wp-config.php' || $low_rel === 'restore.zip') {
+                continue;
+            }
+            // Quiet mode mu-plugin belongs to the site it was turned on for.
+            if ($low_base === 'disembark-quiet-mode.php' && strpos($low_rel, 'mu-plugins/') !== false) {
                 continue;
             }
             // Database dumps never go in the upload: Disembark's database-*.sql
-            // anywhere, and any .sql at the root (a sync mirror's database.sql).
-            if (preg_match('/^database-.*\.sql$/i', $base) || (strpos($rel, '/') === false && preg_match('/\.sql(\.part)?$/i', $rel))) {
+            // or *.(db|sql).txt anywhere, host dumps in wp-content/, and any
+            // .sql / .sql.gz / .sql.part at the root.
+            if (preg_match('/^database-.*\.sql$/i', $base)
+                || preg_match('/\.(?:db|sql)\.txt$/i', $base)
+                || preg_match('#^wp-content/(?:mysql\.sql|mysqldb-dump\.sql(?:\.gz)?)$#i', $rel)
+                || (strpos($rel, '/') === false && preg_match('/\.sql(?:\.gz|\.part)?$/i', $rel))) {
                 continue;
             }
-            // Sync's own working folders.
-            if (strpos($rel, '.disembark-db-parts/') === 0 || strpos($rel, '.disembark-manifests/') === 0) {
+            // Disembark's own working folders (sync state, chunks, uploads storage).
+            if (strpos($low_rel, '_chunks/') === 0
+                || strpos($low_rel, '.disembark-db-parts/') === 0
+                || strpos($low_rel, '.disembark-manifests/') === 0
+                || preg_match('#^(?:wp-content/)?uploads/(?:sites/\d+/)?disembark/#i', $rel)) {
                 continue;
             }
             $zip->addFile($path, $rel);
@@ -3782,7 +3781,8 @@ class Run {
                 }
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
                 curl_multi_add_handle($mh, $ch);
-                $active_transfers[spl_object_id($ch)] = ['wrapper' => $item];
+                $ch_id = is_object($ch) ? spl_object_id($ch) : (int) $ch;
+                $active_transfers[$ch_id] = ['wrapper' => $item];
             }
 
             // 2. EXECUTE
@@ -3792,7 +3792,7 @@ class Run {
             // 3. CHECK COMPLETION
             while ($info = curl_multi_info_read($mh)) {
                 $ch = $info['handle'];
-                $ch_id = spl_object_id($ch);
+                $ch_id = is_object($ch) ? spl_object_id($ch) : (int) $ch;
                 
                 if (isset($active_transfers[$ch_id])) {
                     $transfer = $active_transfers[$ch_id];
