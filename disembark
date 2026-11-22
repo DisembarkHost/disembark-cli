@@ -1580,6 +1580,7 @@ class Run {
             }
         } else {
             echo "Performing subsequent sync to existing folder: $folder\n";
+            self::guard_sync_scope($folder);
         }
 
         $local_db_parts_path = $folder . '/.disembark-db-parts';
@@ -1820,6 +1821,35 @@ class Run {
     /** A site address without scheme, www. or trailing slash, for comparing. */
     private static function normalize_site($url) {
         return preg_replace('#^https?://(www\.)?#i', '', rtrim(strtolower((string) $url), '/'));
+    }
+
+    /**
+     * Stops a sync that would mix two sites of one install in a mirror: the
+     * folder's record says it holds another site of this address (or the
+     * whole install), and this run would overwrite its files and swap its
+     * database.sql for this site's. A record from a different address only
+     * warns (a site that changed its domain), as read_sync_state() does.
+     */
+    private static function guard_sync_scope($folder) {
+        $file = rtrim($folder, '/') . '/' . self::SYNC_STATE;
+        if (!is_file($file) || is_link($file)) {
+            return;
+        }
+        $state = json_decode((string) file_get_contents($file));
+        if (!is_object($state) || self::normalize_site($state->source ?? '') !== self::normalize_site(self::$siteUrl)) {
+            return;
+        }
+        $was = isset($state->site) ? (string) $state->site : '';
+        $now = self::site_key();
+        if ($was === $now) {
+            return;
+        }
+        $what = function ($k) { return $k === '' ? 'the whole install' : 'site ' . $k; };
+        echo "Error: $folder holds a mirror of " . $what($was) . " of " . ($state->source ?? self::$siteUrl) . ", and this sync is for " . $what($now) . ".\n";
+        echo "Syncing here would overwrite that mirror's files and its database.sql with another site's. Sync into another folder";
+        $default = trim(preg_replace('/[^A-Za-z0-9._-]+/', '_', preg_replace('/^https?:\/\/(www\.)?/', '', rtrim(self::$siteUrl, '/'))), '_.') . ($now !== '' ? '-site-' . $now : '');
+        echo ", for example $default.\n";
+        exit(1);
     }
 
     /**
