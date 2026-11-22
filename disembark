@@ -2486,6 +2486,7 @@ class Run {
         echo "Fetching site information for " . self::$siteUrl . "...\n";
 
         // Default states
+        $info_failed = false;
         $status_label = "Unknown";
         $temp_usage = "N/A";
         $db_stats = "N/A";
@@ -2565,7 +2566,11 @@ class Run {
             }
 
         } catch (\Exception $e) {
+            $info_failed = true;
             $msg = $e->getMessage();
+            if (is_array(self::$last_error) && !empty(self::$last_error['status'])) {
+                $msg .= ' ' . self::$last_error['status'];
+            }
             if (strpos($msg, '403') !== false) {
                 $status_label = "Invalid Credentials (403 Forbidden)";
             } elseif (strpos($msg, '404') !== false) {
@@ -2593,6 +2598,10 @@ class Run {
         }
         
         echo "\n";
+        // Scripts check the exit code: a site that couldn't be reached isn't info.
+        if (!empty($info_failed)) {
+            exit(1);
+        }
     }
 
     /**
