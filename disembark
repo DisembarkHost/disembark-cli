@@ -1378,8 +1378,8 @@ class Run {
             // Simplified download call
             self::download_db_file($relative_path, $local_file_path);
 
-            file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
-            unlink($local_file_path); 
+            self::append_file($local_file_path, $db_export_file);
+            unlink($local_file_path);
 
             self::make_request('/cleanup-file', ['file_name' => $file_name], 'POST');
             echo $progress_message . " - Done.\n";
@@ -1432,7 +1432,7 @@ class Run {
                 
                 self::download_db_file($relative_path, $local_file_path);
                 
-                file_put_contents($db_export_file, file_get_contents($local_file_path), FILE_APPEND);
+                self::append_file($local_file_path, $db_export_file);
                 unlink($local_file_path);
 
                 self::make_request('/cleanup-file', ['file_name' => $file_name], 'POST');
@@ -1441,6 +1441,32 @@ class Run {
             }
         }
         echo "Database export and download complete.\n";
+    }
+
+    /**
+     * Appends one downloaded dump part to the dump, a stream at a time, so a
+     * 200 MB part never has to fit in PHP's memory. Throws when the part
+     * can't be read or the dump can't take all of it (a full disk), so a
+     * short dump is never kept as whole.
+     */
+    private static function append_file($from, $to) {
+        $size = @filesize($from);
+        $in   = @fopen($from, 'rb');
+        if (!$in) {
+            throw new \Exception("Could not read the downloaded part $from.");
+        }
+        $out = @fopen($to, 'ab');
+        if (!$out) {
+            fclose($in);
+            throw new \Exception("Could not open $to to add the downloaded part.");
+        }
+        $copied = stream_copy_to_stream($in, $out);
+        $flushed = fflush($out);
+        fclose($in);
+        $closed = fclose($out);
+        if ($copied === false || ($size !== false && $copied !== $size) || !$flushed || !$closed) {
+            throw new \Exception("Could not write all of " . basename($from) . " into " . basename($to) . " (is the disk full?).");
+        }
     }
 
    /**
@@ -2753,7 +2779,9 @@ class Run {
             if (!self::$skip_db) {
                 if (!mkdir($local_db_path, 0755, true)) throw new \Exception("Could not create db directory.");
                 $db_export_file = $local_public_path . '/database-' . $temp_directory_name . '.sql';
-                file_put_contents($db_export_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n");
+                if (file_put_contents($db_export_file, "/*!40101 SET NAMES utf8mb4 */;\nSET sql_mode='NO_AUTO_VALUE_ON_ZERO';\n") === false) {
+                    throw new \Exception("Could not write the database dump at $db_export_file.");
+                }
                 if (!empty($database)) {
                     // This calls download_db_file -> download_file_direct, which updates global progress
                     self::processDatabaseBackup($database, $db_export_file, $local_db_path);
