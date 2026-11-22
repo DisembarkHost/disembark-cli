@@ -2793,12 +2793,20 @@ class Run {
         if (!$scoped && is_object($install) && !empty($install->kind)) {
             $kind = (string) $install->kind;
         }
+        // A v3 source names the install in its profile, null for a plain
+        // site: then a leftover freighter.php (WP Freighter deleted, its
+        // bootstrap left behind) says nothing.
+        $named   = is_object($meta) && (property_exists($meta, 'install') || (isset($meta->profile) && is_object($meta->profile) && property_exists($meta->profile, 'install')));
+        $tenants = false;
         if ($kind === '' && !$scoped && $sql_file && is_readable($sql_file)) {
             $seen = [];
             $h = fopen($sql_file, 'r');
             while ($h && ($line = fgets($h, 8192)) !== false) {
                 if (stripos($line, 'CREATE TABLE') === false) {
                     continue;
+                }
+                if (!$tenants && preg_match('/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?stacked_\d+_/i', $line)) {
+                    $tenants = true;
                 }
                 if (preg_match('/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', $line, $m)) {
                     $seen[strtolower($m[1])][strtolower($m[2])] = true;
@@ -2812,7 +2820,11 @@ class Run {
                 fclose($h);
             }
         }
-        if ($kind === '' && !$scoped && is_file($public_dir . '/wp-content/freighter.php')) {
+        // No profile to go by (an older backup): the bootstrap counts only
+        // with WP Freighter itself or its tenants' tables alongside, as the
+        // plugin judges a live install.
+        if ($kind === '' && !$scoped && !$named && is_file($public_dir . '/wp-content/freighter.php')
+            && (is_dir($public_dir . '/wp-content/plugins/wp-freighter') || $tenants)) {
             $kind = 'freighter';
         }
         if ($kind === 'multisite') {
