@@ -267,8 +267,12 @@ class Run {
             case 'sync':
                 // Logic to determine destination folder
                 if ($sync_folder === null) {
-                    // Default to domain name
+                    // Default to domain name, plus the site for --site, so
+                    // two sites of one install never share a folder.
                     $sync_folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim(self::$siteUrl, '/'));
+                    if (self::site_key() !== '') {
+                        $sync_folder .= '-site-' . self::site_key();
+                    }
                 }
 
                 // Resolve to absolute path
@@ -645,6 +649,22 @@ class Run {
             }
         }
         return max(1, min(300, $wait));
+    }
+
+    /**
+     * The site --site picked, as the source resolved it (its ID, even when
+     * --site named an address), for folder names and the sync record.
+     * '' without --site.
+     */
+    private static function site_key() {
+        if (self::$site === '') {
+            return '';
+        }
+        $caps = self::$source_caps;
+        if (is_object($caps) && isset($caps->scope->site) && (string) $caps->scope->site !== '') {
+            return (string) $caps->scope->site;
+        }
+        return trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', self::$site), '-.');
     }
 
     /** ['site' => <id>] when --site picked one site of an install, else []. */
@@ -1651,6 +1671,14 @@ class Run {
             echo " - Warning: this folder was last synced from " . ($state->source ?? 'another site') . "; nothing will be deleted this time.\n";
             return null;
         }
+        // --site picks one site of a network or WP Freighter install at the
+        // same address: a record kept for another site (or the whole
+        // install) says nothing about this one's deletions.
+        $was = isset($state->site) ? (string) $state->site : '';
+        if ($was !== self::site_key()) {
+            echo " - Warning: this folder was last synced from " . ($was === '' ? 'the whole of ' . ($state->source ?? 'the site') : 'site ' . $was . ' of ' . ($state->source ?? 'the site')) . "; nothing will be deleted this time.\n";
+            return null;
+        }
         return array_fill_keys(array_filter($state->files, 'is_string'), true);
     }
 
@@ -1677,6 +1705,7 @@ class Run {
         $json = json_encode([
             'version' => 1,
             'source'  => rtrim(self::$siteUrl, '/'),
+            'site'    => self::site_key(),
             'synced'  => date('c'),
             'files'   => array_keys($files),
         ], JSON_UNESCAPED_SLASHES);
