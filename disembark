@@ -283,7 +283,10 @@ class Run {
                 if ($sync_folder === null) {
                     // Default to domain name, plus the site for --site, so
                     // two sites of one install never share a folder.
+                    // A subsite address (example.com/shop) becomes one
+                    // folder name, never a folder inside the parent site's.
                     $sync_folder = preg_replace('/^https?:\/\/(www\.)?/', '', rtrim(self::$siteUrl, '/'));
+                    $sync_folder = trim(preg_replace('/[^A-Za-z0-9._-]+/', '_', $sync_folder), '_.');
                     if (self::site_key() !== '') {
                         $sync_folder .= '-site-' . self::site_key();
                     }
@@ -758,10 +761,12 @@ class Run {
             return '';
         }
         $caps = self::$source_caps;
-        if (is_object($caps) && isset($caps->scope->site) && (string) $caps->scope->site !== '') {
-            return (string) $caps->scope->site;
+        $key = self::$site;
+        if (is_object($caps) && isset($caps->scope->site) && is_scalar($caps->scope->site) && (string) $caps->scope->site !== '') {
+            $key = (string) $caps->scope->site;
         }
-        return trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', self::$site), '-.');
+        // Used in a folder name: only safe characters, whatever the source sent.
+        return trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', $key), '-.');
     }
 
     /** ['site' => <id>] when --site picked one site of an install, else []. */
