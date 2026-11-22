@@ -20,6 +20,10 @@ class Run {
     private static $rest_style = 'pretty';
     /** --site=<id>: one site of a multisite network or WP Freighter install (backup, sync). */
     private static $site = '';
+    // The last API error make_request() saw: HTTP status, the WP_Error code
+    // and message when the body was one. Lets a caller tell "this source
+    // has no such route" (an older plugin) from a real refusal.
+    private static $last_error = null;
     
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
@@ -616,6 +620,7 @@ class Run {
             return self::$source_caps;
         }
         self::$source_caps = false; // also stops make_request() asking again meanwhile
+        self::$last_error = null;
         try {
             $pre = self::make_request('/import/preflight', ['import_id' => self::new_session_id()] + (self::$site !== '' ? ['site' => self::$site] : []), 'POST', true);
             if (is_object($pre)) {
@@ -623,7 +628,23 @@ class Run {
                 self::$source_caps = $pre;
             }
         } catch (\Exception $e) {
+            // The plugin itself turned the request away (an unknown --site,
+            // a site that isn't a network): say why and stop, rather than
+            // carry on as if the source were an older plugin. WordPress's
+            // own rest_* answers (no such route on a pre-2.8 source) still
+            // fall back to the 2.9 behavior.
+            $err = self::$last_error;
+            if ($err && $err['code'] !== '' && strpos($err['code'], 'rest_') !== 0 && $err['status'] >= 400 && $err['status'] < 500) {
+                echo "Error: " . ($err['message'] !== '' ? $err['message'] : "the source refused the request ({$err['code']}).") . "\n";
+                exit(1);
+            }
             // Older source; carry on with the 2.9 behavior.
+        }
+        // --site needs a source that knows about networks and tenants (3.0):
+        // an older one ignores it and would hand over the whole install.
+        if (self::$site !== '' && !(is_object(self::$source_caps) && property_exists(self::$source_caps, 'install'))) {
+            echo "Error: --site needs Disembark 3.0 or newer on the source; this one would send the whole install. Update Disembark there, or leave out --site.\n";
+            exit(1);
         }
         return self::$source_caps;
     }
@@ -811,6 +832,11 @@ class Run {
         if ($response->status_code !== 200) {
             $errorMessage = "Error: Request to {$endpoint} failed. HTTP status: {$response->status_code}.";
             $errorBody = json_decode($response->body);
+            self::$last_error = [
+                'status'  => $response->status_code,
+                'code'    => (is_object($errorBody) && isset($errorBody->code) && is_string($errorBody->code)) ? $errorBody->code : '',
+                'message' => (is_object($errorBody) && isset($errorBody->message) && is_string($errorBody->message)) ? $errorBody->message : '',
+            ];
             if (json_last_error() === JSON_ERROR_NONE && isset($errorBody->message)) {
                 $errorMessage .= " Message: " . $errorBody->message;
             } else {
