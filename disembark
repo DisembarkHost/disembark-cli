@@ -963,15 +963,15 @@ class Run {
      * done: false. A 2.9 destination (no `pacing` in its preflight) runs the
      * whole step in one request, as before.
      */
-    private static function paced_request($endpoint, $payload, $label = '') {
+    private static function paced_request($endpoint, $payload, $label = '', $quiet = false) {
         if (!self::source_is_v3()) {
-            return self::make_request($endpoint, $payload, 'POST');
+            return self::make_request($endpoint, $payload, 'POST', $quiet);
         }
         $payload['paced']  = 1;
         $payload['budget'] = !empty(self::$source_caps->budget) ? (float) self::$source_caps->budget : 20;
         $rounds = 0;
         while (true) {
-            $res = self::make_request($endpoint, $payload, 'POST');
+            $res = self::make_request($endpoint, $payload, 'POST', $quiet);
             if (!is_object($res) || !isset($res->done) || $res->done !== false) {
                 if ($rounds > 0) {
                     echo "\n";
@@ -3273,12 +3273,34 @@ class Run {
     private static function restore_rollback($id) {
         echo "Rolling back import $id on " . self::$siteUrl . "...\n";
         self::source_caps(); // a v3 destination rolls back in pieces
+        $payload = ['import_id' => $id];
         try {
-            $res = self::paced_request('/import/rollback', ['import_id' => $id], 'Rolling back');
+            $res = self::paced_request('/import/rollback', $payload, 'Rolling back', true);
         } catch (\Exception $e) {
-            echo "Error: rollback failed: {$e->getMessage()}\n";
-            echo "Nothing more was changed by this command; run it again to retry.\n";
-            exit(1);
+            // Restore points made after this one would be left half undone
+            // (3.0.1 refuses that): undo them first, newest first, if asked.
+            $err = self::$last_error;
+            if (!$err || $err['code'] !== 'later_points_exist') {
+                echo "Error: rollback failed: " . ($err && $err['message'] !== '' ? $err['message'] : $e->getMessage()) . "\n";
+                echo "Nothing more was changed by this command; run it again to retry.\n";
+                exit(1);
+            }
+            echo preg_replace('/ Roll back with later: true.*$/s', '', $err['message']) . "\n";
+            if (!self::$assume_yes) {
+                echo "Roll back the later restore point(s) first, newest first, then this one? Type 'yes' to continue: ";
+                $line = trim((string) fgets(STDIN));
+                if (strtolower($line) !== 'yes') {
+                    echo "Aborted. Nothing was changed.\n";
+                    exit(1);
+                }
+            }
+            try {
+                $res = self::paced_request('/import/rollback', $payload + ['later' => true], 'Rolling back');
+            } catch (\Exception $e2) {
+                echo "Error: rollback failed: {$e2->getMessage()}\n";
+                echo "Run it again to carry on from where it stopped.\n";
+                exit(1);
+            }
         }
         if (is_object($res) && !empty($res->warnings) && is_array($res->warnings)) {
             foreach ($res->warnings as $warning) {
