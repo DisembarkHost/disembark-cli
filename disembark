@@ -2887,7 +2887,8 @@ class Run {
         // if the snapshot can't be verified — without it there is no undo.
         echo "Creating rollback snapshot...\n";
         try {
-            $snap = self::paced_request('/import/snapshot', ['import_id' => $import_id], 'Rollback snapshot');
+            $from_label = $source_home ? preg_replace('#^https?://#', '', rtrim($source_home, '/')) : basename(rtrim($folder, '/'));
+            $snap = self::paced_request('/import/snapshot', ['import_id' => $import_id, 'label' => 'Before restore from ' . $from_label . ' (Disembark CLI)'], 'Rollback snapshot');
         } catch (\Exception $e) {
             $snap = null;
         }
@@ -2976,6 +2977,15 @@ class Run {
                     $sr = self::paced_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'Rewriting URLs');
                     if (is_object($sr)) {
                         echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
+                        if (!empty($sr->files_rewritten)) {
+                            echo "  Rewrote the old address in " . (int) $sr->files_rewritten . " file(s) under uploads.\n";
+                        }
+                        if (!empty($sr->files_too_big_total)) {
+                            echo "  ! " . (int) $sr->files_too_big_total . " file(s) under uploads mention $source_home but are over 5 MB, so left as is: " . implode(', ', array_slice((array) ($sr->files_too_big ?? []), 0, 8)) . ((int) $sr->files_too_big_total > 8 ? ', ...' : '') . "\n";
+                        }
+                        if (!empty($sr->files_mentioning_total)) {
+                            echo "  " . (int) $sr->files_mentioning_total . " theme or plugin file(s) still mention $source_home (left as is): " . implode(', ', array_slice((array) ($sr->files_mentioning_source ?? []), 0, 8)) . ((int) $sr->files_mentioning_total > 8 ? ', ...' : '') . "\n";
+                        }
                     }
                 }
             }
