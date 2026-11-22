@@ -256,6 +256,14 @@ class Run {
         // C. Parse Flags
         $sync_folder = self::parseArguments($argv, 3);
 
+        // --session-id reuses the file lists a dashboard session already
+        // made, for whichever site that dashboard chose. --site would scope
+        // the database to another choice, mixing two sites in one backup.
+        if (self::$session_id && self::$site !== '' && in_array($command, ['backup', 'sync'], true)) {
+            echo "Error: --site can't be combined with --session-id: the session's file lists were made by the dashboard for its own choice of site. Leave out --site to reuse the session, or --session-id to back up site " . self::$site . ".\n";
+            exit(1);
+        }
+
         // Ask the source what it supports first: a v3 source takes the token
         // in a header (kept out of URLs) and cleans up over POST.
         if (in_array($command, ['backup', 'sync', 'ncdu', 'info'], true)) {
