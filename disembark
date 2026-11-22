@@ -256,18 +256,17 @@ class Run {
         // C. Parse Flags
         $sync_folder = self::parseArguments($argv, 3);
 
-        // --session-id reuses the file lists a dashboard session already
-        // made, for whichever site that dashboard chose. --site would scope
-        // the database to another choice, mixing two sites in one backup.
-        if (self::$session_id && self::$site !== '' && in_array($command, ['backup', 'sync'], true)) {
-            echo "Error: --site can't be combined with --session-id: the session's file lists were made by the dashboard for its own choice of site. Leave out --site to reuse the session, or --session-id to back up site " . self::$site . ".\n";
-            exit(1);
-        }
-
         // Ask the source what it supports first: a v3 source takes the token
         // in a header (kept out of URLs) and cleans up over POST.
         if (in_array($command, ['backup', 'sync', 'ncdu', 'info'], true)) {
             self::source_caps();
+        }
+
+        // --session-id reuses the file lists a scan already made, for the
+        // site that scan was made for: the database, zips and streams must
+        // be scoped the same way, or one backup mixes two sites.
+        if (self::$session_id && in_array($command, ['backup', 'sync'], true)) {
+            self::match_session_site();
         }
 
         // 3. Dispatch Command
@@ -2103,10 +2102,22 @@ class Run {
                         // ZIP FAILED
                         $slots[$slot] = null;
                         unset($active_transfers[$ch_id]);
+                        // The source says the session was scanned for
+                        // another site: retrying or streaming won't fix it.
+                        if (is_object($decoded) && isset($decoded->code) && $decoded->code === 'session_site_mismatch') {
+                            echo "\033[{$max_concurrency}B\033[?25h\n";
+                            if (is_resource($mh)) curl_multi_close($mh);
+                            throw new \Exception(isset($decoded->message) ? (string) $decoded->message : 'The session was scanned for another site.');
+                        }
                         if ($data['job']['attempts'] <= $max_retries) {
-                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed. Retrying...\033[{$line}A";
+                            $pause = 1;
+                            if ($http_code == 429 || $http_code == 503) {
+                                $ra = $retry_after[$ch_id] ?? null;
+                                $pause = self::retry_wait((object) ['headers' => $ra !== null ? ['retry-after' => $ra] : []], $data['job']['attempts']);
+                            }
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed (HTTP $http_code). Retrying in {$pause}s...\033[{$line}A";
                             array_unshift($queue, $data['job']);
-                            sleep(1);
+                            sleep($pause);
                         } else {
                             $fallback_chunks[] = $data['job']['files'];
                             echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed. Added to fallback.\033[{$line}A";
@@ -2452,7 +2463,14 @@ class Run {
                         $id_short = $session->token;
                         $chunks   = $session->count;
                         
-                        $session_output .= sprintf("%-20s %-32s (%d chunks)\n", $date_str, $id_short, $chunks);
+                        $about = [];
+                        if (property_exists($session, 'site')) {
+                            $about[] = ($session->site === null || (string) $session->site === '') ? 'whole install' : 'site ' . $session->site;
+                        }
+                        if (!empty($session->filtered)) {
+                            $about[] = 'folders left out';
+                        }
+                        $session_output .= sprintf("%-20s %-32s (%d chunks)%s\n", $date_str, $id_short, $chunks, $about ? ' ' . implode(', ', $about) : '');
                     }
                 }
 
