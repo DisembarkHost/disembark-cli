@@ -1,6 +1,6 @@
 # Changelog
 
-## **v3.0.0** - November 20, 2026
+## **v3.0.0** - November 21, 2026
 
 ### Fixed
 * **PHP 7.4:** `disembark.phar` died at start on PHP 7.x ("Namespace declaration statement has to be the very first statement"). It runs on PHP 7.4 through 8.5 again.
