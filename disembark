@@ -1213,10 +1213,14 @@ class Run {
     private static function download_file_chunked_stream($relative_path, $destination, $total_size) {
         $chunk_size = 50 * 1024 * 1024; // 50 MB chunks
         $offset = 0;
+        $total_size = (int) $total_size;
         
-        // Open destination for writing
-        $fp = fopen($destination, 'w');
-        if (!$fp) throw new \Exception("Could not open local file for writing: $destination");
+        // Written to <file>.part and moved over the file only once every
+        // byte is in, so a failed download never empties the good copy.
+        $part = $destination . '.part';
+        if (is_link($part)) @unlink($part);
+        $fp = fopen($part, 'w');
+        if (!$fp) throw new \Exception("Could not open local file for writing: $part");
         fclose($fp);
 
         $progress_bar_width = 20;
@@ -1234,6 +1238,7 @@ class Run {
             $attempts = 0;
             $max_attempts = 5;
             $chunk_success = false;
+            $wait = 2;
 
             while ($attempts < $max_attempts && !$chunk_success) {
                 $attempts++;
@@ -1263,29 +1268,54 @@ class Run {
                     $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
 
                     if (!$response->success) {
-                         throw new \Exception("HTTP {$response->status_code}");
+                        if ($response->status_code == 429 || $response->status_code == 503) {
+                            $wait = self::retry_wait($response, $attempts);
+                        }
+                        throw new \Exception("HTTP {$response->status_code}");
                     }
                     
+                    // A short chunk means the file changed or the answer was
+                    // cut off: retry it rather than build a file with a hole.
                     if (strlen($response->body) != $length) {
-                        // Sometimes server might send less if EOF, but we calculated EOF.
+                        throw new \Exception("got " . strlen($response->body) . " of $length bytes");
                     }
 
-                    // Append to file
-                    file_put_contents($destination, $response->body, FILE_APPEND);
+                    if (file_put_contents($part, $response->body, FILE_APPEND) !== $length) {
+                        throw new \Exception("could not write to $part (is the disk full?)");
+                    }
                     $chunk_success = true;
 
                 } catch (\Exception $e) {
+                    // Drop whatever part of this chunk made it to disk.
+                    clearstatcache(true, $part);
+                    if (file_exists($part) && filesize($part) > $offset) {
+                        $h = fopen($part, 'r+');
+                        if ($h) { ftruncate($h, $offset); fclose($h); }
+                    }
                     if ($attempts < $max_attempts) {
                         echo str_pad("", 80, " ") . "\r"; 
-                        echo "     - Retry ($attempts/$max_attempts) for offset $offset...\r";
-                        sleep(2);
+                        echo "     - Retry ($attempts/$max_attempts) for offset $offset in {$wait}s...\r";
+                        sleep($wait);
+                        $wait = 2;
                     } else {
+                        @unlink($part);
                         throw new \Exception("Failed to download chunk at offset $offset: " . $e->getMessage());
                     }
                 }
             }
             
             $offset += $length;
+        }
+
+        clearstatcache(true, $part);
+        $got = file_exists($part) ? filesize($part) : 0;
+        if ($got !== $total_size) {
+            @unlink($part);
+            throw new \Exception("The streamed file is $got bytes, not the $total_size listed.");
+        }
+        if (!rename($part, $destination)) {
+            @unlink($part);
+            throw new \Exception("Could not move the download into place at $destination.");
         }
         
         echo str_pad("", 80, " ") . "\r";
@@ -3737,20 +3767,33 @@ class Run {
         $max_attempts = 5;
         $last_error = '';
 
+        // Written beside the destination and moved over it only when whole,
+        // so a failed download never empties a good copy already there.
+        $part = $destination . '.part';
+        $wait = 2;
+
         while ($attempts < $max_attempts) {
             $attempts++;
             $fp = false;
             $ch = false;
+            $retry_after = null;
             
             $previous_downloaded = 0;
             $has_printed_lines = false;
 
             try {
-                $fp = fopen($destination, 'w+');
-                if ($fp === false) throw new \Exception("Could not open $destination");
+                if (is_link($part)) @unlink($part);
+                $fp = fopen($part, 'w+');
+                if ($fp === false) throw new \Exception("Could not open $part");
 
                 $ch = curl_init($url);
                 curl_setopt($ch, CURLOPT_FILE, $fp);
+                curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $line) use (&$retry_after) {
+                    if (stripos($line, 'retry-after:') === 0) {
+                        $retry_after = trim(substr($line, 12));
+                    }
+                    return strlen($line);
+                });
                 curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 if (self::$cookie) {
@@ -3814,12 +3857,23 @@ class Run {
                 $data = curl_exec($ch);
                 $error = curl_error($ch);
                 $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $expected = curl_getinfo($ch, CURLINFO_CONTENT_LENGTH_DOWNLOAD);
                 
                 if (is_resource($ch)) curl_close($ch);
-                if (is_resource($fp)) fclose($fp);
+                $written = is_resource($fp) ? (fflush($fp) && fclose($fp)) : true;
 
                 if (!$data) throw new \Exception("cURL Error: $error");
+                if ($statusCode == 429 || $statusCode == 503) {
+                    $wait = self::retry_wait((object) ['headers' => $retry_after !== null ? ['retry-after' => $retry_after] : []], $attempts);
+                    throw new \Exception("HTTP Error $statusCode (the host asked to slow down)");
+                }
                 if ($statusCode >= 400) throw new \Exception("HTTP Error $statusCode");
+                clearstatcache(true, $part);
+                if (!$written) throw new \Exception("Could not write the download to disk (is it full?)");
+                if ($expected > 0 && filesize($part) !== (int) $expected) {
+                    throw new \Exception("Short download: " . filesize($part) . " of " . (int) $expected . " bytes");
+                }
+                if (!rename($part, $destination)) throw new \Exception("Could not move the download into place at $destination");
 
                 // Cleanup Output
                 if ($has_printed_lines) {
@@ -3850,6 +3904,7 @@ class Run {
             } catch (\Exception $e) {
                 if (is_resource($ch)) curl_close($ch);
                 if (is_resource($fp)) fclose($fp);
+                @unlink($part);
                 if ($has_printed_lines) {
                     // Cleanup visual artifacts before printing error
                      if ($progress_label) echo "\n\033[K"; 
@@ -3857,8 +3912,9 @@ class Run {
                 }
 
                 if ($attempts < $max_attempts) {
-                    echo "     - Warning: Download failed: {$e->getMessage()}. Retrying...\n";
-                    sleep(2);
+                    echo "     - Warning: Download failed: {$e->getMessage()}. Retrying in {$wait}s...\n";
+                    sleep($wait);
+                    $wait = min(60, max(2, $attempts * 2));
                 } else {
                     $last_error = $e->getMessage();
                 }
@@ -3935,10 +3991,13 @@ class Run {
                 $encoded_parts = array_map('rawurlencode', $path_parts);
                 $url = self::$siteUrl . '/' . implode('/', $encoded_parts);
                 
-                $fp = fopen($local_dest, 'w+');
+                // Into <file>.part, moved over the file only once whole, so
+                // a failed download never empties the copy already there.
+                if (is_link($local_dest . '.part')) @unlink($local_dest . '.part');
+                $fp = fopen($local_dest . '.part', 'w+');
                 if (!$fp) {
                     $line_offset = $slot_index + 1;
-                    echo "\033[{$line_offset}B\033[KError: Could not open $local_dest\r\033[{$line_offset}A";
+                    echo "\033[{$line_offset}B\033[KError: Could not open $local_dest.part\r\033[{$line_offset}A";
                     self::$failures[] = "{$file->name} (could not open the local file)";
                     $processed_count++;
                     continue;
@@ -4031,20 +4090,26 @@ class Run {
                     if (is_resource($ch)) {
                         curl_close($ch);
                     }
-                    fclose($transfer['fp']);
+                    $written = fflush($transfer['fp']) && fclose($transfer['fp']);
                     unset($active_transfers[$ch_id]);
                     $slots[$slot] = null;
 
                     // Validation
                     $local_dest = $folder . '/' . $file->name;
-                    $actual_size = file_exists($local_dest) ? filesize($local_dest) : 0;
+                    $part = $local_dest . '.part';
+                    clearstatcache(true, $part);
+                    $actual_size = file_exists($part) ? filesize($part) : 0;
                     $expected_size = (int)$file->size;
                     
                     $is_http_error = $curl_info['http_code'] >= 400;
-                    $is_curl_error = $info['result'] !== CURLE_OK;
+                    $is_curl_error = $info['result'] !== CURLE_OK || !$written;
                     $is_size_mismatch = $actual_size !== $expected_size;
+                    if (!$is_http_error && !$is_curl_error && !$is_size_mismatch && !rename($part, $local_dest)) {
+                        $is_curl_error = true;
+                    }
 
                     if ($is_http_error || $is_curl_error || $is_size_mismatch) {
+                        @unlink($part);
                         // Fail Fast or Retry logic
                         if ($is_http_error) {
                              $fallback_queue[] = $file;
@@ -4521,6 +4586,7 @@ PHP;
         $attempts = 0;
         $max_attempts = 3;
         $last_error = "";
+        $wait = 2;
 
         while ($attempts < $max_attempts) {
             $attempts++;
@@ -4538,13 +4604,21 @@ PHP;
                 $response = \WpOrg\Requests\Requests::post($endpoint_url, $headers, $payload, $options);
 
                 if (!$response->success) {
+                    if ($response->status_code == 429 || $response->status_code == 503) {
+                        $wait = self::retry_wait($response, $attempts);
+                    }
                     if ($response->status_code == 404 || $response->status_code == 403) {
                         throw new \Exception("Stream API failed: HTTP {$response->status_code}. Body: " . substr($response->body, 0, 200));
                     }
                     throw new \Exception("Stream API request failed with status code: {$response->status_code}. Body: " . substr($response->body, 0, 200));
                 }
 
-                if (file_put_contents($destination, $response->body) === false) {
+                // Beside the destination first, so a failed write never
+                // leaves half a file under its name.
+                $part = $destination . '.part';
+                if (is_link($part)) @unlink($part);
+                if (file_put_contents($part, $response->body) !== strlen($response->body) || !rename($part, $destination)) {
+                    @unlink($part);
                     throw new \Exception("Failed to write downloaded stream content to $destination.");
                 }
                 return;
@@ -4552,10 +4626,10 @@ PHP;
             } catch (\Exception $e) {
                 echo "\nWarning: Failed to stream $relative_path (Attempt $attempts/$max_attempts): {$e->getMessage()}\n";
                 $last_error = $e->getMessage();
-                if (file_exists($destination)) unlink($destination);
                 if ($attempts < $max_attempts) {
-                    echo "Retrying in 2 seconds...\n";
-                    sleep(2);
+                    echo "Retrying in {$wait} seconds...\n";
+                    sleep($wait);
+                    $wait = 2;
                 }
             }
         }
