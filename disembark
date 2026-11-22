@@ -1717,8 +1717,8 @@ class Run {
             } else {
                 echo "Skipping file sync as requested.\n";
             }
-        } catch (\Exception $e) {
-            echo "\033[?25h"; 
+        } catch (\Throwable $e) {
+            echo "\033[?25h";
             echo "\nSync failed: {$e->getMessage()}\n";
             @unlink($db_part_file);
             if (!self::$session_id) {
@@ -2837,9 +2837,10 @@ class Run {
             echo "Generating final local zip file: $final_zip_name...\n";
             self::zip_directory($local_public_path, $final_zip_name);
 
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
+            echo "\033[?25h";
             echo "\nBackup failed: {$e->getMessage()}\n";
-            echo "Partial files may be left in {$temp_directory}\n";
+            echo "The downloaded files are kept in {$temp_directory}\n";
             if (!self::$session_id) self::cleanupTemporaryFiles();
             exit(1);
         }
@@ -4661,14 +4662,21 @@ PHP;
         if (!class_exists('ZipArchive')) {
             throw new \Exception('ZipArchive PHP extension is required to create the final zip.');
         }
-        $zip = new \ZipArchive();
-        if (!$zip->open($destination, \ZipArchive::CREATE | \ZipArchive::OVERWRITE)) {
-            throw new \Exception("Failed to create zip archive at $destination.");
-        }
-
-        $source = realpath($source);
-        if ($source === false) {
+        $real = realpath($source);
+        if ($real === false) {
             throw new \Exception("Source directory $source does not exist.");
+        }
+        $source = $real;
+        $zip = new \ZipArchive();
+        // open() returns true or an error code (a truthy int), and PHP 8
+        // throws a ValueError for some bad paths: only true is success.
+        try {
+            $opened = $zip->open($destination, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+        } catch (\Throwable $e) {
+            throw new \Exception("Failed to create zip archive at $destination: " . $e->getMessage());
+        }
+        if ($opened !== true) {
+            throw new \Exception("Failed to create zip archive at $destination (ZipArchive error $opened).");
         }
 
         $files = new \RecursiveIteratorIterator(
@@ -4687,10 +4695,25 @@ PHP;
             if (is_dir($file)) {
                 $zip->addEmptyDir($relativePath);
             } else if (is_file($file)) {
-                $zip->addFile($file, $relativePath);
+                if (!$zip->addFile($file, $relativePath)) {
+                    throw new \Exception("Could not add $relativePath to the zip.");
+                }
             }
         }
-        $zip->close();
+        // ZipArchive writes everything at close(): a full disk shows up
+        // here, not before. A zip that didn't close isn't a backup.
+        $closed = false;
+        $why    = 'is the disk full?';
+        try {
+            $closed = $zip->close();
+        } catch (\Throwable $e) {
+            $why = $e->getMessage();
+        }
+        clearstatcache(true, $destination);
+        if (!$closed || !is_file($destination) || filesize($destination) === 0) {
+            @unlink($destination);
+            throw new \Exception("Could not write the zip $destination ($why).");
+        }
     }
 
     /**
