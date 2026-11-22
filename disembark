@@ -3222,6 +3222,16 @@ class Run {
                 }
                 throw new \Exception("upload failed: {$e->getMessage()}");
             }
+            // A files deploy just gave the destination plain permalinks (its
+            // .htaccess or database): /wp-json/ answers with a page now.
+            // Carry on through ?rest_route=, as make_request() does, once.
+            if (self::$rest_style !== 'rest_route' && in_array($response->status_code, [200, 404], true) && self::is_html_page($response)) {
+                self::$rest_style = 'rest_route';
+                $url = self::rest_url($endpoint);
+                echo "\n      The site answers /wp-json/ with a page (plain permalinks): carrying on through ?rest_route=.\n";
+                $attempt--;
+                continue;
+            }
             if ($response->status_code === 200) {
                 return json_decode($response->body);
             }
