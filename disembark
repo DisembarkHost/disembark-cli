@@ -18,6 +18,8 @@ class Run {
     // (/?rest_route=/...), the latter for sites with plain permalinks where the
     // pretty path has no rewrite rule.
     private static $rest_style = 'pretty';
+    /** --site=<id>: one site of a multisite network or WP Freighter install (backup, sync). */
+    private static $site = '';
     
     // Default Thresholds
     private static $db_max_size = 209715200;       // 200MB
@@ -145,6 +147,10 @@ class Run {
             }
             if (strpos($arg, '--large-file-threshold=') === 0) {
                 self::$large_file_threshold = self::convert_to_bytes(substr($arg, strlen('--large-file-threshold=')));
+                continue;
+            }
+            if (strpos($arg, '--site=') === 0) {
+                self::$site = trim(substr($arg, strlen('--site=')));
                 continue;
             }
             if (strpos($arg, '--user-agent=') === 0) {
@@ -607,7 +613,7 @@ class Run {
         }
         self::$source_caps = false; // also stops make_request() asking again meanwhile
         try {
-            $pre = self::make_request('/import/preflight', ['import_id' => self::new_session_id()], 'POST', true);
+            $pre = self::make_request('/import/preflight', ['import_id' => self::new_session_id()] + (self::$site !== '' ? ['site' => self::$site] : []), 'POST', true);
             if (is_object($pre)) {
                 unset($pre->disembark_token);
                 self::$source_caps = $pre;
@@ -641,10 +647,29 @@ class Run {
         return max(1, min(300, $wait));
     }
 
+    /** Whether a response is an HTML page rather than a REST answer. */
+    private static function is_html_page($response) {
+        $type = '';
+        if (isset($response->headers['content-type'])) {
+            $type = is_array($response->headers['content-type']) ? implode(',', $response->headers['content-type']) : (string) $response->headers['content-type'];
+        }
+        $body = ltrim((string) $response->body);
+        if (stripos($type, 'application/json') !== false) {
+            return false;
+        }
+        return stripos($type, 'text/html') !== false || stripos(substr($body, 0, 500), '<!doctype html') !== false || stripos(substr($body, 0, 500), '<html') !== false;
+    }
+
     private static function make_request($endpoint, $payload = [], $method = 'POST', $quiet = false) {
         $headers = ['Content-Type' => 'application/json; charset=utf-8'] + self::api_headers();
         $method  = strtoupper($method);
         $data = array_merge(['token' => self::$token, 'backup_token' => self::$backup_token], $payload);
+        // --site: the one site of a network or WP Freighter install to back
+        // up or sync. (Import steps never take it: a restore goes into the
+        // site the URL names.)
+        if (self::$site !== '' && strpos($endpoint, '/import/') !== 0 && !isset($data['site'])) {
+            $data['site'] = self::$site;
+        }
         $url = self::rest_url($endpoint);
         if (self::$cookie) {
             // Critical: Cloudflare often blocks requests without a valid Referer matching the cookie's domain
@@ -732,6 +757,18 @@ class Run {
                 continue;
             }
             break;
+        }
+
+        // The destination took a database with plain permalinks partway
+        // through (or never had pretty ones): /wp-json/ now answers with a
+        // page instead of JSON. Carry on through ?rest_route=, as the
+        // dashboard does, once.
+        if (self::$rest_style !== 'rest_route' && in_array($response->status_code, [200, 404], true) && self::is_html_page($response)) {
+            self::$rest_style = 'rest_route';
+            if (!$quiet) {
+                echo "      The site answers /wp-json/ with a page (plain permalinks): carrying on through ?rest_route=.\n";
+            }
+            return self::make_request($endpoint, $payload, $method, $quiet);
         }
 
         if ($response->status_code !== 200) {
@@ -1292,6 +1329,30 @@ class Run {
             'db_prefix' => $src_info->db_prefix ?? '',
             'captured'  => date('c'),
         ];
+        // One site of a network or WP Freighter install: its own address and
+        // the prefix its tables are exported under, for restore to remap.
+        if (isset($src_info->scope) && is_object($src_info->scope) && !empty($src_info->scope->home)) {
+            $source_meta['home_url'] = rtrim((string) $src_info->scope->home, '/');
+            $source_meta['site_url'] = $source_meta['home_url'];
+            if (!empty($src_info->scope->prefix)) {
+                $source_meta['db_prefix'] = (string) $src_info->scope->prefix;
+            }
+        }
+        // What kind of install it came from, and which one site of it (when
+        // the backup is of one site), so restore can refuse a whole network
+        // or WP Freighter install before changing anything.
+        if (isset($src_info->profile)) {
+            $source_meta['profile'] = $src_info->profile;
+        }
+        if (isset($src_info->install) && is_object($src_info->install)) {
+            $source_meta['install'] = ['kind' => $src_info->install->kind ?? '', 'total' => (int) ($src_info->install->total ?? 0), 'home' => $src_info->install->home ?? ''];
+        }
+        if (self::$site !== '') {
+            $source_meta['scope'] = self::$site;
+        } elseif (isset($src_info->scope->site) && (string) $src_info->scope->site !== '') {
+            // The site's own address reached one site of the install.
+            $source_meta['scope'] = (string) $src_info->scope->site;
+        }
         file_put_contents(rtrim($dir, '/') . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
     }
 
@@ -2639,6 +2700,50 @@ class Run {
      * -> import DB (prefix-remapped) -> serialize-aware URL search/replace ->
      * finalize. A rollback point is saved first so the import can be undone.
      */
+    /**
+     * Why a backup can't be restored into one site, or null: it holds a
+     * whole multisite network (its blogs and sitemeta tables under one
+     * prefix, or a profile saying so with no single site chosen) or a whole
+     * WP Freighter install (its bootstrap, wp-content/freighter.php).
+     */
+    private static function whole_install_backup($public_dir, $sql_file, $meta) {
+        $scoped  = is_object($meta) && !empty($meta->scope);
+        $install = is_object($meta) && isset($meta->install) ? $meta->install : (is_object($meta) && isset($meta->profile->install) ? $meta->profile->install : null);
+        $kind    = '';
+        if (!$scoped && is_object($install) && !empty($install->kind)) {
+            $kind = (string) $install->kind;
+        }
+        if ($kind === '' && !$scoped && $sql_file && is_readable($sql_file)) {
+            $seen = [];
+            $h = fopen($sql_file, 'r');
+            while ($h && ($line = fgets($h, 8192)) !== false) {
+                if (stripos($line, 'CREATE TABLE') === false) {
+                    continue;
+                }
+                if (preg_match('/CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_$]*?)(blogs|sitemeta)`?\s*\(/i', $line, $m)) {
+                    $seen[strtolower($m[1])][strtolower($m[2])] = true;
+                    if (count($seen[strtolower($m[1])]) === 2) {
+                        $kind = 'multisite';
+                        break;
+                    }
+                }
+            }
+            if ($h) {
+                fclose($h);
+            }
+        }
+        if ($kind === '' && !$scoped && is_file($public_dir . '/wp-content/freighter.php')) {
+            $kind = 'freighter';
+        }
+        if ($kind === 'multisite') {
+            return 'This backup holds a whole multisite network. Moving a whole network as one isn\'t supported yet: back up one site of it with --site=<id> (or the site\'s own address), or pull the site you want with wp disembark pull --site=<id>.';
+        }
+        if ($kind === 'freighter') {
+            return 'This backup holds a whole WP Freighter install. Moving a whole install as one isn\'t supported yet: back up one tenant with --site=<id>, or pull it with wp disembark pull --site=<id>.';
+        }
+        return null;
+    }
+
     private static function restore($folder) {
         if (!is_dir($folder)) {
             echo "Error: folder not found: $folder\n";
@@ -2688,6 +2793,14 @@ class Run {
                 if (!$source_home && !empty($meta->home_url))  $source_home   = rtrim($meta->home_url, '/');
                 if (!$source_prefix && !empty($meta->db_prefix)) $source_prefix = $meta->db_prefix;
             }
+        }
+
+        // A whole multisite network or WP Freighter install can't be restored
+        // into one site (the plugin refuses it too, but a CLI restore places
+        // files before the database arrives): stopped before anything changes.
+        if ($why = self::whole_install_backup($public_dir, $sql_file, isset($meta) && is_object($meta) ? $meta : null)) {
+            echo "Error: {$why} Nothing was changed.\n";
+            exit(1);
         }
 
         $import_id = self::new_session_id();
@@ -3217,6 +3330,8 @@ class Run {
         echo "\n";
         echo "    Options for backup:\n";
         echo "      --preview                          Show a summary of files and DB tables to be backed up without running the backup.\n";
+        echo "      --site=<id>                        One site of a multisite network or WP Freighter install (a blog ID or tenant ID).\n";
+        echo "                                         Pointing at the site's own address (https://network.com/shop) does the same.\n";
         echo "      --skip-db                          Skip the database backup and only process files.\n";
         echo "      --skip-files                       Skip the file backup and only process the database.\n";
         echo "      --skip-checksums                   Skip file integrity checks. Only downloads files missing from destination.\n";
@@ -3233,6 +3348,7 @@ class Run {
         echo "\n";
         echo "    Options for sync:\n";
         echo "      --debug                            Save local and remote manifest files for debugging.\n";
+        echo "      --site=<id>                        One site of a multisite network or WP Freighter install.\n";
         echo "      --skip-db                          Skip the database sync and only process files.\n";
         echo "      --skip-files                       Skip the file sync and only process the database.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
