@@ -1948,6 +1948,7 @@ class Run {
         $total_chunks = count($queue);
         $fallback_chunks = [];
         $active_transfers = [];
+        $retry_after = [];
         $slots = array_fill(0, $max_concurrency, null); 
 
         echo "\033[?25l";
@@ -1989,8 +1990,16 @@ class Run {
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_TIMEOUT, 1800);
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
+                // A host that rate-limits says how long to wait.
+                curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $line) use (&$retry_after) {
+                    if (stripos($line, 'retry-after:') === 0) {
+                        $retry_after[is_object($c) ? spl_object_id($c) : (int) $c] = trim(substr($line, 12));
+                    }
+                    return strlen($line);
+                });
                 curl_multi_add_handle($mh, $ch);
                 $ch_id = is_object($ch) ? spl_object_id($ch) : (int)$ch;
+                unset($retry_after[$ch_id]);
                 
                 $active_transfers[$ch_id] = [
                     'state' => 'ZIP',
