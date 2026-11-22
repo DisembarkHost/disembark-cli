@@ -3,6 +3,7 @@
 ## **v3.0.0** - November 20, 2026
 
 ### Fixed
+* **PHP 7.4:** `disembark.phar` died at start on PHP 7.x ("Namespace declaration statement has to be the very first statement"). It runs on PHP 7.4 through 8.5 again.
 * **A subsite backs up as that subsite:** `disembark backup https://network.com/shop` exported every table of the whole network. Pointed at one site of a network or WP Freighter install by its own address, the CLI now backs up that site (its tables and users, under its own address and prefix), and `--site=<id>` picks one from the main address.
 * **A whole network can't be restored into one site:** restore refuses a backup that holds a whole multisite network or WP Freighter install before anything changes, instead of overwriting the destination with every site's tables.
 * **Plain permalinks:** a site with plain permalinks answers `/wp-json/` with its home page, which stopped backup and restore. The CLI now notices and carries on through `?rest_route=`.

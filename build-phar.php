@@ -4,7 +4,10 @@ $phar->startBuffering();
 
 // 1. Add the main disembark script
 // We add it by its file name, and also give it the same name inside the phar
-$phar->addFile('disembark', 'disembark');
+// without its #! line: PHP 8 skips it when including a file, but PHP 7.x
+// reads it as output, so the namespace isn't the first statement and the
+// phar dies with a fatal error.
+$phar->addFromString('disembark', preg_replace('/^#![^\n]*\n/', '', file_get_contents(__DIR__ . '/disembark')));
 
 // 2. Add the entire vendor directory recursively
 $vendorDir = __DIR__ . '/vendor';
