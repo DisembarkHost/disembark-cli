@@ -647,6 +647,23 @@ class Run {
         return max(1, min(300, $wait));
     }
 
+    /** ['site' => <id>] when --site picked one site of an install, else []. */
+    private static function site_param() {
+        return self::$site !== '' ? ['site' => self::$site] : [];
+    }
+
+    /**
+     * Whether this backup is one site of a network or WP Freighter install:
+     * --site, or the source's own address reached one (its preflight says).
+     */
+    private static function scoped_source() {
+        if (self::$site !== '') {
+            return true;
+        }
+        $caps = self::source_caps();
+        return is_object($caps) && isset($caps->scope->site) && (string) $caps->scope->site !== '';
+    }
+
     /** Whether a response is an HTML page rather than a REST answer. */
     private static function is_html_page($response) {
         $type = '';
@@ -1111,7 +1128,7 @@ class Run {
                         'file' => $relative_path,
                         'offset' => $offset,
                         'length' => $length
-                    ]);
+                    ] + self::site_param());
 
                     // App-password connections authenticate by header; v3
                     // also takes the token in X-Disembark-Token.
@@ -1759,7 +1776,7 @@ class Run {
                     'token' => self::$token, 
                     'backup_token' => self::$backup_token, 
                     'files' => $job['files']
-                ]);
+                ] + self::site_param());
 
                 $ch = curl_init($url);
                 
@@ -3646,6 +3663,29 @@ class Run {
      * Includes size validation and fallback to stream API.
      */
     private static function download_files_parallel($files, $folder) {
+        // One site of a network or WP Freighter install: the list names its
+        // files as the export does (its uploads as wp-content/uploads), and
+        // that public address would serve the main site's file or none. Each
+        // comes through /stream-file, which looks the real one up.
+        if (self::scoped_source()) {
+            $failed_before = count(self::$failures);
+            foreach ($files as $file) {
+                $local_dest = $folder . '/' . $file->name;
+                if (!is_dir(dirname($local_dest))) {
+                    @mkdir(dirname($local_dest), 0755, true);
+                }
+                echo "    > Streaming {$file->name} (" . self::humanFilesize($file->size) . ")...\n";
+                try {
+                    self::download_file_chunked_stream($file->name, $local_dest, $file->size);
+                    self::$global_bytes_processed += (int) $file->size;
+                } catch (\Exception $e) {
+                    echo "      Error: " . $e->getMessage() . "\n";
+                    self::$failures[] = "{$file->name} (download failed)";
+                }
+            }
+            echo " - All large file downloads processed" . (count(self::$failures) > $failed_before ? ' (with errors)' : '') . ".\n";
+            return;
+        }
         $max_concurrency = 4;
         $max_retries = 3; 
         $mh = curl_multi_init();
@@ -4278,7 +4318,7 @@ PHP;
             try {
                 // Use self::$siteUrl and self::$token
                 $endpoint_url = self::rest_url('/stream-file');
-                $payload = json_encode(['token' => self::$token, 'file' => $relative_path]);
+                $payload = json_encode(['token' => self::$token, 'file' => $relative_path] + self::site_param());
                 $headers = ['Content-Type' => 'application/json'] + self::api_headers();
                 $options = [
                     'verify' => false,
@@ -4317,6 +4357,14 @@ PHP;
      * Downloads a database export file, trying direct download first and falling back to stream.
      */
     private static function download_db_file($relative_path, $destination) {
+        // One site of a network or WP Freighter install keeps its exports in
+        // the install's folder, at the install's address (a subdirectory
+        // subsite's own address doesn't serve the main site's uploads).
+        $base = self::$siteUrl;
+        $caps = self::scoped_source() ? self::source_caps() : null;
+        if (is_object($caps) && !empty($caps->scope->install_home)) {
+            $base = rtrim((string) $caps->scope->install_home, '/');
+        }
         // Strip site URL path prefix for subdirectory installs to avoid doubled paths
         // e.g. "subdir/wp-content/uploads/..." -> "wp-content/uploads/..."
         $site_parsed = parse_url(self::$siteUrl);
@@ -4328,7 +4376,7 @@ PHP;
         $path_parts = explode('/', $relative_path);
         $encoded_parts = array_map('rawurlencode', $path_parts);
         $encoded_relative_path = implode('/', $encoded_parts);
-        $direct_url = self::$siteUrl . '/' . $encoded_relative_path;
+        $direct_url = $base . '/' . $encoded_relative_path;
 
         try {
             self::download_file_direct($direct_url, $destination);
