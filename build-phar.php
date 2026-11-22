@@ -32,7 +32,7 @@ foreach ($iterator as $file) {
 }
 
 // 3. Create the stub
-$stub = "#!/usr/bin/env php \n";
+$stub = "#!/usr/bin/env php\n";
 $stub .= $phar->createDefaultStub('disembark'); // This still points to 'disembark' at the phar's root
 $phar->setStub($stub);
 
