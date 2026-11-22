@@ -657,6 +657,72 @@ class Run {
         return self::$source_caps;
     }
 
+    /**
+     * What the source recorded about the --session-id scan (from the
+     * sessions /backup-size lists): ['site' => '<id>' or '' for the whole
+     * install, 'filtered' => bool], with 'site' left out when the source
+     * didn't record it (older Disembark). null when the session isn't listed.
+     */
+    private static function session_meta() {
+        static $meta = false;
+        if ($meta !== false) {
+            return $meta;
+        }
+        $meta = null;
+        try {
+            $size = self::make_request('/backup-size', [], 'GET', true);
+        } catch (\Exception $e) {
+            // Can't ask: nothing known, nothing refused here.
+            return $meta = [];
+        }
+        foreach ((is_object($size) && isset($size->sessions) && is_array($size->sessions)) ? $size->sessions : [] as $session) {
+            if (is_object($session) && isset($session->token) && (string) $session->token === (string) self::$session_id) {
+                $meta = ['filtered' => !empty($session->filtered)];
+                if (property_exists($session, 'site')) {
+                    $meta['site'] = $session->site === null ? '' : (string) $session->site;
+                }
+                break;
+            }
+        }
+        return $meta;
+    }
+
+    /**
+     * Makes --site agree with the site the reused session was scanned for:
+     * adopts it when --site is left out, refuses a different one. A source
+     * that doesn't record it gets a warning, and refuses a mismatch itself
+     * (session_site_mismatch) where it can tell.
+     */
+    private static function match_session_site() {
+        $meta = self::session_meta();
+        if ($meta === null) {
+            echo "Error: the source has no finished scan with session ID " . self::$session_id . " (see 'disembark info " . self::$siteUrl . "').\n";
+            exit(1);
+        }
+        if (!array_key_exists('site', $meta)) {
+            if (self::$site !== '') {
+                echo "Warning: this source doesn't record which site session " . self::$session_id . " was scanned for. It's used as a scan of site " . self::$site . "; if it wasn't, the backup mixes two sites.\n";
+            }
+            return;
+        }
+        $was  = trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', $meta['site']), '-.');
+        $want = self::site_key();
+        if (self::$site === '') {
+            if ($was === '') {
+                return;
+            }
+            echo "Session " . self::$session_id . " was scanned for site $was; backing up site $was.\n";
+            self::$site = $was;
+            self::$source_caps = null;
+            self::source_caps();
+            return;
+        }
+        if ($was !== $want) {
+            echo "Error: session " . self::$session_id . " was scanned for " . ($was === '' ? 'the whole install' : "site $was") . ", not site $want. Leave out --site to back up what the session scanned, or leave out --session-id to scan site $want.\n";
+            exit(1);
+        }
+    }
+
     /** True when the source is v3 (it announces pacing in its preflight). */
     private static function source_is_v3() {
         return is_object(self::$source_caps) && !empty(self::$source_caps->pacing);
@@ -1628,14 +1694,25 @@ class Run {
                 // Deletions: only files the source listed at the last sync
                 // and no longer lists. Never a file sync didn't bring (yours),
                 // an excluded path, or anything on an incomplete or empty list.
-                if (!$is_initial_sync) {
-                    $deleted_files = self::apply_source_deletions($folder, $previous, $listed);
-                }
+                // A reused session's list is whatever that scan covered
+                // (folders left out with -x, or one site of a network), not
+                // necessarily the whole source: nothing it leaves out can be
+                // taken as deleted, and the sync record stays as it was.
+                if (self::$session_id) {
+                    if (!$is_initial_sync) {
+                        $meta = self::session_meta();
+                        echo " - Reused session" . (!empty($meta['filtered']) ? ' (scanned with folders left out)' : '') . ": nothing deleted locally and the sync record is kept; run a sync without --session-id to remove files deleted on the source.\n";
+                    }
+                } else {
+                    if (!$is_initial_sync) {
+                        $deleted_files = self::apply_source_deletions($folder, $previous, $listed);
+                    }
 
-                // Remember what the source listed, for the next sync's
-                // deletions. An empty list keeps the last record.
-                if (!empty($listed)) {
-                    self::write_sync_state($folder, $listed, $previous);
+                    // Remember what the source listed, for the next sync's
+                    // deletions. An empty list keeps the last record.
+                    if (!empty($listed)) {
+                        self::write_sync_state($folder, $listed, $previous);
+                    }
                 }
                 echo "File sync complete.\n";
             } else {
