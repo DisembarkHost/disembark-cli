@@ -1,5 +1,28 @@
 # Changelog
 
+## **v3.0.1** - November 22, 2026
+
+### Fixed
+* **`--site` backups hold that site's files:** `backup --site=<id>` left the site out of file zips and streams, so a subsite's backup held the main site's files of the same name or lost its own, and its large files came from the main site's public address. The site now goes with every request, a scoped backup streams its large files, and a subsite's database downloads from the network's address.
+* **Reused scans never delete local files:** `sync --session-id` treated anything the reused scan left out (folders excluded with `-x`, or other sites when the scan was for one) as deleted on the source. A sync reusing a scan now deletes nothing and keeps its sync record as it was.
+* **Sync keeps each site to its own folder:** syncing `--site=2` and then `--site=3` into one folder deleted site 2's files. The sync record is now kept per site, the default folder is named after the site, and a folder that holds a mirror of another site of the same install is refused. The default folder for a subsite address is one folder (`example.com_shop`), not nested inside the parent's mirror.
+* **`--site` and `--session-id` agree:** without `--site`, a reused scan backs up the site it was made for; a different `--site` is refused, as is the source's `session_site_mismatch`. An unknown `--site`, or `--site` on a site that isn't a network, stops with the source's own message, and a source older than 3.0 (which would send the whole install) is refused.
+* **A backup that can't write its zip fails:** a full disk while zipping printed "Backup Completed Successfully" after deleting everything it downloaded. It now fails with exit 1 and keeps the downloaded files.
+* **A failed download keeps the good copy:** large files were truncated before the first byte arrived, so a failed download emptied a mirror's copy and put an empty file in a backup. They now download to `<file>.part` and replace the file only when whole and the right size.
+* **Missing files are reported:** files the source listed but couldn't send (unreadable on the server) were left out silently. They're now listed, and the backup or sync exits 1.
+* **Big tables fit in memory:** database parts were read whole into memory, so a large table crashed at PHP's default 128M. They're now streamed into the dump, with every write checked.
+* **Smaller fixes:**
+  * Restore uploads switch to `?rest_route=` when the destination's `/wp-json/` starts answering with a page partway through.
+  * Restore no longer takes a single site for a whole WP Freighter install because of a bootstrap file left behind after WP Freighter was deleted.
+  * Restoring a mirror uses its own `database.sql` over a stray `database-*.sql`, and leaves out nested mirrors and their working folders.
+  * `restore --rollback` of a point with later ones explains, asks (or takes `--yes`), and rolls the later ones back first.
+  * A site file named `files-*.zip` no longer stalls every run.
+  * `info` exits 1 when it can't reach the site.
+
+### Improved
+* Zip, stream and direct downloads wait as long as a rate-limiting host asks (429 or 503 with `Retry-After`).
+* The help gives the 10MB large-file threshold the CLI uses, and the phar's `#!` line has no trailing space.
+
 ## **v3.0.0** - November 21, 2026
 
 ### Fixed
