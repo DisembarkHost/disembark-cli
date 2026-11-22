@@ -61,6 +61,9 @@ class Run {
     // Files a backup or sync could not copy, reported at the end (and the
     // exit status is non-zero when there are any).
     private static $failures = [];
+    // Chunk zips handed to the background extractor, waited on by path
+    // (never by a name pattern a site's own file could match).
+    private static $pending_extractions = [];
 
     // Where sync keeps its record of the source's files (relative to the
     // mirror). Restore never deploys .disembark-manifests/.
@@ -2075,6 +2078,7 @@ class Run {
                         // the folder or through a symlink, then deletes the zip.
                         $cmd = sprintf('%s %s %s %s > /dev/null 2>&1 &', escapeshellarg(PHP_BINARY), escapeshellarg(self::extractor_script()), $safe_zip, $safe_dest);
                         exec($cmd);
+                        self::$pending_extractions[] = $zip_path;
 
                         // Update global stats immediately (based on zip size)
                         // Note: Uncompressed size would be more accurate but requires reading the zip, which blocks.
@@ -4551,8 +4555,19 @@ PHP;
      * entries they refused or couldn't write as failures.
      */
     private static function wait_for_extractions($folder, $max_seconds) {
+        $mine = [];
+        foreach (self::$pending_extractions as $i => $zip) {
+            if (strpos($zip, rtrim($folder, '/') . '/') === 0) {
+                $mine[] = $zip;
+                unset(self::$pending_extractions[$i]);
+            }
+        }
+        $still = function () use ($mine) {
+            clearstatcache();
+            return array_values(array_filter($mine, 'file_exists'));
+        };
         $wait_ticks = 0;
-        while (count(glob($folder . '/sync-files-*.zip')) > 0 || count(glob($folder . '/files-*.zip')) > 0) {
+        while (count($still()) > 0) {
             if ($wait_ticks === 0) echo "Waiting for background extraction to finish...";
             echo ".";
             sleep(1);
@@ -4564,11 +4579,43 @@ PHP;
             }
         }
         if ($wait_ticks > 0) echo " Done.\n";
-        foreach (glob($folder . '/*.zip.skipped') ?: [] as $list) {
+        foreach ($mine as $zip) {
+            $list = $zip . '.skipped';
+            if (!is_file($list) || is_link($list)) {
+                continue;
+            }
             foreach (file($list, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $name) {
                 self::$failures[] = "$name (not unpacked)";
             }
             @unlink($list);
+        }
+    }
+
+    /**
+     * After the chunk zips are unpacked: every file asked for should now be
+     * in $folder. The source leaves a file out of its zip when it can't read
+     * it (permissions, or deleted since the list was made); each one missing
+     * is a failure, so a backup or sync that lacks it never reports success.
+     */
+    private static function verify_arrived($files, $folder) {
+        $known = [];
+        foreach (self::$failures as $line) {
+            $known[preg_replace('/ \([^()]*\)$/', '', $line)] = true;
+        }
+        $missing = 0;
+        foreach ($files as $f) {
+            $name = isset($f->name) ? (string) $f->name : '';
+            if ($name === '' || isset($known[$name])) {
+                continue;
+            }
+            clearstatcache(true, $folder . '/' . $name);
+            if (!is_file($folder . '/' . $name)) {
+                self::$failures[] = "$name (the source didn't send it: unreadable there, or deleted since the list was made)";
+                $missing++;
+            }
+        }
+        if ($missing > 0) {
+            echo " - $missing file(s) the source listed did not arrive.\n";
         }
     }
 
@@ -4645,34 +4692,6 @@ PHP;
             }
         }
         throw new \Exception("Stream failed after $max_attempts attempts. Last error: $last_error");
-    }
-
-    /**
-     * After the chunk zips are unpacked: every file asked for should now be
-     * in $folder. The source leaves a file out of its zip when it can't read
-     * it (permissions, or deleted since the list was made); each one missing
-     * is a failure, so a backup or sync that lacks it never reports success.
-     */
-    private static function verify_arrived($files, $folder) {
-        $known = [];
-        foreach (self::$failures as $line) {
-            $known[preg_replace('/ \([^()]*\)$/', '', $line)] = true;
-        }
-        $missing = 0;
-        foreach ($files as $f) {
-            $name = isset($f->name) ? (string) $f->name : '';
-            if ($name === '' || isset($known[$name])) {
-                continue;
-            }
-            clearstatcache(true, $folder . '/' . $name);
-            if (!is_file($folder . '/' . $name)) {
-                self::$failures[] = "$name (the source didn't send it: unreadable there, or deleted since the list was made)";
-                $missing++;
-            }
-        }
-        if ($missing > 0) {
-            echo " - $missing file(s) the source listed did not arrive.\n";
-        }
     }
 
     /**
