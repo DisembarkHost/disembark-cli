@@ -2824,6 +2824,10 @@ class Run {
             $domain = 'site';
         }
         $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
+        // Resolve to an absolute path: inside a PHAR, Phar::interceptFileFuncs()
+        // checks relative paths against phar:// instead of getcwd(), which made
+        // is_file()/filesize() return false for the zip ZipArchive just wrote.
+        $final_zip_path = getcwd() . DIRECTORY_SEPARATOR . $final_zip_name;
 
         // STATS COUNTERS
         $total_items_processed = 0;
@@ -2975,7 +2979,7 @@ class Run {
             }
 
             echo "Generating final local zip file: $final_zip_name...\n";
-            self::zip_directory($local_public_path, $final_zip_name);
+            self::zip_directory($local_public_path, $final_zip_path);
 
         } catch (\Throwable $e) {
             echo "\033[?25h";
@@ -2996,7 +3000,7 @@ class Run {
         }
 
         // FINAL SUMMARY
-        $final_size = file_exists($final_zip_name) ? filesize($final_zip_name) : 0;
+        $final_size = is_file($final_zip_path) ? filesize($final_zip_path) : 0;
         $had_failures = self::report_failures();
         
         echo $had_failures ? "\nBackup Finished With Errors (the zip is missing the files above)\n" : "\nBackup Completed Successfully\n";
@@ -4995,6 +4999,11 @@ PHP;
     private static function zip_directory($source, $destination) {
         if (!class_exists('ZipArchive')) {
             throw new \Exception('ZipArchive PHP extension is required to create the final zip.');
+        }
+        // Normalize relative destination against getcwd() so Phar::interceptFileFuncs()
+        // checks the real filesystem path rather than phar://.
+        if (substr($destination, 0, 1) !== DIRECTORY_SEPARATOR && !(strlen($destination) > 1 && substr($destination, 1, 1) === ':')) {
+            $destination = getcwd() . DIRECTORY_SEPARATOR . $destination;
         }
         $real = realpath($source);
         if ($real === false) {
