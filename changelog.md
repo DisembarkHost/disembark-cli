@@ -1,5 +1,10 @@
 # Changelog
 
+## **v3.0.2** - November 23, 2026
+
+### Fixed
+* **Backups of one site restore its upload links:** a backup of one site of a network or WP Freighter install now records which folders moved where, so restoring it rewrites links into `uploads/sites/<id>`, in files under uploads and in the database. Before, those links kept pointing at the subsite's old folder. The old server's folders are recorded too, for rewriting stored paths.
+
 ## **v3.0.1** - November 22, 2026
 
 ### Fixed
