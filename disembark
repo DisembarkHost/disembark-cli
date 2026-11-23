@@ -30,8 +30,8 @@ class Run {
     private static $db_max_rows = 1000000;         // 1M rows
     private static $upload_chunk_bytes = 20971520; // 20MB restore upload chunks
     private static $upload_limit_known = false;
-    private static $file_chunk_size = 2500;        // 2500 files
-    private static $file_chunk_max_size = 524288000; // 500MB
+    private static $file_chunk_size = 1000;        // 1000 files
+    private static $file_chunk_max_size = 52428800; // 50MB
     private static $large_file_threshold = 10485760; // 10MB
     
     // Options
@@ -1987,9 +1987,13 @@ class Run {
      * Concurrency: 2 (Keeps pressure on server without overloading).
      */
     private static function sync_chunks_parallel($chunks, $folder) {
-        // Increase concurrency since unzip is now non-blocking
+        // Increase concurrency since unzip is now non-blocking; drops to 1
+        // automatically if the source starts timing out (502/504/524).
         $max_concurrency = 2;
+        $active_concurrency = $max_concurrency;
         $max_retries = 3;
+        $max_files_cap = 0;
+        $max_bytes_cap = 0;
         $mh = curl_multi_init();
         
         // 1. Prepare Queue
@@ -2004,10 +2008,19 @@ class Run {
         }
         
         $total_chunks = count($queue);
+        $next_chunk_id = $total_chunks + 1;
         $fallback_chunks = [];
         $active_transfers = [];
         $retry_after = [];
         $slots = array_fill(0, $max_concurrency, null); 
+
+        $chunk_bytes = function ($files) {
+            $bytes = 0;
+            foreach ($files as $f) {
+                $bytes += isset($f->size) ? (int) $f->size : 0;
+            }
+            return $bytes;
+        };
 
         echo "\033[?25l";
         echo " - Starting parallel sync (Concurrency: $max_concurrency, Retries: $max_retries)...\n";
@@ -2016,12 +2029,44 @@ class Run {
 
         do {
             // 2. REFILL SLOTS
-            while (count($active_transfers) < $max_concurrency && !empty($queue)) {
+            while (count($active_transfers) < $active_concurrency && !empty($queue)) {
                 $slot_idx = array_search(null, $slots);
                 if ($slot_idx === false) $slot_idx = count($active_transfers);
                 
-                // Get Job
+                // Get Job (split oversized queued chunks lazily once adaptive caps are set)
                 $job = array_shift($queue);
+                if ($max_files_cap > 0 && count($job['files']) > 25 && (count($job['files']) > $max_files_cap || $chunk_bytes($job['files']) > $max_bytes_cap)) {
+                    $sub_chunks = [];
+                    $cur = [];
+                    $cur_b = 0;
+                    foreach ($job['files'] as $f) {
+                        $fb = isset($f->size) ? (int) $f->size : 0;
+                        if (!empty($cur) && (count($cur) >= $max_files_cap || ($max_bytes_cap > 0 && $cur_b + $fb > $max_bytes_cap))) {
+                            $sub_chunks[] = $cur;
+                            $cur = [$f];
+                            $cur_b = $fb;
+                        } else {
+                            $cur[] = $f;
+                            $cur_b += $fb;
+                        }
+                    }
+                    if (!empty($cur)) $sub_chunks[] = $cur;
+                    if (count($sub_chunks) > 1) {
+                        $total_chunks += count($sub_chunks) - 1;
+                        $prep = [];
+                        foreach ($sub_chunks as $idx => $sc) {
+                            $prep[] = [
+                                'files' => $sc,
+                                'attempts' => 0,
+                                'id' => $idx === 0 ? $job['id'] : $next_chunk_id++
+                            ];
+                        }
+                        $job = array_shift($prep);
+                        for ($pi = count($prep) - 1; $pi >= 0; $pi--) {
+                            array_unshift($queue, $prep[$pi]);
+                        }
+                    }
+                }
                 $job['attempts']++;
                 
                 // Start STAGE_ZIP
@@ -2234,8 +2279,31 @@ class Run {
                             if (is_resource($mh)) curl_multi_close($mh);
                             throw new \Exception(isset($decoded->message) ? (string) $decoded->message : 'The session was scanned for another site.');
                         }
-                        if ($data['job']['attempts'] <= $max_retries) {
-                            $pause = 1;
+                        $is_timeout = in_array((int) $http_code, [0, 502, 504, 524], true);
+                        $n_files = count($data['job']['files']);
+                        if ($is_timeout) {
+                            $active_concurrency = 1;
+                        }
+                        if ($is_timeout && $n_files > 25) {
+                            // Split oversized chunk in half immediately instead of retrying the same timeout.
+                            $half_files = max(25, (int) ceil($n_files / 2));
+                            $job_b = $chunk_bytes($data['job']['files']);
+                            $half_bytes = max(5 * 1024 * 1024, (int) floor($job_b / 2));
+                            $max_files_cap = $max_files_cap > 0 ? min($max_files_cap, $half_files) : $half_files;
+                            $max_bytes_cap = $max_bytes_cap > 0 ? min($max_bytes_cap, $half_bytes) : $half_bytes;
+                            $halves = array_chunk($data['job']['files'], $half_files);
+                            $total_chunks += count($halves) - 1;
+                            for ($hi = count($halves) - 1; $hi >= 0; $hi--) {
+                                array_unshift($queue, [
+                                    'files' => $halves[$hi],
+                                    'attempts' => 0,
+                                    'id' => $hi === 0 ? $data['job']['id'] : $next_chunk_id++
+                                ]);
+                            }
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Timed Out (HTTP $http_code). Splitting into {$half_files}-file chunks...\033[{$line}A";
+                            sleep(2);
+                        } elseif ($data['job']['attempts'] <= $max_retries) {
+                            $pause = $is_timeout ? 2 : 1;
                             if ($http_code == 429 || $http_code == 503) {
                                 $ra = $retry_after[$ch_id] ?? null;
                                 $pause = self::retry_wait((object) ['headers' => $ra !== null ? ['retry-after' => $ra] : []], $data['job']['attempts']);
@@ -2293,26 +2361,14 @@ class Run {
         if (is_resource($mh)) curl_multi_close($mh);
 
         if (!empty($fallback_chunks)) {
-            echo "\nProcessing failed chunks via stream fallback...\n";
+            $fallback_files = [];
             foreach ($fallback_chunks as $chunk) {
                 foreach ($chunk as $f) {
-                    if (!self::local_path_safe($folder, $f->name)) {
-                        self::$failures[] = "{$f->name} (unsafe path)";
-                        continue;
-                    }
-                    $ldest = $folder . '/' . $f->name;
-                    $ldir = dirname($ldest);
-                    if (!is_dir($ldir)) @mkdir($ldir, 0755, true);
-                    try {
-                        echo "   - Streaming: {$f->name}\n";
-                        self::download_file_via_stream($f->name, $ldest);
-                        self::$global_bytes_processed += (isset($f->size) ? (float)$f->size : 0);
-                    } catch (\Exception $fe) {
-                        echo "   - Failed to download: {$f->name}\n";
-                        self::$failures[] = "{$f->name} (download failed)";
-                    }
+                    $fallback_files[] = $f;
                 }
             }
+            echo "\nProcessing " . count($fallback_files) . " fallback file(s) via stream...\n";
+            self::download_files_parallel($fallback_files, $folder);
         }
     }
 
@@ -3802,8 +3858,8 @@ class Run {
         echo "      --skip-files                       Skip the file sync and only process the database.\n";
         echo "      --db-max-size=<size>               Set max DB part size (e.g., 25MB, 1G). Default: 200MB.\n";
         echo "      --db-max-rows=<num>                Set max DB part rows (e.g., 100000). Default: 1000000.\n";
-        echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 2500.\n";
-        echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 500MB.\n";
+        echo "      --file-chunk-size=<num>            Set number of files per sync zip. Default: 1000.\n";
+        echo "      --file-chunk-max-size=<size>       Set max total size per sync zip (e.g., 100MB). Default: 50MB.\n";
         echo "      --large-file-threshold=<size>      Files bigger than this download one at a time instead of in zips (e.g., 100MB). Default: 10MB.\n";
         echo "      -x <path>                          Leave a path out (its local copy is kept). Can be repeated.\n";
         echo "      --exclude-tables=<tables>          Leave tables out of database.sql (comma-separated, * wildcards).\n";
