@@ -1988,12 +1988,15 @@ class Run {
      */
     private static function sync_chunks_parallel($chunks, $folder) {
         // Increase concurrency since unzip is now non-blocking; drops to 1
-        // automatically if the source starts timing out (502/504/524).
+        // with exponential backoff and a circuit breaker if the source is overloaded.
         $max_concurrency = 2;
         $active_concurrency = $max_concurrency;
         $max_retries = 3;
         $max_files_cap = 0;
         $max_bytes_cap = 0;
+        $consecutive_overload = 0;
+        $max_consecutive_overload = 6;
+        $backoff_until = 0.0;
         $mh = curl_multi_init();
         
         // 1. Prepare Queue
@@ -2028,8 +2031,15 @@ class Run {
         echo "\033[{$max_concurrency}A";
 
         do {
-            // 2. REFILL SLOTS
-            while (count($active_transfers) < $active_concurrency && !empty($queue)) {
+            // 2. REFILL SLOTS (pause cleanly while cooling down from overload)
+            $now = microtime(true);
+            if ($backoff_until > $now && empty($active_transfers) && !empty($queue)) {
+                $wait_left = (int) ceil($backoff_until - $now);
+                echo "\033[1B\r\033[K 1: Source busy — pausing {$wait_left}s to let server recover...\033[1A";
+                usleep(250000);
+                continue;
+            }
+            while ($backoff_until <= microtime(true) && count($active_transfers) < $active_concurrency && !empty($queue)) {
                 $slot_idx = array_search(null, $slots);
                 if ($slot_idx === false) $slot_idx = count($active_transfers);
                 
@@ -2235,6 +2245,11 @@ class Run {
 
                     if ($http_code === 200 && !empty($zip_url) && strpos($zip_url, 'http') === 0) {
                         // SUCCESS -> TRANSITION TO DOWNLOAD
+                        $consecutive_overload = 0;
+                        if ($active_concurrency === 1) {
+                            // Brief breathing room between chunks on a host that previously timed out.
+                            $backoff_until = max($backoff_until, microtime(true) + 0.5);
+                        }
                         $fname = basename(parse_url($zip_url, PHP_URL_PATH) ?: $zip_url);
                         // Our own name locally: the server's could match a
                         // site file in the folder (the zip is deleted after).
@@ -2280,12 +2295,33 @@ class Run {
                             throw new \Exception(isset($decoded->message) ? (string) $decoded->message : 'The session was scanned for another site.');
                         }
                         $is_timeout = in_array((int) $http_code, [0, 502, 504, 524], true);
+                        $is_overload = $is_timeout || in_array((int) $http_code, [429, 503], true);
                         $n_files = count($data['job']['files']);
-                        if ($is_timeout) {
+                        if ($is_overload) {
                             $active_concurrency = 1;
+                            $consecutive_overload++;
+                            if ($consecutive_overload >= $max_consecutive_overload) {
+                                foreach ($active_transfers as $rem_id => $rem) {
+                                    if (isset($rem['handle'])) {
+                                        curl_multi_remove_handle($mh, $rem['handle']);
+                                        if (is_resource($rem['handle'])) curl_close($rem['handle']);
+                                    }
+                                    if (!empty($rem['fp']) && is_resource($rem['fp'])) fclose($rem['fp']);
+                                }
+                                echo "\033[{$max_concurrency}B\033[?25h\n";
+                                if (is_resource($mh)) curl_multi_close($mh);
+                                throw new \Exception("Source site appears overloaded (HTTP {$http_code}, {$consecutive_overload} consecutive timeouts/errors). Stopping gracefully to avoid impacting the live site — wait a minute for it to recover, then run the same command again.");
+                            }
+                            $cooldown = min(60, 5 * (1 << ($consecutive_overload - 1)));
+                            $ra = $retry_after[$ch_id] ?? null;
+                            if ($ra !== null) {
+                                $ra_wait = self::retry_wait((object) ['headers' => ['retry-after' => $ra]], $data['job']['attempts']);
+                                $cooldown = max($cooldown, $ra_wait);
+                            }
+                            $backoff_until = max($backoff_until, microtime(true) + $cooldown);
                         }
                         if ($is_timeout && $n_files > 25) {
-                            // Split oversized chunk in half immediately instead of retrying the same timeout.
+                            // Split oversized chunk in half immediately and pause to let PHP workers recover.
                             $half_files = max(25, (int) ceil($n_files / 2));
                             $job_b = $chunk_bytes($data['job']['files']);
                             $half_bytes = max(5 * 1024 * 1024, (int) floor($job_b / 2));
@@ -2300,17 +2336,14 @@ class Run {
                                     'id' => $hi === 0 ? $data['job']['id'] : $next_chunk_id++
                                 ]);
                             }
-                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Timed Out (HTTP $http_code). Splitting into {$half_files}-file chunks...\033[{$line}A";
-                            sleep(2);
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Timed Out (HTTP $http_code). Cooling down {$cooldown}s, splitting to {$half_files} files...\033[{$line}A";
                         } elseif ($data['job']['attempts'] <= $max_retries) {
-                            $pause = $is_timeout ? 2 : 1;
-                            if ($http_code == 429 || $http_code == 503) {
-                                $ra = $retry_after[$ch_id] ?? null;
-                                $pause = self::retry_wait((object) ['headers' => $ra !== null ? ['retry-after' => $ra] : []], $data['job']['attempts']);
-                            }
-                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed (HTTP $http_code). Retrying in {$pause}s...\033[{$line}A";
+                            $pause = $is_overload ? $cooldown : 1;
+                            echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed (HTTP $http_code). Retrying after {$pause}s...\033[{$line}A";
                             array_unshift($queue, $data['job']);
-                            sleep($pause);
+                            if (!$is_overload) {
+                                sleep(1);
+                            }
                         } else {
                             $fallback_chunks[] = $data['job']['files'];
                             echo "\033[{$line}B\r\033[K {$label_num}: Zip Failed. Added to fallback.\033[{$line}A";
@@ -2368,7 +2401,7 @@ class Run {
                 }
             }
             echo "\nProcessing " . count($fallback_files) . " fallback file(s) via stream...\n";
-            self::download_files_parallel($fallback_files, $folder);
+            self::download_files_parallel($fallback_files, $folder, $active_concurrency === 1 ? 1 : 4);
         }
     }
 
@@ -4166,7 +4199,7 @@ class Run {
      * Downloads large files using a rolling queue with Multi-line Progress Bars + Global Footer.
      * Includes size validation and fallback to stream API.
      */
-    private static function download_files_parallel($files, $folder) {
+    private static function download_files_parallel($files, $folder, $concurrency = 4) {
         // One site of a network or WP Freighter install: the list names its
         // files as the export does (its uploads as wp-content/uploads), and
         // that public address would serve the main site's file or none. Each
@@ -4190,8 +4223,11 @@ class Run {
             echo " - All large file downloads processed" . (count(self::$failures) > $failed_before ? ' (with errors)' : '') . ".\n";
             return;
         }
-        $max_concurrency = 4;
-        $max_retries = 3; 
+        $max_concurrency = max(1, (int) $concurrency);
+        $active_concurrency = $max_concurrency;
+        $max_retries = 3;
+        $consecutive_overload = 0;
+        $backoff_until = 0.0;
         $mh = curl_multi_init();
 
         $queue = [];
@@ -4213,8 +4249,13 @@ class Run {
         echo "\033[" . ($max_concurrency + 1) . "A"; // Move cursor up
 
         do {
-            // 1. REFILL QUEUE
-            while (count($active_transfers) < $max_concurrency && !empty($queue)) {
+            // 1. REFILL QUEUE (pause if backing off from overload)
+            $now = microtime(true);
+            if ($backoff_until > $now && empty($active_transfers) && !empty($queue)) {
+                usleep(250000);
+                continue;
+            }
+            while ($backoff_until <= microtime(true) && count($active_transfers) < $active_concurrency && !empty($queue)) {
                 $slot_index = array_search(null, $slots);
                 if ($slot_index === false) break;
 
@@ -4351,8 +4392,29 @@ class Run {
 
                     if ($is_http_error || $is_curl_error || $is_size_mismatch) {
                         @unlink($part);
-                        // Fail Fast or Retry logic
-                        if ($is_http_error) {
+                        $overload_code = in_array((int) $curl_info['http_code'], [429, 502, 503, 504, 524], true);
+                        if ($overload_code) {
+                            $active_concurrency = 1;
+                            $consecutive_overload++;
+                            $cooldown = min(60, 5 * (1 << ($consecutive_overload - 1)));
+                            $backoff_until = max($backoff_until, microtime(true) + $cooldown);
+                            if ($consecutive_overload >= 6) {
+                                foreach ($active_transfers as $rem) {
+                                    curl_multi_remove_handle($mh, $rem['handle']);
+                                    if (is_resource($rem['handle'])) curl_close($rem['handle']);
+                                    if (is_resource($rem['fp'])) fclose($rem['fp']);
+                                }
+                                curl_multi_close($mh);
+                                echo "\033[" . ($max_concurrency + 1) . "B\r\033[K\033[?25h";
+                                throw new \Exception("Source site appears overloaded during file download (HTTP {$curl_info['http_code']}). Stopping gracefully — wait a minute, then run the same command again.");
+                            }
+                            if ($wrapper['attempts'] < $max_retries) {
+                                array_unshift($queue, $wrapper);
+                            } else {
+                                $fallback_queue[] = $file;
+                                $processed_count++;
+                            }
+                        } elseif ($is_http_error) {
                              $fallback_queue[] = $file;
                              $line_offset = $slot + 1;
                              echo "\033[{$line_offset}B\r\033[K {$slot}: -> HTTP {$curl_info['http_code']}. Queuing fallback...\033[{$line_offset}A";
@@ -4369,6 +4431,7 @@ class Run {
                         }
                     } else {
                         // SUCCESS: Permanently add this file's full size to global stats
+                        $consecutive_overload = 0;
                         self::$global_bytes_processed += $expected_size;
                         $processed_count++;
                     }
