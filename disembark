@@ -217,7 +217,15 @@ class Run {
         // These do not require a site URL or configuration file to run.
         switch ($command) {
             case 'version':
+            case '--version':
+            case '-v':
+            case '-V':
                 self::version();
+                exit(0);
+            case 'help':
+            case '--help':
+            case '-h':
+                self::showHelp();
                 exit(0);
             case 'upgrade':
                 self::upgrade();
