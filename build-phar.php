@@ -1,5 +1,5 @@
 <?php
-$phar = new Phar('disembark.phar');
+$phar = new Phar(__DIR__ . '/disembark.phar');
 $phar->startBuffering();
 
 // 1. Add the main disembark script

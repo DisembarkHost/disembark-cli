@@ -712,7 +712,13 @@ class Run {
         }
         $was  = trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', $meta['site']), '-.');
         $want = self::site_key();
-        if (self::$site === '') {
+        if ($want === '') {
+            $caps = self::source_caps();
+            if (is_object($caps) && isset($caps->scope->site) && is_scalar($caps->scope->site) && (string) $caps->scope->site !== '') {
+                $want = trim(preg_replace('/[^A-Za-z0-9._-]+/', '-', (string) $caps->scope->site), '-.');
+            }
+        }
+        if (self::$site === '' && $want === '') {
             if ($was === '') {
                 return;
             }
@@ -723,7 +729,10 @@ class Run {
             return;
         }
         if ($was !== $want) {
-            echo "Error: session " . self::$session_id . " was scanned for " . ($was === '' ? 'the whole install' : "site $was") . ", not site $want. Leave out --site to back up what the session scanned, or leave out --session-id to scan site $want.\n";
+            $hint = self::$site !== ''
+                ? "Leave out --site to back up what the session scanned, or leave out --session-id to scan site $want."
+                : "Leave out --session-id to scan site $want.";
+            echo "Error: session " . self::$session_id . " was scanned for " . ($was === '' ? 'the whole install' : "site $was") . ", not site $want. {$hint}\n";
             exit(1);
         }
     }
@@ -985,7 +994,7 @@ class Run {
             }
             $rounds++;
             $progress = '';
-            foreach ([['tables_done', 'tables_total', 'tables'], ['entries_done', 'entries_total', 'entries'], ['placed', 'total', 'files'], ['parts_done', 'parts_total', 'parts'], ['files_done', 'files_total', 'files']] as $pair) {
+            foreach ([['tables_done', 'tables_total', 'tables'], ['entries_done', 'entries_total', 'entries'], ['placed', 'total', 'files'], ['parts_done', 'parts_total', 'parts'], ['files_done', 'files_total', 'files'], ['users_done', 'users_total', 'users']] as $pair) {
                 if (isset($res->{$pair[0]}, $res->{$pair[1]})) {
                     $progress = "{$res->{$pair[0]}} of {$res->{$pair[1]}} {$pair[2]}";
                     break;
@@ -2121,13 +2130,14 @@ class Run {
                         // Unpacked by a separate PHP process (see
                         // extractor_script()) that never writes outside
                         // the folder or through a symlink, then deletes the zip.
+                        $zip_size = @filesize($zip_path) ?: 0;
                         $cmd = sprintf('%s %s %s %s > /dev/null 2>&1 &', escapeshellarg(PHP_BINARY), escapeshellarg(self::extractor_script()), $safe_zip, $safe_dest);
                         exec($cmd);
                         self::$pending_extractions[] = $zip_path;
 
                         // Update global stats immediately (based on zip size)
                         // Note: Uncompressed size would be more accurate but requires reading the zip, which blocks.
-                        self::$global_bytes_processed += filesize($zip_path);
+                        self::$global_bytes_processed += $zip_size;
 
                         $msg_text = "Chunk {$data['chunk_idx']} backgrounded.";
                         $msg_padded = str_pad($msg_text, 56);
@@ -2809,7 +2819,10 @@ class Run {
         $local_public_path = $temp_directory . '/public';
         
         $domain = preg_replace('/^https?:\/\/(www\.)?/', '', self::$siteUrl);
-        $domain = preg_replace('/\//', '_', $domain);
+        $domain = trim(preg_replace('/[^A-Za-z0-9._-]+/', '_', $domain), '_.');
+        if ($domain === '') {
+            $domain = 'site';
+        }
         $final_zip_name = "{$temp_directory_name}-{$domain}.zip";
 
         // STATS COUNTERS
@@ -3065,15 +3078,17 @@ class Run {
             exit(1);
         }
 
-        // Locate the site files. A backup snapshot keeps them under public/.
-        $public_dir = $folder . '/public';
-        if (!is_dir($public_dir)) {
-            if (is_dir($folder . '/wp-includes') || is_dir($folder . '/wp-content')) {
-                $public_dir = $folder;
-            } else {
-                echo "Error: no 'public' directory in $folder. Point restore at a 'disembark backup' snapshot.\n";
-                exit(1);
-            }
+        // Locate the site files. A sync mirror keeps its files at the folder's
+        // root (and may itself contain a user 'public/' folder); a backup
+        // snapshot keeps them under public/.
+        if (is_file($folder . '/' . self::SYNC_STATE)
+            || ((is_dir($folder . '/wp-includes') || is_dir($folder . '/wp-content')) && !is_dir($folder . '/public/wp-includes'))) {
+            $public_dir = $folder;
+        } elseif (is_dir($folder . '/public')) {
+            $public_dir = $folder . '/public';
+        } else {
+            echo "Error: no 'public' directory in $folder. Point restore at a 'disembark backup' snapshot.\n";
+            exit(1);
         }
 
         // Locate the SQL dump (written into public/ by backup). More than one
@@ -3106,6 +3121,7 @@ class Run {
         // Resolve source metadata: --source-* overrides, else disembark-source.json.
         $source_home   = self::$source_url;
         $source_prefix = self::$source_prefix;
+        $meta          = null;
         $meta_file     = $folder . '/disembark-source.json';
         if (!file_exists($meta_file) && file_exists($public_dir . '/disembark-source.json')) {
             $meta_file = $public_dir . '/disembark-source.json';
@@ -3224,6 +3240,14 @@ class Run {
 
         $zip_tmp = null;
         try {
+            // Stage source metadata so the destination knows the source's
+            // server paths, content_dir, and multisite/tenant scope (kept out
+            // of $rel_files and blocked from web-root deployment by
+            // Import::never_deploy()).
+            if (file_exists($meta_file)) {
+                self::upload_file_to_staging($meta_file, 'disembark-source.json', $import_id);
+            }
+
             // Files: zip the tree, upload, deploy in batches.
             if (!self::$skip_files) {
                 echo "Packaging files...\n";
@@ -3295,19 +3319,21 @@ class Run {
                     }
                 }
 
-                if ($source_home && $dest_home && $source_home !== $dest_home) {
-                    echo "Rewriting URLs ($source_home -> $dest_home)...\n";
-                    $sr = self::paced_request('/import/search-replace', ['import_id' => $import_id, 'from' => $source_home, 'to' => $dest_home], 'Rewriting URLs');
+                $has_source_paths = is_object($meta) && (!empty($meta->scope) || !empty($meta->abspath) || !empty($meta->content_dir));
+                if (($source_home && $dest_home && $source_home !== $dest_home) || ($dest_home && $has_source_paths)) {
+                    $sr_from = $source_home ?: $dest_home;
+                    echo ($sr_from !== $dest_home ? "Rewriting URLs ($sr_from -> $dest_home)...\n" : "Rewriting server paths and scope...\n");
+                    $sr = self::paced_request('/import/search-replace', ['import_id' => $import_id, 'from' => $sr_from, 'to' => $dest_home], 'Rewriting URLs');
                     if (is_object($sr)) {
                         echo "  " . ($sr->rows_changed ?? 0) . " rows / " . ($sr->cells_changed ?? 0) . " cells updated across " . ($sr->tables ?? 0) . " tables.\n";
                         if (!empty($sr->files_rewritten)) {
                             echo "  Rewrote the old address in " . (int) $sr->files_rewritten . " file(s) under uploads.\n";
                         }
                         if (!empty($sr->files_too_big_total)) {
-                            echo "  ! " . (int) $sr->files_too_big_total . " file(s) under uploads mention $source_home but are over 5 MB, so left as is: " . implode(', ', array_slice((array) ($sr->files_too_big ?? []), 0, 8)) . ((int) $sr->files_too_big_total > 8 ? ', ...' : '') . "\n";
+                            echo "  ! " . (int) $sr->files_too_big_total . " file(s) under uploads mention $sr_from but are over 5 MB, so left as is: " . implode(', ', array_slice((array) ($sr->files_too_big ?? []), 0, 8)) . ((int) $sr->files_too_big_total > 8 ? ', ...' : '') . "\n";
                         }
                         if (!empty($sr->files_mentioning_total)) {
-                            echo "  " . (int) $sr->files_mentioning_total . " theme or plugin file(s) still mention $source_home (left as is): " . implode(', ', array_slice((array) ($sr->files_mentioning_source ?? []), 0, 8)) . ((int) $sr->files_mentioning_total > 8 ? ', ...' : '') . "\n";
+                            echo "  " . (int) $sr->files_mentioning_total . " theme or plugin file(s) still mention $sr_from (left as is): " . implode(', ', array_slice((array) ($sr->files_mentioning_source ?? []), 0, 8)) . ((int) $sr->files_mentioning_total > 8 ? ', ...' : '') . "\n";
                         }
                     }
                 }
@@ -3334,7 +3360,25 @@ class Run {
      */
     private static function restore_rollback($id) {
         echo "Rolling back import $id on " . self::$siteUrl . "...\n";
-        self::source_caps(); // a v3 destination rolls back in pieces
+        // Preflight with this import_id so token-guard recovery works and
+        // app-password connections can pin the site's Disembark token before
+        // rollback replaces wp_users.
+        self::$source_caps = false;
+        try {
+            $pre = self::make_request('/import/preflight', ['import_id' => $id], 'POST', true);
+            if (is_object($pre)) {
+                if (!empty($pre->disembark_token)) {
+                    self::$token    = $pre->disembark_token;
+                    self::$username = null;
+                    self::$password = null;
+                }
+                $caps = clone $pre;
+                unset($caps->disembark_token);
+                self::$source_caps = $caps;
+            }
+        } catch (\Exception $e) {
+            // Older destination without /import/preflight; carry on without pacing.
+        }
         $payload = ['import_id' => $id];
         try {
             $res = self::paced_request('/import/rollback', $payload, 'Rolling back', true);
@@ -3588,7 +3632,16 @@ class Run {
                 continue;
             }
             if ($response->status_code === 200) {
-                return json_decode($response->body);
+                if (self::is_html_page($response)) {
+                    echo "Error: upload received an HTML page instead of JSON from {$endpoint}.\n";
+                    throw new \Exception("Invalid HTML response for {$endpoint}");
+                }
+                $decoded = json_decode($response->body);
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    echo "Error: could not decode JSON response from {$endpoint}. Response: " . substr($response->body, 0, 300) . "\n";
+                    throw new \Exception("Invalid JSON response for {$endpoint}");
+                }
+                return $decoded;
             }
             if (in_array($response->status_code, [502, 503, 504], true) && $attempt < $attempts) {
                 echo "\n  Upload got HTTP {$response->status_code}; retrying...\n";
@@ -4141,7 +4194,7 @@ class Run {
                 curl_setopt($ch, CURLOPT_USERAGENT, self::$user_agent);
 
                 curl_multi_add_handle($mh, $ch);
-                $ch_int = (int)$ch;
+                $ch_int = is_object($ch) ? spl_object_id($ch) : (int) $ch;
                 $active_transfers[$ch_int] = [
                     'handle'  => $ch, 
                     'wrapper' => $item,
@@ -4202,7 +4255,7 @@ class Run {
             // 5. CHECK COMPLETION
             while ($info = curl_multi_info_read($mh)) {
                 $ch = $info['handle'];
-                $ch_id = (int)$ch;
+                $ch_id = is_object($ch) ? spl_object_id($ch) : (int) $ch;
                 
                 if (isset($active_transfers[$ch_id])) {
                     $transfer = $active_transfers[$ch_id];
@@ -4216,7 +4269,9 @@ class Run {
                     if (is_resource($ch)) {
                         curl_close($ch);
                     }
-                    $written = fflush($transfer['fp']) && fclose($transfer['fp']);
+                    $flushed = fflush($transfer['fp']);
+                    $closed = fclose($transfer['fp']);
+                    $written = $flushed && $closed;
                     unset($active_transfers[$ch_id]);
                     $slots[$slot] = null;
 
@@ -4260,7 +4315,9 @@ class Run {
                 }
             }
 
-        } while ($running > 0 || !empty($queue));
+        } while ($running > 0 || !empty($queue) || !empty($active_transfers));
+
+        curl_multi_close($mh);
 
         // CLEANUP: 
         // 1. Move cursor down from Top (where it sits during loop) to the Global Footer line
@@ -4612,9 +4669,11 @@ if ($root === false || $zip->open($zip_path) !== true) {
 $safe = function ($rel) use ($root) {
     if ($rel === '' || strpos($rel, "\0") !== false || strpos($rel, '\\') !== false || $rel[0] === '/' || preg_match('#^[A-Za-z]:#', $rel)) return false;
     $parts = explode('/', $rel);
+    foreach ($parts as $seg) {
+        if ($seg === '' || $seg === '.' || $seg === '..') return false;
+    }
     $path = $root;
     foreach ($parts as $i => $seg) {
-        if ($seg === '' || $seg === '.' || $seg === '..') return false;
         $path .= '/' . $seg;
         if (is_link($path)) return false;
         if (!file_exists($path)) return true;
@@ -4719,9 +4778,13 @@ PHP;
             if ($name === '' || isset($known[$name])) {
                 continue;
             }
-            clearstatcache(true, $folder . '/' . $name);
-            if (!is_file($folder . '/' . $name)) {
+            $path = $folder . '/' . $name;
+            clearstatcache(true, $path);
+            if (!is_file($path)) {
                 self::$failures[] = "$name (the source didn't send it: unreadable there, or deleted since the list was made)";
+                $missing++;
+            } elseif (isset($f->size) && is_numeric($f->size) && @filesize($path) !== (int) $f->size) {
+                self::$failures[] = "$name (size mismatch after transfer: expected " . (int) $f->size . " bytes, got " . (int) @filesize($path) . ")";
                 $missing++;
             }
         }
@@ -4819,8 +4882,8 @@ PHP;
         }
         // Strip site URL path prefix for subdirectory installs to avoid doubled paths
         // e.g. "subdir/wp-content/uploads/..." -> "wp-content/uploads/..."
-        $site_parsed = parse_url(self::$siteUrl);
-        $site_path_prefix = isset($site_parsed['path']) ? ltrim($site_parsed['path'], '/') : '';
+        $site_parsed = parse_url($base);
+        $site_path_prefix = isset($site_parsed['path']) ? trim($site_parsed['path'], '/') : '';
         if (!empty($site_path_prefix) && strpos($relative_path, $site_path_prefix . '/') === 0) {
             $relative_path = substr($relative_path, strlen($site_path_prefix) + 1);
         }
