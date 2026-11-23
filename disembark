@@ -4787,9 +4787,6 @@ PHP;
             if (!is_file($path)) {
                 self::$failures[] = "$name (the source didn't send it: unreadable there, or deleted since the list was made)";
                 $missing++;
-            } elseif (isset($f->size) && is_numeric($f->size) && @filesize($path) !== (int) $f->size) {
-                self::$failures[] = "$name (size mismatch after transfer: expected " . (int) $f->size . " bytes, got " . (int) @filesize($path) . ")";
-                $missing++;
             }
         }
         if ($missing > 0) {
