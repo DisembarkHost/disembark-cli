@@ -1,5 +1,17 @@
 # Changelog
 
+## **v3.0.3** - November 23, 2026
+
+### Fixed
+* **`disembark.phar backup` works reliably with relative paths:** backup zip paths are resolved against `getcwd()` before file verification so `Phar::interceptFileFuncs()` checks the real filesystem instead of `phar://`.
+* **PHP 8 `CurlHandle` collision:** concurrent downloads now key handles with `spl_object_id()` on PHP 8+ instead of `(int) $ch`, preventing handle collisions when downloading multiple files in parallel.
+* **Live-site backups don't fail on changing logs/caches:** `verify_arrived()` no longer fails a backup when a live file's size changed between scan and download.
+* **Restore metadata and rollbacks:** `restore` stages `disembark-source.json` cleanly, keeps scoped same-URL rewrites working, pins the destination's Disembark token and v3 pacing during `--rollback`, validates every extractor path segment before `mkdir`, strips base paths cleanly when downloading DB files, and checks JSON responses on multipart uploads.
+
+### Improved
+* **Adaptive chunking and overload protection:** default sync/backup zip chunk limits are lowered from `2500 files / 500 MB` to `1000 files / 50 MB`. On `429`, `502`, `503`, `504`, or `524` responses, the CLI splits oversized chunks in half, shrinks caps for remaining queued chunks, drops concurrency to 1 with a brief breathing pause between chunks, applies exponential cooldown (`5s → 60s` or `Retry-After`), and stops gracefully after 6 consecutive overload errors instead of hammering a struggling live site. Fallback downloads run in parallel (at concurrency 1 if overloaded).
+* **Paced user-merge progress:** restore output shows `users_done`/`users_total` during paced multisite user merges.
+
 ## **v3.0.2** - November 23, 2026
 
 ### Fixed
