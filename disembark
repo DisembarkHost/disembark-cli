@@ -1547,11 +1547,21 @@ class Run {
         if (isset($src_info->install) && is_object($src_info->install)) {
             $source_meta['install'] = ['kind' => $src_info->install->kind ?? '', 'total' => (int) ($src_info->install->total ?? 0), 'home' => $src_info->install->home ?? ''];
         }
-        if (self::$site !== '') {
+        // The old server's folders, for rewriting paths stored in the database.
+        foreach (['abspath', 'content_dir'] as $key) {
+            if (!empty($src_info->$key) && is_string($src_info->$key)) {
+                $source_meta[$key] = $src_info->$key;
+            }
+        }
+        // One site of the install: the scope the source reported, as a
+        // pull stamps it, so restore knows which folders moved where
+        // (uploads/sites/2 → uploads) and rewrites their addresses. Only
+        // the site's ID was kept before, and a subsite's files came across
+        // with links still pointing into uploads/sites/2.
+        if (isset($src_info->scope) && is_object($src_info->scope) && (string) ($src_info->scope->site ?? '') !== '') {
+            $source_meta['scope'] = json_decode(json_encode($src_info->scope), true);
+        } elseif (self::$site !== '') {
             $source_meta['scope'] = self::$site;
-        } elseif (isset($src_info->scope->site) && (string) $src_info->scope->site !== '') {
-            // The site's own address reached one site of the install.
-            $source_meta['scope'] = (string) $src_info->scope->site;
         }
         file_put_contents(rtrim($dir, '/') . '/disembark-source.json', json_encode($source_meta, JSON_PRETTY_PRINT));
     }
